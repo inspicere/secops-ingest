@@ -1,0 +1,61 @@
+# Example unit. Copy to /etc/systemd/system/ and adjust paths and identities.
+#
+#   systemctl enable --now secops-ingest@example.timer
+#
+# The instance name (%i) is the connector name, so one unit file serves every
+# connector: secops-ingest@phisher, secops-ingest@xdr, and so on.
+
+[Unit]
+Description=Security telemetry ingest: %i
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=secops
+Group=secops
+WorkingDirectory=/opt/secops
+ExecStart=/opt/secops/venv/bin/python -m secops_ingest %i
+
+# Connection details only. The password belongs in PGPASSFILE: anything in
+# Environment= is readable through /proc/<pid>/environ and `systemctl show`.
+#
+# THE QUOTES ARE LOAD-BEARING. systemd splits an unquoted Environment= value on
+# whitespace, so this DSN would become SECOPS_DB_DSN=host=... plus three stray
+# variables named port, dbname and user — and the worker would quietly connect
+# to the wrong database as the wrong role.
+Environment="SECOPS_DB_DSN=host=localhost port=5432 dbname=secops user=secops_ingest"
+Environment=PGPASSFILE=/etc/secops/pgpass
+Environment=SECOPS_SECRETS_BACKEND=file
+Environment=SECOPS_SECRETS_DIR=/etc/secops/secrets
+Environment=PYTHONUNBUFFERED=1
+
+# Resource caps. A backfill is the likeliest cause of a co-tenancy incident on a
+# host shared with the database and a reporting tool: the worker should die first.
+MemoryMax=1G
+CPUQuota=50%
+Nice=10
+# TimeoutStartSec, NOT RuntimeMaxSec: systemd ignores RuntimeMaxSec for
+# Type=oneshot and says so in the journal, so the cap would be a silent no-op.
+TimeoutStartSec=1800
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# ProtectSystem=strict makes everything read-only except what is listed here.
+ReadWritePaths=/var/lib/secops
+
+[Install]
+WantedBy=multi-user.target

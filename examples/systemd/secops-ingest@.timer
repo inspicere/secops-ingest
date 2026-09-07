@@ -1,0 +1,16 @@
+# Example timer. See secops-ingest@.service.
+
+[Unit]
+Description=Scheduled security telemetry ingest: %i
+
+[Timer]
+OnCalendar=hourly
+# Stagger. Five workers waking simultaneously on a small host contend with each
+# other, with the transform stage, and with whatever is querying the warehouse.
+RandomizedDelaySec=300
+# Catch up a run missed while the host was down.
+Persistent=true
+Unit=secops-ingest@%i.service
+
+[Install]
+WantedBy=timers.target
