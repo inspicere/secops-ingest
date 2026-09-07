@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Compiled bytecode embeds absolute source paths, so it leaks the build
+# directory layout in addition to being churn.
+
+# Environments
+.venv/
+.venv-*/
+venv/
+
+# Local artefacts
+*.tgz
+*.tar.gz
+*.dump
+secrets/
+*.pem
+*.key
