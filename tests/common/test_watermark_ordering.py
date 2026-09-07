@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import pytest
 
-from secops_ingest.common.watermark import comparable as _comparable, newer as _newer
+from secops_ingest.common.watermark import comparable as _comparable
+from secops_ingest.common.watermark import newer as _newer
 from secops_ingest.redaction import register_secret, scrub
-
 
 # --- the data-loss case -----------------------------------------------------
 
@@ -29,7 +29,9 @@ def test_mixed_utc_offsets_order_by_instant_not_text() -> None:
 
 def test_epoch_strings_order_numerically() -> None:
     """'9999999999' > '10000000000' as text, but is the smaller number."""
-    assert "9999999999" > "10000000000"
+    # Comparing two literals is the point: it pins the lexical ordering
+    # that comparable() exists to correct.
+    assert "9999999999" > "10000000000"  # noqa: PLR0133
     assert _newer("10000000000", "9999999999") is True
     assert _newer("9999999999", "10000000000") is False
 

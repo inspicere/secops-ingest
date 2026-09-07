@@ -12,8 +12,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from datetime import datetime, timedelta, timezone
-from typing import Any, Iterator
+from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 
 class ExampleSource:
@@ -28,7 +29,7 @@ class ExampleSource:
         # and holds the value in memory only.
         return {"token": "not-a-real-credential"}
 
-    def fetch(self, creds: Any, cursor: str | None) -> Iterator[dict]:
+    def fetch(self, creds: Any, cursor: str | None) -> Iterator[dict[str, Any]]:
         """Yield synthetic records strictly newer than `cursor`.
 
         Anchored to the top of the current hour rather than to `now()`, so two
@@ -36,7 +37,7 @@ class ExampleSource:
         makes upsert idempotency testable: with a `now()` anchor every run mints
         new ids and a re-run always looks like it inserted correctly.
         """
-        base = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        base = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
         for i in range(self.count):
             created = base - timedelta(minutes=i)
             record = {
@@ -51,7 +52,7 @@ class ExampleSource:
                 continue
             yield record
 
-    def to_row(self, record: dict, run_id: int) -> tuple:
+    def to_row(self, record: dict[str, Any], run_id: int) -> tuple[Any, ...]:
         # _event_time comes from createdAt, which never changes. The watermark
         # uses updatedAt; partitioning on that would move rows between
         # partitions whenever a record is updated.
@@ -62,7 +63,7 @@ class ExampleSource:
             run_id or None,
         )
 
-    def watermark_of(self, record: dict) -> Any:
+    def watermark_of(self, record: dict[str, Any]) -> Any:
         return record["updatedAt"]
 
 

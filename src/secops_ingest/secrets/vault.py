@@ -6,6 +6,7 @@ Install with:  pip install secops-ingest[vault]
 from __future__ import annotations
 
 import os
+from typing import Any
 
 from .base import SecretError, SecretNotFound, SecretProvider
 
@@ -26,12 +27,12 @@ class VaultSecretProvider(SecretProvider):
         self._prefix = path_prefix or os.environ.get("SECOPS_VAULT_PREFIX", "")
         if not self._url:
             raise SecretError("Vault provider requires VAULT_ADDR")
-        self._client = None
+        self._client: Any = None
 
-    def _get_client(self):
+    def _get_client(self) -> Any:
         if self._client is None:
             try:
-                import hvac  # type: ignore
+                import hvac
             except ImportError as exc:  # pragma: no cover - depends on extra
                 raise SecretError(
                     "Vault provider requires the 'vault' extra: "
@@ -54,7 +55,7 @@ class VaultSecretProvider(SecretProvider):
         # Single-key secrets resolve directly; otherwise require a 'value' key
         # so behaviour is predictable across backends.
         if "value" in data:
-            return data["value"]
+            return str(data["value"])
         if len(data) == 1:
-            return next(iter(data.values()))
+            return str(next(iter(data.values())))
         raise SecretError(f"secret has multiple keys and no 'value': {name}")

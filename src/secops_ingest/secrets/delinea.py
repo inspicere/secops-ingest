@@ -11,6 +11,7 @@ client registration is unavailable.
 from __future__ import annotations
 
 import os
+from typing import Any
 
 from .base import SecretError, SecretNotFound, SecretProvider
 
@@ -34,14 +35,14 @@ class DelineaSecretProvider(SecretProvider):
         self._folder = folder or os.environ.get("SECOPS_DELINEA_FOLDER")
         if not self._base_url:
             raise SecretError("Delinea provider requires SECOPS_DELINEA_URL")
-        self._client = None
+        self._client: Any = None
 
-    def _get_client(self):
+    def _get_client(self) -> Any:
         if self._client is None:
             try:
                 # Imported lazily so the core package has no hard dependency
                 # on a proprietary SDK.
-                from delinea.secrets.server import SecretServer  # type: ignore
+                from delinea.secrets.server import SecretServer
             except ImportError as exc:  # pragma: no cover - depends on extra
                 raise SecretError(
                     "Delinea provider requires the 'delinea' extra: "
@@ -50,7 +51,7 @@ class DelineaSecretProvider(SecretProvider):
             self._client = self._build_client(SecretServer)
         return self._client
 
-    def _build_client(self, secret_server_cls):  # pragma: no cover - needs a live server
+    def _build_client(self, secret_server_cls: Any) -> Any:  # pragma: no cover - needs a live server
         # SDK client registration is the intended path; the SDK resolves its
         # machine-bound credential itself.
         return secret_server_cls(self._base_url)
@@ -59,7 +60,7 @@ class DelineaSecretProvider(SecretProvider):
         client = self._get_client()
         try:
             secret = client.get_secret_by_path(f"{self._folder}\\{name}")
-            return secret.fields["password"].value
+            return str(secret.fields["password"].value)
         except Exception as exc:
             # Never surface the backend's exception text: it can contain paths,
             # folder structure, or field contents.

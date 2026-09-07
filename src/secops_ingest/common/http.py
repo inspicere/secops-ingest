@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import random
 import time
-from typing import Callable, TypeVar
+from collections.abc import Callable
+from typing import TypeVar
 
 try:
     import httpx
@@ -62,4 +63,4 @@ def _delay(attempt: int, base: float, cap: float, retry_after: str | None) -> fl
             return min(float(retry_after), cap)   # honour the server's own hint
         except ValueError:
             pass
-    return min(cap, base * (2 ** attempt)) * (0.5 + random.random() / 2)
+    return min(cap, base * (2.0**attempt)) * (0.5 + random.random() / 2)

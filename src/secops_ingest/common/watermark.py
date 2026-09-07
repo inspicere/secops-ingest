@@ -30,7 +30,9 @@ def comparable(value: Any) -> Any:
     if text.isdigit():
         return int(text)
     try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        # No Z -> +00:00 rewrite: fromisoformat parses the military suffix
+        # itself from 3.11, which is this package's floor.
+        return datetime.fromisoformat(text)
     except ValueError:
         if text[:4] not in _warned_unparsable:
             _warned_unparsable.add(text[:4])
@@ -52,4 +54,4 @@ def newer(candidate: Any, current: Any) -> bool:
         log.warning("watermark type changed (%s -> %s); not advancing",
                     type(b).__name__, type(a).__name__)
         return False
-    return a > b
+    return bool(a > b)

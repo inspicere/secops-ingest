@@ -12,11 +12,12 @@ import argparse
 import importlib
 import logging
 import sys
+from typing import Any
 
 from .redaction import RedactingFilter
 
 
-def _load_source(name: str):
+def _load_source(name: str) -> Any:
     target = f"secops_ingest.sources.{name}"
     try:
         module = importlib.import_module(f".sources.{name}", package="secops_ingest")

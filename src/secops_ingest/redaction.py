@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 
-
 #: Process-wide registry. Credentials are registered once when fetched, so any
 #: code path that persists text - not only logging - can scrub it.
 _REGISTRY: set[str] = set()

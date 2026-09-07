@@ -40,3 +40,10 @@ target-version = "py311"
 [tool.mypy]
 python_version = "3.11"
 strict = true
+
+# Optional backends and drivers. They are deliberately absent from the default
+# dev environment: the package must type-check without them for the same reason
+# it must import without them.
+[[tool.mypy.overrides]]
+module = ["psycopg.*", "httpx", "hvac", "delinea.*"]
+ignore_missing_imports = true

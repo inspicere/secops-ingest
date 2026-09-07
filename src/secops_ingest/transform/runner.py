@@ -32,7 +32,7 @@ class TransformResult:
     error: str | None = None
 
 
-def _start(conn, target: str) -> int:
+def _start(conn: Any, target: str) -> int:
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO control.transform_run (target, status) "
@@ -44,7 +44,9 @@ def _start(conn, target: str) -> int:
     return int(run_id)
 
 
-def _finish(conn, run_id: int, status: str, rows: int, days: int, error: str | None) -> None:
+def _finish(
+    conn: Any, run_id: int, status: str, rows: int, days: int, error: str | None
+) -> None:
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE control.transform_run SET ended_at = now(), status = %s, "
@@ -54,7 +56,7 @@ def _finish(conn, run_id: int, status: str, rows: int, days: int, error: str | N
     conn.commit()
 
 
-def _watermark(conn, target: str):
+def _watermark(conn: Any, target: str) -> Any:
     with conn.cursor() as cur:
         cur.execute(
             "SELECT cursor_value FROM control.transform_watermark WHERE target = %s",
@@ -64,7 +66,7 @@ def _watermark(conn, target: str):
     return row[0] if row else None
 
 
-def _advance(conn, target: str, value) -> None:
+def _advance(conn: Any, target: str, value: Any) -> None:
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO control.transform_watermark (target, cursor_value, updated_at) "
@@ -115,7 +117,10 @@ def execute(target: Target) -> TransformResult:
             log.exception("target=%s run=%s failed", target.name, run_id)
             try:
                 conn.rollback()
-            except Exception:                      # pragma: no cover - defensive
+            # Deliberately blind: this runs while another exception is
+            # unwinding. A narrower clause would let a rollback failure
+            # replace the original error, which is the one worth reading.
+            except Exception:  # pragma: no cover - defensive  # noqa: BLE001
                 log.warning("rollback failed while handling a transform failure")
             try:
                 _finish(conn, run_id, "FAILED", 0, 0, f"{type(exc).__name__}: {exc}")
@@ -124,7 +129,7 @@ def execute(target: Target) -> TransformResult:
             raise
 
 
-def _affected_days(conn, target: Target, since) -> list[date]:
+def _affected_days(conn: Any, target: Target, since: Any) -> list[date]:
     """Days touched by THIS run, derived from raw rows newer than the watermark.
 
     Deliberately not a scan of the fact table: that would return every day the
@@ -143,7 +148,7 @@ def _affected_days(conn, target: Target, since) -> list[date]:
         return [r[0] for r in cur.fetchall()]
 
 
-def _rebuild_rollups(conn, target: Target, days: list[date]) -> None:
+def _rebuild_rollups(conn: Any, target: Target, days: list[date]) -> None:
     """Recompute whole days from FACTS. Never increment.
 
     Incrementing double-counts on any retry. The day is cleared and rebuilt in
@@ -158,7 +163,7 @@ def _rebuild_rollups(conn, target: Target, days: list[date]) -> None:
         cur.execute(target.rollup_sql, {"days": days})
 
 
-def _record_coverage(conn, target: Target, days: list[date]) -> None:
+def _record_coverage(conn: Any, target: Target, days: list[date]) -> None:
     """Prove a period's reporting rows exist, so raw expiry can be gated on it."""
     if not days:
         return

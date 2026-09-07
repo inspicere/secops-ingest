@@ -13,8 +13,9 @@ Design notes:
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any
 
 try:
     import psycopg

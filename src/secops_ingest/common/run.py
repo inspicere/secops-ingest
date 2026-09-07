@@ -12,12 +12,13 @@ rather than once per connector.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any, Iterator, Protocol
+from typing import Any, Protocol
 
+from ..redaction import scrub
 from . import db
 from .watermark import newer as _newer
-from ..redaction import scrub
 
 log = logging.getLogger(__name__)
 
@@ -34,17 +35,17 @@ class Source(Protocol):
     def authenticate(self) -> Any:
         """Fetch credentials ONCE per run. Held in memory, never written."""
 
-    def fetch(self, creds: Any, cursor: str | None) -> Iterator[dict]:
+    def fetch(self, creds: Any, cursor: str | None) -> Iterator[dict[str, Any]]:
         """Yield raw vendor records newer than `cursor`."""
 
-    def to_row(self, record: dict, run_id: int) -> tuple:
+    def to_row(self, record: dict[str, Any], run_id: int) -> tuple[Any, ...]:
         """Map a record to (source_id, payload, _event_time, _source_run_id).
 
         `_event_time` MUST come from an immutable field - the record's creation
         time, never the field the watermark uses. It is the partition key.
         """
 
-    def watermark_of(self, record: dict) -> Any:
+    def watermark_of(self, record: dict[str, Any]) -> Any:
         """Value to advance the watermark to. Usually a modification time."""
 
 
@@ -68,7 +69,7 @@ def execute(source: Source, *, dry_run: bool = False, batch_size: int = DEFAULT_
             log.info("source=%s run=%s cursor=%s dry_run=%s",
                      source.name, run_id, cursor, dry_run)
 
-            batch: list[tuple] = []
+            batch: list[tuple[Any, ...]] = []
             for record in source.fetch(creds, cursor):
                 read += 1
                 mark = source.watermark_of(record)
@@ -106,7 +107,10 @@ def execute(source: Source, *, dry_run: bool = False, batch_size: int = DEFAULT_
                 # masking the real failure.
                 try:
                     conn.rollback()
-                except Exception:            # pragma: no cover - defensive
+                # Deliberately blind: this runs while another exception is
+                # unwinding. A narrower clause would let a rollback failure
+                # replace the original error, which is the one worth reading.
+                except Exception:  # pragma: no cover - defensive  # noqa: BLE001
                     log.warning("rollback failed while handling a run failure")
                 try:
                     db.finish_run(
@@ -119,7 +123,7 @@ def execute(source: Source, *, dry_run: bool = False, batch_size: int = DEFAULT_
             raise
 
 
-def _land(conn, source: Source, batch: list[tuple], dry_run: bool) -> int:
+def _land(conn: Any, source: Source, batch: list[tuple[Any, ...]], dry_run: bool) -> int:
     if dry_run:
         return len(batch)
     return db.upsert_many(conn, source.table, batch)

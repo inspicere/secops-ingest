@@ -22,7 +22,6 @@ from secops_ingest.secrets import (
     validate_name,
 )
 
-
 # --- name validation: this is what makes path-based backends safe ---
 
 @pytest.mark.parametrize(
