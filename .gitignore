@@ -18,6 +18,10 @@ venv/
 *.tgz
 *.tar.gz
 *.dump
-secrets/
+# Anchored to the repo root. Unanchored, `secrets/` matches at ANY depth and
+# silently excludes src/secops_ingest/secrets/ and tests/secrets/ — the package
+# publishes without the module it is built around, and still imports locally
+# because the files are on disk.
+/secrets/
 *.pem
 *.key
