@@ -219,6 +219,40 @@ python -m secops_ingest.transform <target>
 - a bare `%(since)s` inside `IS NULL` must be cast (`%(since)s::timestamptz`); PostgreSQL cannot
   infer a type for it and raises `AmbiguousParameter`
 
+## Warehouse schema
+
+The DDL ships with the package and is emitted as SQL, never executed:
+
+```bash
+python -m secops_ingest.schema | psql "$DSN"
+python -m secops_ingest.schema --target wazuh_alerts --partitions-ahead 6
+```
+
+Three layers: `raw_*` landing tables partitioned monthly on an immutable event
+time, `control` for run history, watermarks and the coverage ledger, and
+`mart_*` facts and rollups declared by each transform target.
+
+Emitting rather than applying keeps the schema usable from psql, Ansible, a
+migration tool, or a code review — and means this part needs no database driver.
+Everything is `IF NOT EXISTS` or a guarded `DO` block, so re-running is safe.
+
+Three things in it are load-bearing and easy to undo by accident:
+
+**`_event_time` must come from an immutable field.** It is the partition key.
+Sources that mutate records watermark on the modification time so state changes
+are re-read; partitioning on that would move a row between partitions every time
+somebody touched it.
+
+**The month arithmetic is PostgreSQL's.** Adding an "average month" of seconds in
+application code drifts and eventually skips a month — which surfaces as inserts
+failing at midnight on the first, with no prior warning. Keep the lookahead
+window maintained on every deploy rather than assuming it.
+
+**The coverage ledger is what makes raw expiry safe.** Raw is a bounded
+re-derivation buffer, so dropping a partition is irreversible. Nothing may drop a
+period without a positive row in `control.transform_coverage` recording that the
+period's reporting rows exist.
+
 ## Credential handling
 
 - Secrets are fetched once per run and held in memory. Nothing is cached to disk.

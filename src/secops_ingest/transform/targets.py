@@ -47,6 +47,30 @@ EXAMPLE = Target(
         WHERE reported_at::date = ANY(%(days)s)
         GROUP BY 1, 2, 3, 4
     """,
+    fact_ddl="""
+        CREATE TABLE IF NOT EXISTS mart_fact_example_messages (
+            message_id  text        NOT NULL,
+            reported_at timestamptz NOT NULL,
+            updated_at  timestamptz,
+            status      text,
+            category    text,
+            severity    text,
+            PRIMARY KEY (message_id, reported_at)
+        ) PARTITION BY RANGE (reported_at);
+        CREATE INDEX IF NOT EXISTS mart_fact_example_messages_reported_at_idx
+            ON mart_fact_example_messages (reported_at);
+    """,
+    rollup_ddl="""
+        CREATE TABLE IF NOT EXISTS mart_rollup_example_daily (
+            day           date   NOT NULL,
+            status        text,
+            category      text,
+            severity      text,
+            message_count bigint NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS mart_rollup_example_daily_day_idx
+            ON mart_rollup_example_daily (day);
+    """,
 )
 
 #: A busy Wazuh deployment exceeds 20,000 alerts/day, so a 7-year trend over
@@ -102,6 +126,39 @@ WAZUH = Target(
         FROM mart_fact_wazuh_alerts
         WHERE occurred_at::date = ANY(%(days)s)
         GROUP BY 1, 2, 3, 4
+    """,
+    fact_ddl="""
+        CREATE TABLE IF NOT EXISTS mart_fact_wazuh_alerts (
+            alert_id         text        NOT NULL,
+            occurred_at      timestamptz NOT NULL,
+            rule_id          text,
+            rule_level       integer,
+            rule_description text,
+            rule_group       text,
+            agent_id         text,
+            agent_name       text,
+            decoder          text,
+            location         text,
+            PRIMARY KEY (alert_id, occurred_at)
+        ) PARTITION BY RANGE (occurred_at);
+        CREATE INDEX IF NOT EXISTS mart_fact_wazuh_alerts_occurred_at_idx
+            ON mart_fact_wazuh_alerts (occurred_at);
+        -- agent_name is excluded from the rollup on cardinality grounds, so
+        -- per-agent questions are answered here instead. This index is what
+        -- makes that affordable.
+        CREATE INDEX IF NOT EXISTS mart_fact_wazuh_alerts_agent_idx
+            ON mart_fact_wazuh_alerts (agent_name);
+    """,
+    rollup_ddl="""
+        CREATE TABLE IF NOT EXISTS mart_rollup_wazuh_daily (
+            day         date   NOT NULL,
+            rule_level  integer,
+            rule_group  text,
+            decoder     text,
+            alert_count bigint NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS mart_rollup_wazuh_daily_day_idx
+            ON mart_rollup_wazuh_daily (day);
     """,
 )
 
@@ -202,6 +259,45 @@ DEFECTDOJO = Target(
         FROM mart_fact_defectdojo_findings
         WHERE discovered_at = ANY(%(days)s)
         GROUP BY 1, 2, 3
+    """,
+    fact_ddl="""
+        CREATE TABLE IF NOT EXISTS mart_fact_defectdojo_findings (
+            finding_id          text NOT NULL,
+            discovered_at       date NOT NULL,
+            created_at          timestamptz,
+            last_status_update  timestamptz,
+            mitigated_at        timestamptz,
+            severity            text,
+            status              text,
+            cwe                 integer,
+            cvss_score          numeric(4,1),
+            component_name      text,
+            sla_start_date      date,
+            sla_expiration_date date,
+            PRIMARY KEY (finding_id, discovered_at)
+        ) PARTITION BY RANGE (discovered_at);
+        CREATE INDEX IF NOT EXISTS mart_fact_defectdojo_findings_discovered_idx
+            ON mart_fact_defectdojo_findings (discovered_at);
+        -- The rollup deliberately does NOT precompute open-SLA breaches, because
+        -- that answer is a function of now() and would drift. It is computed at
+        -- query time instead, and this partial index is what makes that cheap:
+        -- it covers exactly the still-open rows the question asks about.
+        CREATE INDEX IF NOT EXISTS mart_fact_defectdojo_findings_open_sla_idx
+            ON mart_fact_defectdojo_findings (sla_expiration_date)
+            WHERE mitigated_at IS NULL;
+    """,
+    rollup_ddl="""
+        CREATE TABLE IF NOT EXISTS mart_rollup_defectdojo_daily (
+            day                         date   NOT NULL,
+            severity                    text,
+            status                      text,
+            finding_count               bigint NOT NULL,
+            days_to_mitigate_sum        bigint NOT NULL,
+            days_to_mitigate_count      bigint NOT NULL,
+            sla_breached_on_close_count bigint NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS mart_rollup_defectdojo_daily_day_idx
+            ON mart_rollup_defectdojo_daily (day);
     """,
 )
 

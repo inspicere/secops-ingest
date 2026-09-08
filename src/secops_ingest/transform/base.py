@@ -39,6 +39,15 @@ class Target:
     rollup_table: str | None = None
     rollup_sql: str | None = None
 
+    #: DDL creating fact_table / rollup_table.
+    #:
+    #: Carried by the target rather than kept in a deployment repo, because a
+    #: target that declares SQL writing into a table nobody creates is only half
+    #: a definition -- and the half that is missing fails at 3am on first run,
+    #: not at review time.
+    fact_ddl: str | None = None
+    rollup_ddl: str | None = None
+
     def __post_init__(self) -> None:
         if "%(since)s" not in self.upsert_sql:
             raise ValueError(
@@ -54,4 +63,19 @@ class Target:
         if bool(self.rollup_table) != bool(self.rollup_sql):
             raise ValueError(
                 f"target {self.name}: rollup_table and rollup_sql must be set together"
+            )
+        # A DDL block that creates something other than the table this target
+        # writes to is worse than none: it succeeds, and the upsert then fails
+        # against a table that does not exist.
+        if self.fact_ddl and self.fact_table not in self.fact_ddl:
+            raise ValueError(
+                f"target {self.name}: fact_ddl does not create {self.fact_table}"
+            )
+        if self.rollup_ddl and self.rollup_table and self.rollup_table not in self.rollup_ddl:
+            raise ValueError(
+                f"target {self.name}: rollup_ddl does not create {self.rollup_table}"
+            )
+        if self.rollup_ddl and not self.rollup_table:
+            raise ValueError(
+                f"target {self.name}: rollup_ddl given but no rollup_table"
             )
