@@ -33,8 +33,11 @@ jobs:
           print('core OK:', available_backends())
           "
 
+      # The http extra is required, not optional, for the suite to be meaningful:
+      # connector tests guard on `importorskip("httpx")`, so without it they
+      # skip silently and CI reports green on tests that never ran.
       - name: Install dev dependencies
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev,http]"
 
       - name: Lint
         run: ruff check src tests

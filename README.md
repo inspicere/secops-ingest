@@ -43,6 +43,34 @@ inside the same hour produce byte-identical rows. That is deliberate: it is what
 idempotency observable. With a `now()` anchor every run mints new ids, and a re-run always looks
 like it inserted correctly whether or not it did.
 
+## A connector against a real product
+
+`example` proves the wiring; **`wazuh`** proves the contract. Wazuh is an
+open-source (GPLv2) XDR/SIEM platform, so the connector can be exercised against
+software anyone can install rather than against a synthetic fixture:
+
+```bash
+export SECOPS_WAZUH_URL=https://127.0.0.1:9200
+export SECOPS_SECRETS_BACKEND=env
+export SECOPS_SECRET_WAZUH_INDEXER_PASSWORD=...
+python -m secops_ingest wazuh --dry-run
+```
+
+Speaking HTTP to a GPL-licensed server places no licence obligation on this
+Apache-2.0 client — nothing here links to or vendors Wazuh code.
+
+It is also the connector worth reading before writing your own, because it has
+the problem the synthetic example does not. Wazuh alerts are append-only, so the
+event time *is* the watermark — and that is exactly what makes late arrival
+dangerous. An agent that was offline can index an alert older than a watermark
+already passed, and a strict `> cursor` query would step over it and never look
+back. The loss would be silent.
+
+So each run re-reads a trailing window (`SECOPS_WAZUH_LAG_SECONDS`, default 900).
+Re-reading costs nothing because landing is an upsert keyed on
+`(source_id, _event_time)`. That trade — a little duplicate work against losing
+records — is the one most connectors get wrong in the same direction.
+
 ## Secret backends
 
 Selected by `SECOPS_SECRETS_BACKEND`, defaulting to `env`.
@@ -58,7 +86,7 @@ Selected by `SECOPS_SECRETS_BACKEND`, defaulting to `env`.
 from secops_ingest.secrets import get_provider
 
 provider = get_provider()           # or get_provider("file", directory="/run/secrets")
-token = provider.get("phisher_api_key")
+token = provider.get("wazuh_indexer_password")
 ```
 
 The `vault` backend speaks the Vault HTTP API, so it works against
