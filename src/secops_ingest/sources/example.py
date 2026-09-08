@@ -19,7 +19,7 @@ from typing import Any
 
 class ExampleSource:
     name = "example"
-    table = "raw_phisher.messages"
+    table = "raw_example.messages"
 
     #: Records to emit per run. Kept small; this exists to prove wiring.
     count = int(os.environ.get("SECOPS_EXAMPLE_COUNT", "25"))

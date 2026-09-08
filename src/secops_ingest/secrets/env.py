@@ -15,7 +15,8 @@ from .base import SecretNotFound, SecretProvider
 class EnvSecretProvider(SecretProvider):
     """Read secrets from environment variables.
 
-    ``phisher-api-token`` resolves to ``SECOPS_SECRET_PHISHER_API_TOKEN``.
+    ``wazuh-indexer-password`` resolves to
+    ``SECOPS_SECRET_WAZUH_INDEXER_PASSWORD``.
     """
 
     def __init__(self, prefix: str = "SECOPS_SECRET_", **kwargs: object) -> None:

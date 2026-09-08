@@ -42,7 +42,7 @@ class RedactingFilter(logging.Filter):
 
         redactor = RedactingFilter()
         logging.getLogger().addFilter(redactor)
-        redactor.register(provider.get("phisher-api-token"))
+        redactor.register(provider.get("wazuh-indexer-password"))
     """
 
     #: Values shorter than this are not redacted - they would match too much

@@ -12,7 +12,7 @@ from .base import Target
 #: derived from a raw buffer that is dropped on schedule.
 EXAMPLE = Target(
     name="example_messages",
-    raw_table="raw_phisher.messages",
+    raw_table="raw_example.messages",
     fact_table="mart_fact_example_messages",
     fact_date_expr="reported_at",
     upsert_sql="""
@@ -25,7 +25,7 @@ EXAMPLE = Target(
             payload->>'status',
             payload->>'category',
             payload->>'severity'
-        FROM raw_phisher.messages
+        FROM raw_example.messages
         -- Casts are required: PostgreSQL cannot infer a type for a bare
         -- parameter used in `IS NULL`, and raises AmbiguousParameter.
         WHERE %(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz
@@ -49,51 +49,60 @@ EXAMPLE = Target(
     """,
 )
 
-#: Avanan exceeds 20,000 events/day, so a 7-year trend over per-record facts
-#: scans ~51M rows. The rollup reduces that to ~1.2M — 42x less — which is what
-#: makes a long-horizon dashboard usable on a shared 4-core host.
+#: A busy Wazuh deployment exceeds 20,000 alerts/day, so a 7-year trend over
+#: per-record facts scans ~51M rows. The rollup reduces that to ~1.2M — 42x less
+#: — which is what makes a long-horizon dashboard usable on a modest host.
 #:
-#: Per-record facts are retained for the full period regardless (~24GB), so this
-#: grain is a performance optimisation and can be rebuilt, not a one-way door.
+#: Per-record facts are retained for the full period regardless, so this grain is
+#: a performance optimisation that can be rebuilt, not a one-way door.
 #:
-#: EVERY DIMENSION HERE MUST BE LOW-CARDINALITY. Adding sender_domain (~5,000
-#: distinct) would yield up to 120,000 rows/day — a rollup larger than the fact
-#: table it summarises. High-cardinality attributes stay in the facts.
-AVANAN = Target(
-    name="avanan_events",
-    raw_table="raw_avanan.events",
-    fact_table="mart_fact_avanan_events",
+#: EVERY DIMENSION HERE MUST BE LOW-CARDINALITY. rule_level has 16 values and
+#: decoder a few dozen, so the daily rollup stays small. agent_name is the
+#: tempting mistake: it looks like an obvious dimension and is bounded only by
+#: fleet size, so on a 5,000-agent estate it would produce a rollup larger than
+#: the fact table it summarises. High-cardinality attributes stay in the facts,
+#: where a dashboard can filter to one agent without paying for all of them.
+WAZUH = Target(
+    name="wazuh_alerts",
+    raw_table="raw_wazuh.alerts",
+    fact_table="mart_fact_wazuh_alerts",
     fact_date_expr="occurred_at",
     upsert_sql="""
-        INSERT INTO mart_fact_avanan_events
-            (event_id, occurred_at, event_type, severity, verdict, direction,
-             sender_domain, subject_key)
+        INSERT INTO mart_fact_wazuh_alerts
+            (alert_id, occurred_at, rule_id, rule_level, rule_description,
+             rule_group, agent_id, agent_name, decoder, location)
         SELECT
             source_id,
-            (payload->>'eventCreated')::timestamptz,
-            payload->>'type',
-            payload->>'severity',
-            payload->>'state',
-            payload->>'direction',
-            payload->>'senderDomain',
-            payload->>'subject_key'
-        FROM raw_avanan.events
+            (payload->>'timestamp')::timestamptz,
+            payload->'rule'->>'id',
+            (payload->'rule'->>'level')::int,
+            payload->'rule'->>'description',
+            payload->'rule'->'groups'->>0,
+            payload->'agent'->>'id',
+            payload->'agent'->>'name',
+            payload->'decoder'->>'name',
+            payload->>'location'
+        FROM raw_wazuh.alerts
         WHERE %(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz
-        ON CONFLICT (event_id, occurred_at) DO UPDATE SET
-            event_type = EXCLUDED.event_type,
-            severity   = EXCLUDED.severity,
-            verdict    = EXCLUDED.verdict,
-            direction  = EXCLUDED.direction
+        -- Alerts are append-only, so this conflict clause fires only on the
+        -- connector's deliberate re-read of its late-arrival overlap window.
+        -- It exists so that overlap costs nothing but a rewrite of identical
+        -- values; without it the overlap would be a duplicate-key crash.
+        ON CONFLICT (alert_id, occurred_at) DO UPDATE SET
+            rule_level       = EXCLUDED.rule_level,
+            rule_description = EXCLUDED.rule_description,
+            rule_group       = EXCLUDED.rule_group,
+            decoder          = EXCLUDED.decoder
     """,
-    rollup_table="mart_rollup_avanan_daily",
+    rollup_table="mart_rollup_wazuh_daily",
     rollup_sql="""
-        INSERT INTO mart_rollup_avanan_daily
-            (day, event_type, severity, verdict, direction, event_count)
-        SELECT occurred_at::date, event_type, severity, verdict, direction, count(*)
-        FROM mart_fact_avanan_events
+        INSERT INTO mart_rollup_wazuh_daily
+            (day, rule_level, rule_group, decoder, alert_count)
+        SELECT occurred_at::date, rule_level, rule_group, decoder, count(*)
+        FROM mart_fact_wazuh_alerts
         WHERE occurred_at::date = ANY(%(days)s)
-        GROUP BY 1, 2, 3, 4, 5
+        GROUP BY 1, 2, 3, 4
     """,
 )
 
-TARGETS = {t.name: t for t in (EXAMPLE, AVANAN)}
+TARGETS = {t.name: t for t in (EXAMPLE, WAZUH)}

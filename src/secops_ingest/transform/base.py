@@ -21,10 +21,10 @@ class Target:
     #: Identifier used in control.transform_run / _watermark / _coverage.
     name: str
 
-    #: Source table, e.g. "raw_phisher.messages".
+    #: Source table, e.g. "raw_wazuh.alerts".
     raw_table: str
 
-    #: Destination, e.g. "mart_fact_phisher_messages".
+    #: Destination, e.g. "mart_fact_wazuh_alerts".
     fact_table: str
 
     #: Upsert deriving facts from raw. Receives %(since)s — the previous

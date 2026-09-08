@@ -36,7 +36,7 @@ def _load_source(name: str) -> Any:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="secops_ingest")
-    parser.add_argument("source", help="connector name, e.g. phisher")
+    parser.add_argument("source", help="connector name, e.g. wazuh")
     parser.add_argument("--dry-run", action="store_true",
                         help="fetch and validate, write nothing")
     parser.add_argument("--batch-size", type=int, default=None)

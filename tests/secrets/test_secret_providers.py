@@ -43,7 +43,7 @@ def test_invalid_names_rejected(bad: str) -> None:
         validate_name(bad)
 
 
-@pytest.mark.parametrize("good", ["phisher-api-token", "xdr.key", "a", "A_1-b.c"])
+@pytest.mark.parametrize("good", ["wazuh-indexer-password", "indexer.key", "a", "A_1-b.c"])
 def test_valid_names_accepted(good: str) -> None:
     assert validate_name(good) == good
 
@@ -51,8 +51,8 @@ def test_valid_names_accepted(good: str) -> None:
 # --- env provider ---
 
 def test_env_provider_reads_and_maps_name(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SECOPS_SECRET_PHISHER_API_TOKEN", "tok-123")
-    assert EnvSecretProvider().get("phisher-api-token") == "tok-123"
+    monkeypatch.setenv("SECOPS_SECRET_WAZUH_INDEXER_PASSWORD", "tok-123")
+    assert EnvSecretProvider().get("wazuh-indexer-password") == "tok-123"
 
 
 def test_env_provider_missing_raises_without_leaking_scheme(
