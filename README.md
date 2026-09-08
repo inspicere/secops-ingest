@@ -43,7 +43,7 @@ inside the same hour produce byte-identical rows. That is deliberate: it is what
 idempotency observable. With a `now()` anchor every run mints new ids, and a re-run always looks
 like it inserted correctly whether or not it did.
 
-## A connector against a real product
+## Connectors against real products
 
 `example` proves the wiring; **`wazuh`** proves the contract. Wazuh is an
 open-source (GPLv2) XDR/SIEM platform, so the connector can be exercised against
@@ -70,6 +70,36 @@ So each run re-reads a trailing window (`SECOPS_WAZUH_LAG_SECONDS`, default 900)
 Re-reading costs nothing because landing is an upsert keyed on
 `(source_id, _event_time)`. That trade — a little duplicate work against losing
 records — is the one most connectors get wrong in the same direction.
+
+### DefectDojo — the other half of the watermark problem
+
+`wazuh` and `defectdojo` are a deliberate pair, because between them they cover
+both shapes a connector can face:
+
+| | Wazuh | DefectDojo |
+|---|---|---|
+| Records | append-only | mutate for months |
+| Watermark | the event time itself | a separate modification field |
+| The hazard | late arrival leaves a silent gap | watermarking on creation misses every change |
+
+A DefectDojo finding is created once, then triaged, verified, risk-accepted,
+mitigated, reopened. A watermark on `created` reads it once on the day it
+appears and never again — so findings closed months ago still show as open, and
+the SLA numbers are wrong in the flattering direction. Nothing errors.
+
+Its API also has two traps worth knowing before writing any client for it:
+
+**Unknown query parameters are ignored, not rejected.** `?nonsense=xyzzy`
+returns the full collection with HTTP 200. A wrong parameter name does not fail
+— it silently returns everything.
+
+**The ordering parameter is `o=`, not `ordering=`.** The conventional name is
+accepted and ignored, per the first trap.
+
+There is no server-side time filter at all, so this connector sorts by
+modification time descending and stops at the first record older than the
+watermark. Against a ~50,000-finding instance that reads five records instead of
+fifty thousand.
 
 ## Secret backends
 
