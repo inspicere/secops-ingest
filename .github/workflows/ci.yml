@@ -71,3 +71,54 @@ jobs:
             exit 1
           fi
           echo "hygiene clean"
+
+  # The pluggable-backend claim, demonstrated rather than asserted.
+  #
+  # OpenBao is the MPL-2.0 fork of Vault's last open-source branch, under Linux
+  # Foundation governance, and keeps Vault's HTTP API. Testing against it proves
+  # two things at once: the provider works with a real server, and it does so
+  # with nothing proprietary anywhere in the job. HashiCorp Vault moved to BUSL
+  # in 2023, so it could not play this role.
+  openbao:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Start OpenBao
+        run: |
+          docker run -d --name openbao -p 8200:8200 \
+            -e BAO_DEV_ROOT_TOKEN_ID=root \
+            -e BAO_DEV_LISTEN_ADDRESS=0.0.0.0:8200 \
+            quay.io/openbao/openbao:latest server -dev
+          for i in $(seq 1 45); do
+            curl -sf http://127.0.0.1:8200/v1/sys/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+          # Fail here rather than letting the tests skip: VAULT_ADDR is set in
+          # the next step regardless, so a server that never came up would
+          # otherwise surface as a confusing collection errors instead of
+          # "the backend is down".
+          if ! curl -sf http://127.0.0.1:8200/v1/sys/health >/dev/null; then
+            echo "::error::OpenBao did not become healthy"
+            docker logs openbao
+            exit 1
+          fi
+          echo "server reports:"
+          curl -sf http://127.0.0.1:8200/v1/sys/health
+
+      - name: Install with the vault extra
+        run: pip install -e ".[vault,dev]"
+
+      - name: Vault provider resolves secrets from OpenBao
+        env:
+          VAULT_ADDR: http://127.0.0.1:8200
+          VAULT_TOKEN: root
+        run: pytest tests/secrets/test_vault_backend_integration.py -v
+
+      - name: OpenBao logs
+        if: failure()
+        run: docker logs openbao

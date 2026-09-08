@@ -51,7 +51,7 @@ Selected by `SECOPS_SECRETS_BACKEND`, defaulting to `env`.
 |---|---|---|
 | `env` | development, CI, containers | yes |
 | `file` | systemd `LoadCredential=`, Docker and Kubernetes secrets | yes |
-| `vault` | HashiCorp Vault | `[vault]` |
+| `vault` | HashiCorp Vault, or OpenBao | `[vault]` |
 | `delinea` | Delinea Secret Server | `[delinea]` |
 
 ```python
@@ -60,6 +60,25 @@ from secops_ingest.secrets import get_provider
 provider = get_provider()           # or get_provider("file", directory="/run/secrets")
 token = provider.get("phisher_api_key")
 ```
+
+The `vault` backend speaks the Vault HTTP API, so it works against
+[OpenBao](https://openbao.org/) unchanged — the MPL-2.0 fork of Vault's last
+open-source branch, now under Linux Foundation governance. That matters here:
+HashiCorp Vault moved to the BUSL in 2023, and a package claiming pluggable,
+open backends should be able to name one that is actually open.
+
+CI runs the provider's integration tests against a live OpenBao server on every
+push, so this is demonstrated rather than asserted. To run them yourself:
+
+```bash
+docker run -d -p 8200:8200 -e BAO_DEV_ROOT_TOKEN_ID=root \
+    quay.io/openbao/openbao:latest server -dev
+pip install -e ".[vault,dev]"
+VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root pytest tests/secrets -v
+```
+
+Without `VAULT_ADDR` those tests skip, so the default `pytest` run still needs
+no network and no server.
 
 The interface is one method:
 
