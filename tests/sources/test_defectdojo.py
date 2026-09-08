@@ -38,7 +38,11 @@ def finding(
 
 
 def page(records: list[dict[str, Any]], more: bool = False) -> dict[str, Any]:
-    return {"count": 999, "next": "http://x/next" if more else None, "results": records}
+    # The connector only tests `next` for truthiness — it paginates by offset —
+    # but a realistic value is what the API actually returns, and example.com is
+    # reserved by RFC 2606 for exactly this.
+    nxt = "https://dojo.example.com/api/v2/findings/?limit=2&offset=2" if more else None
+    return {"count": 999, "next": nxt, "results": records}
 
 
 class Recorder:
