@@ -105,4 +105,104 @@ WAZUH = Target(
     """,
 )
 
-TARGETS = {t.name: t for t in (EXAMPLE, WAZUH)}
+#: Vulnerability findings. The counterpart to WAZUH in the transform layer, for
+#: the same reason the connectors are a pair: Wazuh alerts are events that
+#: happened, DefectDojo findings are open items whose STATE changes for months.
+#:
+#: The grain is the DISCOVERY date, not the modification date. That is what makes
+#: the rollup correct under mutation: when a finding discovered in July is
+#: mitigated today, its raw row still carries July as _event_time, so the runner
+#: recomputes July's rollup and the day it belongs to gets the new state. A
+#: modification-date grain would scatter one finding's history across every day
+#: somebody touched it.
+#:
+#: MEASURES ARE ADDITIVE ON PURPOSE. days_to_mitigate is stored as a SUM and a
+#: COUNT rather than a mean, because means do not re-aggregate: averaging the
+#: daily averages over a month weights a day with two findings the same as a day
+#: with two hundred. Storing both terms lets the dashboard divide at whatever
+#: grain it is actually showing, and get the right answer at all of them.
+DEFECTDOJO = Target(
+    name="defectdojo_findings",
+    raw_table="raw_defectdojo.findings",
+    fact_table="mart_fact_defectdojo_findings",
+    fact_date_expr="discovered_at",
+    upsert_sql="""
+        INSERT INTO mart_fact_defectdojo_findings
+            (finding_id, discovered_at, created_at, last_status_update, mitigated_at,
+             severity, status, cwe, cvss_score, component_name,
+             sla_start_date, sla_expiration_date)
+        SELECT
+            source_id,
+            COALESCE((payload->>'date')::date, (payload->>'created')::timestamptz::date),
+            (payload->>'created')::timestamptz,
+            (payload->>'last_status_update')::timestamptz,
+            (payload->>'mitigated')::timestamptz,
+            payload->>'severity',
+            -- Order is a decision, not an accident. A finding can be several of
+            -- these at once, and the first match wins: a false positive that was
+            -- also closed is a false positive, not a mitigation, or the
+            -- time-to-mitigate figures get credit for work nobody did.
+            CASE
+                WHEN (payload->>'false_p')::boolean        THEN 'false_positive'
+                WHEN (payload->>'duplicate')::boolean      THEN 'duplicate'
+                WHEN (payload->>'out_of_scope')::boolean   THEN 'out_of_scope'
+                WHEN (payload->>'risk_accepted')::boolean  THEN 'risk_accepted'
+                WHEN (payload->>'is_mitigated')::boolean   THEN 'mitigated'
+                WHEN (payload->>'active')::boolean         THEN 'open'
+                ELSE 'inactive'
+            END,
+            (payload->>'cwe')::int,
+            (payload->>'cvssv3_score')::numeric,
+            payload->>'component_name',
+            (payload->>'sla_start_date')::date,
+            (payload->>'sla_expiration_date')::date
+        FROM raw_defectdojo.findings
+        WHERE %(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz
+        -- Every mutable column is refreshed. Unlike an append-only source, this
+        -- clause is the normal path rather than the exception: most rows arrive
+        -- because their state changed, not because they are new.
+        ON CONFLICT (finding_id, discovered_at) DO UPDATE SET
+            last_status_update = EXCLUDED.last_status_update,
+            mitigated_at       = EXCLUDED.mitigated_at,
+            severity           = EXCLUDED.severity,
+            status             = EXCLUDED.status,
+            cvss_score         = EXCLUDED.cvss_score,
+            sla_expiration_date = EXCLUDED.sla_expiration_date
+    """,
+    rollup_table="mart_rollup_defectdojo_daily",
+    # severity has 5 values and status 7, so a day holds at most ~35 rows.
+    # component_name is deliberately absent: ~thousands of distinct values would
+    # make the rollup larger than the facts it summarises. It stays in the fact
+    # table, where a dashboard can filter to one component without paying for all.
+    rollup_sql="""
+        INSERT INTO mart_rollup_defectdojo_daily
+            (day, severity, status, finding_count,
+             days_to_mitigate_sum, days_to_mitigate_count, sla_breached_on_close_count)
+        SELECT
+            discovered_at,
+            severity,
+            status,
+            count(*),
+            -- SUM and COUNT, never an average. See the note above the target.
+            COALESCE(SUM(mitigated_at::date - discovered_at)
+                     FILTER (WHERE mitigated_at IS NOT NULL), 0),
+            COUNT(*) FILTER (WHERE mitigated_at IS NOT NULL),
+            -- Only breaches that are already SETTLED are counted here. Whether a
+            -- still-open finding has blown its SLA is a function of now(), and
+            -- this table is only recomputed when a finding changes -- so a
+            -- stored open-breach count would be correct on the day it was
+            -- written and silently drift wrong every day after. That figure has
+            -- to be computed at query time against sla_expiration_date on the
+            -- facts, which are retained for the full reporting period.
+            COUNT(*) FILTER (
+                WHERE mitigated_at IS NOT NULL
+                  AND sla_expiration_date IS NOT NULL
+                  AND mitigated_at::date > sla_expiration_date
+            )
+        FROM mart_fact_defectdojo_findings
+        WHERE discovered_at = ANY(%(days)s)
+        GROUP BY 1, 2, 3
+    """,
+)
+
+TARGETS = {t.name: t for t in (EXAMPLE, WAZUH, DEFECTDOJO)}
