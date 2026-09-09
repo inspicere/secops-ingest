@@ -21,6 +21,7 @@ import re
 __all__ = [
     "InvalidIdentifier",
     "control_sql",
+    "grants_sql",
     "mart_partition_sql",
     "partitions_sql",
     "raw_table_sql",
@@ -217,3 +218,98 @@ def mart_partition_sql(table: str, *, behind: int = 1, ahead: int = 3) -> str:
     if ahead < 1:
         raise ValueError("ahead must be >= 1, or the current month is the last one created")
     return _partition_do_block(table, table, behind, ahead)
+
+
+def grants_sql(
+    raw_schemas: list[str],
+    mart_tables: list[str],
+    *,
+    ingest_role: str | None = None,
+    transform_role: str | None = None,
+    read_role: str | None = None,
+) -> str:
+    """Privileges for the three jobs that touch this schema.
+
+    Roles are named rather than assumed, because role naming is a local
+    convention and hardcoding one makes the package unusable anywhere else.
+    Omit a role and its grants are simply not emitted.
+
+    TWO THINGS THAT HAVE ALREADY GONE WRONG HERE:
+
+    Sequence privileges. Both run tables have a `bigserial` primary key, so a
+    role that may INSERT into control.ingest_run still cannot do it without
+    USAGE on the underlying sequence. The failure arrives on the first write of
+    the first run, long after the grant looked complete.
+
+    The transform's control grants. It is easy to reason that the transform only
+    reads raw and writes mart, and to forget that it also records its own run
+    history, watermark and coverage. Missing those, it dies at the first insert
+    with a permission error that names a table nobody was thinking about.
+
+    ALTER DEFAULT PRIVILEGES matters because raw tables are partitioned and new
+    monthly partitions are created continuously. Without it, grants cover
+    today's partitions and silently fail to cover next month's.
+    """
+    for name in raw_schemas:
+        validate_identifier(name)
+    for name in mart_tables:
+        validate_identifier(name)
+    for role in (ingest_role, transform_role, read_role):
+        if role is not None:
+            validate_identifier(role)
+
+    out: list[str] = []
+
+    if ingest_role:
+        out.append(f"-- {ingest_role}: lands raw records and records its runs")
+        for schema in raw_schemas:
+            out.append(f"GRANT USAGE ON SCHEMA {schema} TO {ingest_role};")
+            out.append(
+                f"GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA {schema} "
+                f"TO {ingest_role};"
+            )
+            out.append(
+                f"ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} "
+                f"GRANT SELECT, INSERT, UPDATE ON TABLES TO {ingest_role};"
+            )
+        out.append(f"GRANT USAGE ON SCHEMA control TO {ingest_role};")
+        out.append(
+            f"GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA control TO {ingest_role};"
+        )
+        # bigserial: INSERT alone is not enough.
+        out.append(
+            f"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA control TO {ingest_role};"
+        )
+        out.append("")
+
+    if transform_role:
+        out.append(f"-- {transform_role}: reads raw, writes mart, records its runs")
+        for schema in raw_schemas:
+            out.append(f"GRANT USAGE ON SCHEMA {schema} TO {transform_role};")
+            out.append(f"GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO {transform_role};")
+            out.append(
+                f"ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} "
+                f"GRANT SELECT ON TABLES TO {transform_role};"
+            )
+        out.append(f"GRANT USAGE ON SCHEMA control TO {transform_role};")
+        out.append(
+            f"GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA control "
+            f"TO {transform_role};"
+        )
+        out.append(
+            f"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA control TO {transform_role};"
+        )
+        for table in mart_tables:
+            # DELETE is required: rollups are rebuilt by clearing the day first.
+            out.append(
+                f"GRANT SELECT, INSERT, UPDATE, DELETE ON {table} TO {transform_role};"
+            )
+        out.append("")
+
+    if read_role:
+        out.append(f"-- {read_role}: reporting. Reads the mart layer and nothing else.")
+        for table in mart_tables:
+            out.append(f"GRANT SELECT ON {table} TO {read_role};")
+        out.append("")
+
+    return "\n".join(out) + ("\n" if out else "")

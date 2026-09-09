@@ -18,7 +18,13 @@ import argparse
 import sys
 
 from ..transform.targets import TARGETS
-from . import control_sql, mart_partition_sql, partitions_sql, raw_table_sql
+from . import (
+    control_sql,
+    grants_sql,
+    mart_partition_sql,
+    partitions_sql,
+    raw_table_sql,
+)
 
 
 def _banner(text: str) -> str:
@@ -41,6 +47,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--no-control", action="store_true", help="skip the control schema"
     )
+    # Role names are a local convention, so nothing is granted unless asked for.
+    parser.add_argument("--ingest-role", metavar="ROLE",
+                        help="role that lands raw records; grants emitted if given")
+    parser.add_argument("--transform-role", metavar="ROLE",
+                        help="role that derives the mart layer")
+    parser.add_argument("--read-role", metavar="ROLE",
+                        help="read-only reporting role (Metabase, Grafana, ...)")
     args = parser.parse_args(argv)
 
     names = args.target or sorted(TARGETS)
@@ -88,6 +101,31 @@ def main(argv: list[str] | None = None) -> int:
 
         if t.rollup_ddl:
             out.append(f"-- daily rollup\n{t.rollup_ddl.strip()}\n")
+
+    # Grants come last, once every object they name exists. GRANT ... ON ALL
+    # TABLES IN SCHEMA is evaluated at execution time, so emitting it earlier
+    # would silently skip tables created further down the file.
+    if args.ingest_role or args.transform_role or args.read_role:
+        raw_schemas: list[str] = []
+        mart_tables: list[str] = []
+        for name in names:
+            t = TARGETS[name]
+            schema = t.raw_table.partition(".")[0]
+            if schema not in raw_schemas:
+                raw_schemas.append(schema)
+            if t.fact_ddl:
+                mart_tables.append(t.fact_table)
+            if t.rollup_ddl and t.rollup_table:
+                mart_tables.append(t.rollup_table)
+        out.append(_banner("privileges"))
+        out.append(
+            grants_sql(
+                raw_schemas, mart_tables,
+                ingest_role=args.ingest_role,
+                transform_role=args.transform_role,
+                read_role=args.read_role,
+            )
+        )
 
     print("\n".join(out))
     return 0

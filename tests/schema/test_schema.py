@@ -12,6 +12,7 @@ import pytest
 from secops_ingest.schema import (
     InvalidIdentifier,
     control_sql,
+    grants_sql,
     mart_partition_sql,
     partitions_sql,
     raw_table_sql,
@@ -180,3 +181,76 @@ def test_mart_partitions_emitted_only_for_partitioned_facts(
     target = TARGETS["defectdojo_findings"]
     assert "PARTITION BY RANGE" in (target.fact_ddl or "")
     assert f"monthly partitions for {target.fact_table}" in out
+
+
+# -- grants -------------------------------------------------------------------
+
+
+def g(**kw: object) -> str:
+    return grants_sql(["raw_wazuh"], ["mart_fact_wazuh_alerts", "mart_rollup_wazuh_daily"], **kw)  # type: ignore[arg-type]
+
+
+def test_no_roles_means_no_grants() -> None:
+    """Role naming is a local convention; assume nothing."""
+    assert g() == ""
+
+
+def test_sequence_privileges_are_granted() -> None:
+    """control.ingest_run has a bigserial key.
+
+    INSERT alone is not enough — the role also needs USAGE on the sequence, and
+    the failure lands on the first write of the first run.
+    """
+    for role in ("ingest_role", "transform_role"):
+        sql = g(**{role: "r"})
+        assert "USAGE, SELECT ON ALL SEQUENCES IN SCHEMA control" in sql
+
+
+def test_transform_gets_control_grants() -> None:
+    """The transform reads raw and writes mart — and records its own runs.
+
+    Forgetting the third has already broken this project once: it died at the
+    first insert, naming a table nobody was thinking about.
+    """
+    sql = g(transform_role="wh_transform")
+    assert "ON ALL TABLES IN SCHEMA control TO wh_transform" in sql
+
+
+def test_transform_can_delete_from_the_mart() -> None:
+    """Rollups are rebuilt by clearing the day first, so DELETE is required."""
+    sql = g(transform_role="wh_transform")
+    assert "SELECT, INSERT, UPDATE, DELETE ON mart_rollup_wazuh_daily" in sql
+
+
+def test_default_privileges_cover_future_partitions() -> None:
+    """Raw tables gain a new partition every month.
+
+    Without ALTER DEFAULT PRIVILEGES the grants cover today's partitions and
+    silently fail to cover next month's.
+    """
+    assert "ALTER DEFAULT PRIVILEGES IN SCHEMA raw_wazuh" in g(ingest_role="wh_ingest")
+
+
+def test_read_role_sees_the_mart_and_nothing_else() -> None:
+    sql = g(read_role="wh_metabase")
+    assert "GRANT SELECT ON mart_fact_wazuh_alerts TO wh_metabase;" in sql
+    assert "raw_wazuh" not in sql
+    assert "control" not in sql
+    assert "INSERT" not in sql and "DELETE" not in sql
+
+
+def test_role_names_are_validated() -> None:
+    with pytest.raises(InvalidIdentifier):
+        g(ingest_role="r; DROP SCHEMA control CASCADE")
+
+
+def test_grants_are_emitted_after_the_tables_they_name(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """GRANT ... ON ALL TABLES IN SCHEMA is evaluated when it runs.
+
+    Emitted before the CREATE statements, it would silently cover nothing.
+    """
+    assert main(["--target", "wazuh_alerts", "--ingest-role", "wh_ingest"]) == 0
+    out = capsys.readouterr().out
+    assert out.index("CREATE TABLE IF NOT EXISTS raw_wazuh.alerts") < out.index("GRANT USAGE")

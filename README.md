@@ -226,6 +226,11 @@ The DDL ships with the package and is emitted as SQL, never executed:
 ```bash
 python -m secops_ingest.schema | psql "$DSN"
 python -m secops_ingest.schema --target wazuh_alerts --partitions-ahead 6
+
+# privileges, if you want them — role names are yours, nothing is assumed
+python -m secops_ingest.schema \
+    --ingest-role secops_ingest --transform-role secops_transform \
+    --read-role secops_reader | psql "$DSN"
 ```
 
 Three layers: `raw_*` landing tables partitioned monthly on an immutable event
