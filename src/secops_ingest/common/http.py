@@ -5,6 +5,7 @@ Requires the `http` extra:  pip install secops-ingest[http]
 
 from __future__ import annotations
 
+import logging
 import random
 import time
 from collections.abc import Callable
@@ -16,6 +17,8 @@ except ImportError as exc:  # pragma: no cover - depends on extra
     raise ImportError(
         "HTTP helpers require the 'http' extra: pip install secops-ingest[http]"
     ) from exc
+
+log = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -53,8 +56,23 @@ def with_retries(
             last = exc
             delay = _delay(attempt, base_delay, max_delay, None)
         if attempt < attempts - 1:
+            # Say something. A silent retry loop against a slow endpoint is
+            # indistinguishable from a hang: five 60-second timeouts produce
+            # five minutes of nothing, and the first thing anyone does is kill
+            # it and start guessing.
+            log.warning(
+                "attempt %d/%d failed (%s: %s); retrying in %.1fs",
+                attempt + 1, attempts, type(last).__name__, _brief(last), delay,
+            )
             sleep(delay)
     raise RetryBudgetExhausted(f"gave up after {attempts} attempts") from last
+
+
+def _brief(exc: Exception | None) -> str:
+    """A short reason. Full exception text can carry URLs and headers."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"HTTP {exc.response.status_code}"
+    return type(exc).__name__ if exc else "unknown"
 
 
 def _delay(attempt: int, base: float, cap: float, retry_after: str | None) -> float:

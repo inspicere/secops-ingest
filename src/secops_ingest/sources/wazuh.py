@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from collections.abc import Iterator
 from datetime import datetime, timedelta
 from functools import partial
@@ -114,8 +115,10 @@ class WazuhSource:
             # partial, not a lambda: a lambda would close over the loop
             # variable, which is safe only because with_retries happens to call
             # it immediately -- not a property worth depending on.
+            started = time.monotonic()
             resp = with_retries(partial(self._search, creds, body))
             hits = resp.get("hits", {}).get("hits", [])
+            log.info("page %d: %d hits in %.1fs", page, len(hits), time.monotonic() - started)
             if not hits:
                 return
 

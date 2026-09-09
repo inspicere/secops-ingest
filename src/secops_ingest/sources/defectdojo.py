@@ -42,7 +42,7 @@ Configuration:
 
     SECOPS_DEFECTDOJO_URL        base URL, e.g. https://dojo.example.com
     SECOPS_DEFECTDOJO_SECRET     secret name (default defectdojo_api_token)
-    SECOPS_DEFECTDOJO_PAGE_SIZE  results per request (default 100)
+    SECOPS_DEFECTDOJO_PAGE_SIZE  results per request (default 25 -- see below)
     SECOPS_DEFECTDOJO_CA_BUNDLE  CA bundle for the API's certificate
     SECOPS_DEFECTDOJO_INSECURE   set to 1 to skip TLS verification (logged)
 """
@@ -52,6 +52,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from collections.abc import Iterator
 from functools import partial
 from typing import Any
@@ -62,7 +63,19 @@ from ..secrets import get_provider
 
 log = logging.getLogger(__name__)
 
-DEFAULT_PAGE_SIZE = 100
+#: Deliberately small. Finding payloads vary enormously -- a typical one is ~3KB,
+#: but a finding carrying a scan dump in its description can be 100x that -- so
+#: page size is not a reliable throttle on response size. Measured against a live
+#: instance holding ~50k findings:
+#:
+#:     limit=25    0.4s     76 KB
+#:     limit=50   29.0s    5.9 MB      <- one large finding lands in the page
+#:     limit=100  did not return within 120s
+#:
+#: The failure mode is asymmetric. A small page costs extra round trips; a large
+#: page exceeds the HTTP timeout, and with_retries then retries it five times,
+#: turning a slow endpoint into several minutes of silence. Err small.
+DEFAULT_PAGE_SIZE = 25
 
 #: Ordering key. Descending, so the newest modification is the first record
 #: returned — see `fetch` for why that ordering is load-bearing.
@@ -148,8 +161,17 @@ class DefectDojoSource:
                 # conventional name is accepted and silently ignored.
                 "o": ORDER_BY,
             }
+            started = time.monotonic()
             payload = with_retries(partial(self._get, creds, params))
+            elapsed = time.monotonic() - started
             results = payload.get("results") or []
+            # Per-page progress. This endpoint gets slow as the collection grows
+            # -- ordering 50k findings server-side is not cheap -- and without a
+            # line per page a long run looks identical to a hang.
+            log.info(
+                "page offset=%d records=%d in %.1fs (total=%s)",
+                offset, len(results), elapsed, payload.get("count", "?"),
+            )
             if not results:
                 return
 
@@ -157,6 +179,7 @@ class DefectDojoSource:
                 mark = self.watermark_of(record)
                 if floor is not None and mark is not None and comparable(mark) < floor:
                     # Descending order: everything after this is older still.
+                    log.info("reached the watermark at offset=%d; stopping", offset)
                     return
                 yield record
 
