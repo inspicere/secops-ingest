@@ -42,9 +42,9 @@ def test_numeric_format_specifiers_survive_redaction(registry: None) -> None:
     """
     f = RedactingFilter()
     f.register("supersecretvalue")
-    rec = record('HTTP Request: %s %s "%s %d %s"', "GET", "http://x/y", "HTTP/1.1", 200, "OK")
+    rec = record('HTTP Request: %s %s "%s %d %s"', "GET", "http://api.example/y", "HTTP/1.1", 200, "OK")
     assert f.filter(rec) is True
-    assert rec.getMessage() == 'HTTP Request: GET http://x/y "HTTP/1.1 200 OK"'
+    assert rec.getMessage() == 'HTTP Request: GET http://api.example/y "HTTP/1.1 200 OK"'
 
 
 def test_float_specifier_survives(registry: None) -> None:
