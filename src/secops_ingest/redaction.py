@@ -8,6 +8,7 @@ a dict dump, or a third-party library.
 from __future__ import annotations
 
 import logging
+import traceback
 
 #: Process-wide registry. Credentials are registered once when fetched, so any
 #: code path that persists text - not only logging - can scrub it.
@@ -66,11 +67,39 @@ class RedactingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         if not self._values:
             return True
-        if isinstance(record.msg, str):
-            record.msg = self._scrub(record.msg)
-        if record.args:
-            if isinstance(record.args, dict):
-                record.args = {k: self._scrub(str(v)) for k, v in record.args.items()}
-            else:
-                record.args = tuple(self._scrub(str(a)) for a in record.args)
+
+        # Render the message here, scrub the result, then clear args.
+        #
+        # The obvious implementation scrubs each argument in place, and breaks
+        # every record using a numeric format specifier: scrubbing forces each
+        # argument through str(), and "%d" % "200" raises TypeError. Logging
+        # catches that, writes "--- Logging error ---" to stderr, and DISCARDS
+        # the line. So the failure of a component whose entire job is to make
+        # logs safe is a missing log line -- which is the worst shape it could
+        # take, and cost an evening of mistaking a slow API for a hang.
+        #
+        # Rendering first is also strictly more thorough. A secret that reaches
+        # a record inside a non-string argument -- a dict of headers, a mapping
+        # of connection parameters -- is caught here, where per-argument
+        # scrubbing would have stringified it into the output unexamined.
+        try:
+            rendered = record.getMessage()
+        except Exception:  # pragma: no cover - defensive  # noqa: BLE001
+            # Redaction must never itself be the reason a line disappears. A
+            # record that cannot render is the caller's bug, and their
+            # traceback to see.
+            return True
+
+        record.msg = self._scrub(rendered)
+        record.args = ()
+
+        # Pre-render the traceback so the Formatter uses this scrubbed copy
+        # rather than formatting the exception itself afterwards, where a filter
+        # can no longer reach it. This is what makes the module docstring's
+        # claim about exceptions true.
+        if record.exc_info and not record.exc_text:
+            record.exc_text = self._scrub(
+                "".join(traceback.format_exception(*record.exc_info))
+            ).rstrip("\n")
+
         return True
