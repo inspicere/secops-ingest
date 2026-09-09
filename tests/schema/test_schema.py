@@ -254,3 +254,48 @@ def test_grants_are_emitted_after_the_tables_they_name(
     assert main(["--target", "wazuh_alerts", "--ingest-role", "wh_ingest"]) == 0
     out = capsys.readouterr().out
     assert out.index("CREATE TABLE IF NOT EXISTS raw_wazuh.alerts") < out.index("GRANT USAGE")
+
+
+# -- raw tables with no transform target --------------------------------------
+
+
+def test_raw_only_emits_just_that_table(capsys: pytest.CaptureFixture[str]) -> None:
+    """A deployment may land sources whose connector is not in this repo."""
+    assert main(["--raw", "raw_phisher.messages", "--no-control"]) == 0
+    out = capsys.readouterr().out
+    assert "raw_phisher.messages" in out
+    # No target was named, so no target DDL should appear.
+    assert "mart_fact_wazuh_alerts" not in out
+    assert "mart_fact_defectdojo_findings" not in out
+
+
+def test_raw_and_target_together_emit_both(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["--raw", "raw_phisher.messages", "--target", "wazuh_alerts"]) == 0
+    out = capsys.readouterr().out
+    assert "raw_phisher.messages" in out
+    assert "mart_fact_wazuh_alerts" in out
+
+
+def test_raw_gets_partitions_like_any_other(capsys: pytest.CaptureFixture[str]) -> None:
+    """Missing partitions fail at midnight on the first regardless of origin."""
+    assert main(["--raw", "raw_phisher.messages", "--no-control"]) == 0
+    out = capsys.readouterr().out
+    assert "monthly partitions for raw_phisher.messages" in out
+    assert "generate_series" in out
+
+
+def test_raw_schema_included_in_grants(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["--raw", "raw_phisher.messages", "--ingest-role", "wh_ingest"]) == 0
+    out = capsys.readouterr().out
+    assert "GRANT USAGE ON SCHEMA raw_phisher TO wh_ingest;" in out
+
+
+@pytest.mark.parametrize("bad", ["nodot", ".messages", "raw_phisher."])
+def test_malformed_raw_spec_is_rejected(bad: str) -> None:
+    with pytest.raises(SystemExit):
+        main(["--raw", bad])
+
+
+def test_hostile_raw_identifier_is_rejected() -> None:
+    with pytest.raises(InvalidIdentifier):
+        main(["--raw", "raw_x; DROP SCHEMA control CASCADE.messages", "--no-control"])

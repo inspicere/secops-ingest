@@ -35,7 +35,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="secops_ingest.schema")
     parser.add_argument(
         "--target", action="append", metavar="NAME",
-        help="target to emit DDL for; repeatable. Default: all.",
+        help="target to emit DDL for; repeatable. Default: all, unless --raw is given.",
+    )
+    # A deployment can land sources that have no transform target yet -- or whose
+    # connector lives in a private repository. Without this the emitter could
+    # only describe schemas it already knew about, which is not much use to
+    # anyone whose sources differ from the examples.
+    parser.add_argument(
+        "--raw", action="append", metavar="SCHEMA.TABLE",
+        help="extra raw landing table with no target; repeatable.",
     )
     parser.add_argument("--partitions-behind", type=int, default=1)
     parser.add_argument("--partitions-ahead", type=int, default=3)
@@ -56,7 +64,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="read-only reporting role (Metabase, Grafana, ...)")
     args = parser.parse_args(argv)
 
-    names = args.target or sorted(TARGETS)
+    # --raw alone means "just these tables"; naming targets as well brings both.
+    names = args.target if args.target else ([] if args.raw else sorted(TARGETS))
     unknown = [n for n in names if n not in TARGETS]
     if unknown:
         parser.error(f"unknown target(s): {', '.join(unknown)}. Known: {', '.join(sorted(TARGETS))}")
@@ -69,6 +78,22 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_control:
         out.append(_banner("control — run history, watermarks, coverage ledger"))
         out.append(control_sql())
+
+    extra_raw: list[tuple[str, str]] = []
+    for spec in args.raw or []:
+        schema, _, table = spec.partition(".")
+        if not schema or not table:
+            parser.error(f"--raw expects SCHEMA.TABLE, got {spec!r}")
+        extra_raw.append((schema, table))
+
+    for schema, table in extra_raw:
+        out.append(_banner(f"{schema}.{table} (raw only, no transform target)"))
+        out.append(raw_table_sql(schema, table, gin_index=args.gin))
+        out.append(
+            f"-- monthly partitions for {schema}.{table}\n"
+            + partitions_sql(schema, table,
+                             behind=args.partitions_behind, ahead=args.partitions_ahead)
+        )
 
     for name in names:
         t = TARGETS[name]
@@ -108,6 +133,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.ingest_role or args.transform_role or args.read_role:
         raw_schemas: list[str] = []
         mart_tables: list[str] = []
+        for schema, _table in extra_raw:
+            if schema not in raw_schemas:
+                raw_schemas.append(schema)
         for name in names:
             t = TARGETS[name]
             schema = t.raw_table.partition(".")[0]
