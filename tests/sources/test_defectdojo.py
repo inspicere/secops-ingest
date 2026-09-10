@@ -79,8 +79,10 @@ def test_uses_o_not_ordering(source: DefectDojoSource) -> None:
     order, and the early stop would then cut the run at a random point.
     """
     rec = Recorder([page([finding(1, "2026-09-08T08:00:00-05:00")])])
-    drive(source, rec)
-    assert rec.params[0]["o"] == "-last_status_update"
+    drive(source, rec, cursor="2026-09-01T00:00:00-05:00")
+    # The parameter NAME is the point here; which column it names is covered by
+    # the backfill/incremental tests below.
+    assert "o" in rec.params[0]
     assert "ordering" not in rec.params[0]
 
 
@@ -273,3 +275,40 @@ def test_disabling_verification_warns(
     with caplog.at_level("WARNING"):
         assert source._tls_verify() is False
     assert "TLS verification DISABLED" in caplog.text
+
+
+# -- backfill uses a cheaper ordering -----------------------------------------
+
+
+def test_backfill_orders_by_the_indexed_column(source: DefectDojoSource) -> None:
+    """No cursor means no early stop, so the expensive ordering buys nothing.
+
+    last_status_update is unindexed in DefectDojo: ordering on it costs ~43s per
+    page against ~51k findings, versus ~0.5s ordering by id. Over a 2,000-page
+    backfill that is a day against twenty minutes.
+    """
+    rec = Recorder([page([finding(1, "2026-09-08T08:00:00-05:00")])])
+    drive(source, rec, cursor=None)
+    assert rec.params[0]["o"] == "-id"
+
+
+def test_incremental_keeps_the_modification_ordering(source: DefectDojoSource) -> None:
+    """With a cursor the descending sort is what makes the early stop possible."""
+    rec = Recorder([page([finding(1, "2026-09-08T08:00:00-05:00")])])
+    drive(source, rec, cursor="2026-09-01T00:00:00-05:00")
+    assert rec.params[0]["o"] == "-last_status_update"
+
+
+def test_backfill_still_collects_every_record(source: DefectDojoSource) -> None:
+    """Order does not affect completeness when nothing stops early.
+
+    The watermark stays correct because the framework keeps the MAXIMUM
+    watermark it observes, not the last one to arrive.
+    """
+    out_of_order = page([
+        finding(3, "2026-09-01T00:00:00-05:00"),
+        finding(1, "2026-09-08T08:00:00-05:00"),
+    ], more=True)
+    rec = Recorder([out_of_order, page([finding(2, "2026-09-05T00:00:00-05:00")])])
+    got = drive(source, rec, cursor=None)
+    assert sorted(r["id"] for r in got) == [1, 2, 3]

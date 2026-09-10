@@ -49,7 +49,6 @@ Configuration:
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import time
@@ -58,6 +57,7 @@ from functools import partial
 from typing import Any
 
 from ..common.http import with_retries
+from ..common.payload import to_json
 from ..common.watermark import comparable
 from ..secrets import get_provider
 
@@ -77,9 +77,29 @@ log = logging.getLogger(__name__)
 #: turning a slow endpoint into several minutes of silence. Err small.
 DEFAULT_PAGE_SIZE = 25
 
-#: Ordering key. Descending, so the newest modification is the first record
-#: returned — see `fetch` for why that ordering is load-bearing.
+#: Incremental ordering. Descending, so the newest modification is the first
+#: record returned — see `fetch` for why that is load-bearing.
 ORDER_BY = "-last_status_update"
+
+#: Backfill ordering, and the reason is performance rather than taste.
+#:
+#: last_status_update carries no index in DefectDojo, so ordering on it makes
+#: PostgreSQL sort the entire collection for EVERY page. Measured against a
+#: ~51k-finding instance:
+#:
+#:     limit=25                          0.5s
+#:     limit=25&o=-id                    0.7s
+#:     limit=25&o=-last_status_update   43.4s
+#:     limit=25&o=-id&offset=40000       0.4s   (offset itself is free)
+#:
+#: An incremental run reads a handful of pages and can afford it. A backfill
+#: reads ~2,000, which is 24 hours against 20 minutes.
+#:
+#: Ordering by id is safe for a backfill precisely because a backfill has no
+#: early stop to support: it reads everything, so the order records arrive in
+#: does not affect what is collected. The watermark is still correct because the
+#: framework keeps the MAXIMUM watermark it observes, not the last one.
+ORDER_BY_BACKFILL = "-id"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -152,6 +172,12 @@ class DefectDojoSource:
         """
         offset = 0
         floor = comparable(cursor) if cursor else None
+        # No cursor means a backfill: read everything, so the expensive ordering
+        # that exists only to enable an early stop buys nothing. See
+        # ORDER_BY_BACKFILL.
+        order = ORDER_BY if floor is not None else ORDER_BY_BACKFILL
+        if floor is None:
+            log.info("no watermark: backfilling the whole collection ordered by %s", order)
 
         while True:
             params = {
@@ -159,7 +185,7 @@ class DefectDojoSource:
                 "offset": offset,
                 # `o`, not `ordering`. See the module docstring: the
                 # conventional name is accepted and silently ignored.
-                "o": ORDER_BY,
+                "o": order,
             }
             started = time.monotonic()
             payload = with_retries(partial(self._get, creds, params))
@@ -225,7 +251,7 @@ class DefectDojoSource:
         """
         return (
             str(record["id"]),
-            json.dumps(record),
+            to_json(record, identifier=str(record["id"])),
             record.get("date") or record["created"],
             run_id or None,
         )
