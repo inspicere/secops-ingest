@@ -28,7 +28,6 @@ Configuration (endpoints and tenancy are config, never constants):
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import time
@@ -38,6 +37,7 @@ from functools import partial
 from typing import Any
 
 from ..common.http import with_retries
+from ..common.payload import to_json
 from ..secrets import get_provider
 
 log = logging.getLogger(__name__)
@@ -204,7 +204,7 @@ class WazuhSource:
     def to_row(self, record: dict[str, Any], run_id: int) -> tuple[Any, ...]:
         return (
             record["id"],
-            json.dumps(record),
+            to_json(record, identifier=record["id"]),
             record["timestamp"],
             run_id or None,
         )

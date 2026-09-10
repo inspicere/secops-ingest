@@ -10,11 +10,12 @@ worked example of the Source contract for anyone writing a new connector.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
+
+from ..common.payload import to_json
 
 
 class ExampleSource:
@@ -58,7 +59,7 @@ class ExampleSource:
         # partitions whenever a record is updated.
         return (
             record["id"],
-            json.dumps(record),
+            to_json(record, identifier=record["id"]),
             record["createdAt"],
             run_id or None,
         )
