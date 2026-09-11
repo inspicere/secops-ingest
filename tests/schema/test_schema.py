@@ -299,3 +299,24 @@ def test_malformed_raw_spec_is_rejected(bad: str) -> None:
 def test_hostile_raw_identifier_is_rejected() -> None:
     with pytest.raises(InvalidIdentifier):
         main(["--raw", "raw_x; DROP SCHEMA control CASCADE.messages", "--no-control"])
+
+
+def test_raw_partitions_are_created_in_the_parents_schema() -> None:
+    """An unqualified %I resolves against search_path, not the parent's schema.
+
+    Partitions of raw_phisher.messages were landing in public as
+    messages_2026_09 -- attached to the correct parent, in the wrong schema.
+    They worked, so a partition COUNT looked right: pg_inherits reports the
+    relationship wherever the child lives. What broke silently was everything
+    that reasons about schemas, including ALTER DEFAULT PRIVILEGES.
+    """
+    sql = partitions_sql("raw_phisher", "messages")
+    assert "%I.%I PARTITION OF raw_phisher.messages" in sql
+    assert "'raw_phisher'," in sql
+
+
+def test_mart_partitions_stay_unqualified() -> None:
+    """Mart tables are created unqualified, so their partitions must match."""
+    sql = mart_partition_sql("mart_fact_wazuh_alerts")
+    assert "%I PARTITION OF mart_fact_wazuh_alerts" in sql
+    assert "%I.%I" not in sql

@@ -162,14 +162,33 @@ CREATE INDEX IF NOT EXISTS {table}_ingested_at_idx
     return sql
 
 
-def _partition_do_block(qualified: str, prefix: str, behind: int, ahead: int) -> str:
+def _partition_do_block(
+    qualified: str, prefix: str, behind: int, ahead: int, schema: str | None = None
+) -> str:
     """A DO block creating monthly partitions across a window.
 
     THE MONTH ARITHMETIC IS POSTGRESQL'S, DELIBERATELY. Adding a fixed "average
     month" of seconds to a date in application code drifts, and eventually skips
     or duplicates a month -- which surfaces as inserts failing at midnight on the
     first. generate_series over interval '1 month' cannot drift.
+
+    THE PARTITION NAME MUST BE SCHEMA-QUALIFIED when the parent is. An
+    unqualified %I resolves against search_path, so partitions of
+    raw_phisher.messages were being created as public.messages_2026_09 --
+    attached to the right parent, in the wrong schema. They still worked, which
+    is why it went unnoticed: pg_inherits reports the parent/child relationship
+    regardless of where the child lives, so a count of partitions looked
+    correct. What broke quietly was everything that reasons about schemas --
+    ALTER DEFAULT PRIVILEGES IN SCHEMA raw_* no longer covered them, and the
+    isolation between raw schemas was not real.
     """
+    if schema:
+        target = "%I.%I"
+        name_args = f"'{schema}',\n            '{prefix}_' || to_char(m, 'YYYY_MM'),"
+    else:
+        target = "%I"
+        name_args = f"'{prefix}_' || to_char(m, 'YYYY_MM'),"
+
     return f"""\
 DO $do$
 DECLARE
@@ -182,9 +201,9 @@ BEGIN
             interval '1 month')::date
     LOOP
         EXECUTE format(
-            'CREATE TABLE IF NOT EXISTS %I PARTITION OF {qualified} '
+            'CREATE TABLE IF NOT EXISTS {target} PARTITION OF {qualified} '
             'FOR VALUES FROM (%L) TO (%L)',
-            '{prefix}_' || to_char(m, 'YYYY_MM'),
+            {name_args}
             m,
             (m + interval '1 month')::date);
     END LOOP;
@@ -204,7 +223,7 @@ def partitions_sql(schema: str, table: str, *, behind: int = 1, ahead: int = 3) 
     validate_identifier(table)
     if ahead < 1:
         raise ValueError("ahead must be >= 1, or the current month is the last one created")
-    return _partition_do_block(f"{schema}.{table}", table, behind, ahead)
+    return _partition_do_block(f"{schema}.{table}", table, behind, ahead, schema=schema)
 
 
 def mart_partition_sql(table: str, *, behind: int = 1, ahead: int = 3) -> str:
