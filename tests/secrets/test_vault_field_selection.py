@@ -41,18 +41,19 @@ class StubClient:
 def provider_for(
     store: dict[str, dict[str, str]], *, prefix: str = ""
 ) -> tuple[VaultSecretProvider, StubKvV2]:
-    p = VaultSecretProvider(url="http://stub.invalid", path_prefix=prefix)
+    p = VaultSecretProvider(url="http://127.0.0.1:1", path_prefix=prefix)  # never dialled
     client = StubClient(store)
-    p._client = client                     # noqa: SLF001 - injecting the lazy client
+    # Injecting the lazily-built client; the provider never dials out.
+    p._client = client
     return p, client.secrets.kv.v2
 
 
-VENDOR = {"secops/xdr": {"url": "https://api-tenant", "api_key": "k", "api_key_id": "42"}}
+VENDOR = {"secops/xdr": {"url": "https://api.example.com", "api_key": "k", "api_key_id": "42"}}
 
 
 def test_each_field_of_a_grouped_secret_resolves() -> None:
     p, _ = provider_for(VENDOR, prefix="secops/")
-    assert p.get("xdr.url") == "https://api-tenant"
+    assert p.get("xdr.url") == "https://api.example.com"
     assert p.get("xdr.api_key") == "k"
     assert p.get("xdr.api_key_id") == "42"
 

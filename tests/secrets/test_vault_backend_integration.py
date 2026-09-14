@@ -173,9 +173,9 @@ def test_cache_avoids_a_second_backend_call(seed: Any) -> None:
 
 
 def test_field_selection_reads_one_field_of_a_multi_key_secret(seed: Any) -> None:
-    name = seed({"url": "https://api-tenant", "api_key": "k", "api_key_id": "42"})
+    name = seed({"url": "https://api.example.com", "api_key": "k", "api_key_id": "42"})
     provider = VaultSecretProvider()
-    assert provider.get(f"{name}.url") == "https://api-tenant"
+    assert provider.get(f"{name}.url") == "https://api.example.com"
     assert provider.get(f"{name}.api_key") == "k"
     assert provider.get(f"{name}.api_key_id") == "42"
 
