@@ -13,7 +13,13 @@ import re
 import pytest
 
 from secops_ingest.transform.base import Target
-from secops_ingest.transform.targets import TARGETS, XDR_INCIDENTS, XSOAR_INCIDENTS
+from secops_ingest.transform.targets import (
+    TARGETS,
+    XDR_ALERTS,
+    XDR_ENDPOINTS,
+    XDR_INCIDENTS,
+    XSOAR_INCIDENTS,
+)
 
 ALL = list(TARGETS.values())
 WITH_ROLLUP = [t for t in ALL if t.rollup_table]
@@ -198,3 +204,36 @@ def test_both_incident_targets_select_on_ingested_at() -> None:
     mutating source includes rows whose event time is months old."""
     for t in (XSOAR_INCIDENTS, XDR_INCIDENTS):
         assert "_ingested_at > %(since)s::timestamptz" in t.upsert_sql
+
+
+def test_alerts_target_has_a_rollup_because_the_volume_requires_one() -> None:
+    """~17.7k alerts/day is ~6.5M rows/year. A seven-year trend over per-record
+    facts is unusable on a modest host."""
+    assert XDR_ALERTS.rollup_table == "mart_rollup_xdr_alerts_daily"
+    assert XDR_ALERTS.rollup_sql is not None
+
+
+def test_alert_rollup_dimensions_are_all_low_cardinality() -> None:
+    """endpoint_id is the tempting mistake: 1,630 endpoints would make the
+    rollup larger than the fact table it summarises."""
+    sql = XDR_ALERTS.rollup_sql or ""
+    assert "endpoint_id" not in sql
+    assert "host_name" not in sql
+    for dim in ("severity", "category", "source"):
+        assert dim in sql
+
+
+def test_alert_rollup_is_rebuilt_from_facts_not_from_raw() -> None:
+    """Raw partitions are dropped on schedule; a rollup derived from raw could
+    not be rebuilt afterwards."""
+    assert "mart_fact_xdr_alerts" in (XDR_ALERTS.rollup_sql or "")
+    assert "raw_xdr" not in (XDR_ALERTS.rollup_sql or "")
+
+
+def test_endpoint_target_is_keyed_per_snapshot_not_per_endpoint() -> None:
+    """A current-state table would overwrite its own history and make drift
+    invisible, which is the only thing this source is for."""
+    assert "PRIMARY KEY (endpoint_id, snapshot_at)" in (
+        XDR_ENDPOINTS.fact_ddl or ""
+    )
+    assert XDR_ENDPOINTS.fact_date_expr == "snapshot_at"

@@ -440,4 +440,153 @@ XDR_INCIDENTS = Target(
     """,
 )
 
-TARGETS = {t.name: t for t in (EXAMPLE, WAZUH, DEFECTDOJO, XSOAR_INCIDENTS, XDR_INCIDENTS)}
+#: Measured 2026-09-14: ~17,700 alerts/day, 2,650,762 in the collection. That is
+#: ~6.5M fact rows a year against 9,715 incidents, so the rollup is not an
+#: optimisation to add later -- it is what makes a long-horizon dashboard open
+#: at all.
+#:
+#: EVERY DIMENSION HERE MUST BE LOW-CARDINALITY. severity has a handful of
+#: values, category and source a few dozen. endpoint_id is the tempting mistake:
+#: bounded only by fleet size (1,630 here), it would produce a daily rollup
+#: larger than the fact table it summarises. High-cardinality attributes stay in
+#: the facts, where a dashboard can filter to one endpoint without paying for
+#: all of them.
+XDR_ALERTS = Target(
+    name="xdr_alerts",
+    raw_table="raw_xdr.alerts",
+    fact_table="mart_fact_xdr_alerts",
+    fact_date_expr="detected_at",
+    upsert_sql="""
+        INSERT INTO mart_fact_xdr_alerts
+            (alert_id, detected_at, indexed_at, severity, category, source,
+             alert_name, resolution_status, endpoint_id, host_name, agent_os_type)
+        SELECT
+            source_id,
+            to_timestamp((payload->>'detection_timestamp')::bigint / 1000),
+            to_timestamp((payload->>'local_insert_ts')::bigint / 1000),
+            payload->>'severity',
+            payload->>'category',
+            payload->>'source',
+            payload->>'name',
+            payload->>'resolution_status',
+            payload->>'endpoint_id',
+            payload->>'host_name',
+            payload->>'agent_os_type'
+        FROM raw_xdr.alerts
+        WHERE %(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz
+        -- Fires only on the connector's deliberate late-arrival overlap, which
+        -- re-reads a trailing window every run. Without this clause that
+        -- overlap would be a duplicate-key crash instead of a rewrite of
+        -- identical values.
+        ON CONFLICT (alert_id, detected_at) DO UPDATE SET
+            resolution_status = EXCLUDED.resolution_status,
+            indexed_at        = EXCLUDED.indexed_at
+    """,
+    rollup_table="mart_rollup_xdr_alerts_daily",
+    rollup_sql="""
+        INSERT INTO mart_rollup_xdr_alerts_daily
+            (day, severity, category, source, alert_count)
+        SELECT detected_at::date, severity, category, source, count(*)
+        FROM mart_fact_xdr_alerts
+        WHERE detected_at::date = ANY(%(days)s)
+        GROUP BY 1, 2, 3, 4
+    """,
+    fact_ddl="""
+        CREATE TABLE IF NOT EXISTS mart_fact_xdr_alerts (
+            alert_id          text        NOT NULL,
+            detected_at       timestamptz NOT NULL,
+            indexed_at        timestamptz,
+            severity          text,
+            category          text,
+            source            text,
+            alert_name        text,
+            resolution_status text,
+            endpoint_id       text,
+            host_name         text,
+            agent_os_type     text,
+            PRIMARY KEY (alert_id, detected_at)
+        ) PARTITION BY RANGE (detected_at);
+        CREATE INDEX IF NOT EXISTS mart_fact_xdr_alerts_detected_at_idx
+            ON mart_fact_xdr_alerts (detected_at);
+    """,
+    rollup_ddl="""
+        CREATE TABLE IF NOT EXISTS mart_rollup_xdr_alerts_daily (
+            day         date   NOT NULL,
+            severity    text,
+            category    text,
+            source      text,
+            alert_count bigint NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS mart_rollup_xdr_alerts_daily_day_idx
+            ON mart_rollup_xdr_alerts_daily (day);
+    """,
+)
+
+#: One row per endpoint per snapshot. The grain is the point: a current-state
+#: table answers "what is the estate now" and destroys the answer to "when did
+#: this agent stop checking in", which is the question policy health is actually
+#: about. 1,630 endpoints daily is ~595k rows a year -- small enough that no
+#: rollup is needed.
+XDR_ENDPOINTS = Target(
+    name="xdr_endpoints",
+    raw_table="raw_xdr.endpoint_snapshots",
+    fact_table="mart_fact_xdr_endpoint_snapshots",
+    fact_date_expr="snapshot_at",
+    upsert_sql="""
+        INSERT INTO mart_fact_xdr_endpoint_snapshots
+            (endpoint_id, snapshot_at, endpoint_name, endpoint_status,
+             agent_version, content_version, os_type, last_seen_at,
+             is_isolated, operational_status)
+        SELECT
+            source_id,
+            _event_time,
+            payload->>'endpoint_name',
+            payload->>'endpoint_status',
+            payload->>'agent_version',
+            payload->>'content_version',
+            payload->>'os_type',
+            CASE WHEN COALESCE((payload->>'last_seen')::bigint, 0) > 0
+                 THEN to_timestamp((payload->>'last_seen')::bigint / 1000)
+            END,
+            payload->>'is_isolated',
+            payload->>'operational_status'
+        FROM raw_xdr.endpoint_snapshots
+        WHERE %(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz
+        ON CONFLICT (endpoint_id, snapshot_at) DO UPDATE SET
+            endpoint_status    = EXCLUDED.endpoint_status,
+            agent_version      = EXCLUDED.agent_version,
+            content_version    = EXCLUDED.content_version,
+            last_seen_at       = EXCLUDED.last_seen_at,
+            operational_status = EXCLUDED.operational_status
+    """,
+    fact_ddl="""
+        CREATE TABLE IF NOT EXISTS mart_fact_xdr_endpoint_snapshots (
+            endpoint_id        text        NOT NULL,
+            snapshot_at        timestamptz NOT NULL,
+            endpoint_name      text,
+            endpoint_status    text,
+            agent_version      text,
+            content_version    text,
+            os_type            text,
+            last_seen_at       timestamptz,
+            is_isolated        text,
+            operational_status text,
+            PRIMARY KEY (endpoint_id, snapshot_at)
+        ) PARTITION BY RANGE (snapshot_at);
+        CREATE INDEX IF NOT EXISTS mart_fact_xdr_endpoint_snapshots_snapshot_at_idx
+            ON mart_fact_xdr_endpoint_snapshots (snapshot_at);
+    """,
+)
+
+TARGETS = {
+    t.name: t
+    for t in (
+        EXAMPLE,
+        WAZUH,
+        DEFECTDOJO,
+        XSOAR_INCIDENTS,
+        XDR_INCIDENTS,
+        XDR_ALERTS,
+        XDR_ENDPOINTS,
+    )
+}
