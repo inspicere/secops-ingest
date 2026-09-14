@@ -14,6 +14,7 @@ import pytest
 
 from secops_ingest.transform.base import Target
 from secops_ingest.transform.targets import (
+    INCIDENT_LIFECYCLE,
     TARGETS,
     XDR_ALERTS,
     XDR_ENDPOINTS,
@@ -243,3 +244,39 @@ def test_endpoint_target_is_keyed_per_snapshot_not_per_endpoint() -> None:
     invisible, which is the only thing this source is for."""
     assert "PRIMARY KEY (endpoint_id, snapshot_at)" in body(XDR_ENDPOINTS.fact_ddl)
     assert XDR_ENDPOINTS.fact_date_expr == "snapshot_at"
+
+
+def test_lifecycle_is_a_left_join_anchored_on_xsoar() -> None:
+    """XSOAR holds ~2.75 years against XDR's 325 days. An inner join would
+    silently discard every incident older than XDR's retention -- most of them.
+    """
+    sql = INCIDENT_LIFECYCLE.upsert_sql
+    assert "LEFT JOIN" in sql
+    assert sql.index("raw_xsoar.incidents") < sql.index("mart_fact_xdr_incidents")
+
+
+def test_lifecycle_classifies_unmatched_rows_rather_than_hiding_them() -> None:
+    """Unmatched rows are two different populations and must not be conflated:
+    incidents from a non-XDR feed correctly have no XDR side, while XDR-sourced
+    ones that aged out of retention are a data-availability gap.
+    """
+    sql = INCIDENT_LIFECYCLE.upsert_sql
+    for status in ("matched", "non_xdr_source", "xdr_aged_out"):
+        assert status in sql
+    assert "join_status" in (INCIDENT_LIFECYCLE.fact_ddl or "")
+
+
+def test_lifecycle_measures_resolution_from_the_xsoar_side() -> None:
+    """The same incident exists on both sides; measuring it twice double-counts."""
+    assert "time_to_resolve" in (INCIDENT_LIFECYCLE.fact_ddl or "")
+    assert "closed_at" in INCIDENT_LIFECYCLE.upsert_sql
+
+
+def test_lifecycle_filters_on_the_anchor_tables_ingested_at() -> None:
+    """The runner interpolates raw_table as a live SQL identifier to fetch
+    _ingested_at and _event_time. Fact tables carry no _ingested_at, so
+    raw_xsoar.incidents must be the raw_table, and the incremental predicate
+    must use its _ingested_at column.
+    """
+    assert INCIDENT_LIFECYCLE.raw_table == "raw_xsoar.incidents"
+    assert "x._ingested_at > %(since)s::timestamptz" in INCIDENT_LIFECYCLE.upsert_sql

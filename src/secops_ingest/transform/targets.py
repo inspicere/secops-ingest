@@ -311,6 +311,9 @@ DEFECTDOJO = Target(
 #: the instance's own measure. Derived `time_to_resolve` lives on the lifecycle
 #: fact table built in a later task, since the same incident exists on both XSOAR
 #: and XDR sides and measuring it twice would double-count.
+#:
+#: The payload extraction is deliberately duplicated in INCIDENT_LIFECYCLE.
+#: Editing one without the other will make them drift.
 XSOAR_INCIDENTS = Target(
     name="xsoar_incidents",
     raw_table="raw_xsoar.incidents",
@@ -578,6 +581,95 @@ XDR_ENDPOINTS = Target(
     """,
 )
 
+#: The end-to-end view the whole integration exists for:
+#:
+#:     XDR incident created -> XSOAR incident created -> XSOAR closed
+#:
+#: ANCHORED ON XSOAR, AND THE DIRECTION IS LOAD-BEARING. Measured 2026-09-14:
+#: XSOAR holds 48,678 incidents back to 2023-12-10; XDR holds 9,715 with 325
+#: days of retention. An inner join, or a join anchored on XDR, would silently
+#: discard every incident older than XDR's retention -- which is most of them --
+#: and the loss would look like a smaller, tidier dataset rather than an error.
+#:
+#: UNMATCHED ROWS ARE EXPECTED AND ARE TWO DIFFERENT THINGS. Roughly 10.5% of
+#: XSOAR incidents did not come from XDR at all (other feeds, and a manual
+#: source); separately, XDR-sourced incidents whose XDR record has aged out
+#: carry an id that no longer resolves. Collapsing those into one "unmatched"
+#: bucket turns a data-availability gap into an apparent business fact, so
+#: join_status keeps them apart on the dashboard.
+#:
+#: DO NOT SUM MTTR ACROSS THE TWO FACT TABLES. The same incident exists on both
+#: sides. This table is the only correct place to measure the lifecycle.
+#:
+#: The payload extraction is deliberately duplicated from XSOAR_INCIDENTS.
+#: Editing one without the other will make them drift.
+INCIDENT_LIFECYCLE = Target(
+    name="incident_lifecycle",
+    raw_table="raw_xsoar.incidents",
+    fact_table="mart_fact_incident_lifecycle",
+    fact_date_expr="created_at",
+    upsert_sql="""
+        INSERT INTO mart_fact_incident_lifecycle
+            (xsoar_incident_id, created_at, xdr_incident_id, xdr_created_at,
+             xdr_resolved_at, closed_at, status, severity, source_brand,
+             incident_type, alert_count, join_status, time_to_resolve)
+        SELECT
+            x.source_id,
+            (x.payload->>'created')::timestamptz,
+            NULLIF(x.payload->>'dbotMirrorId', ''),
+            d.created_at,
+            d.resolved_at,
+            NULLIF(NULLIF(x.payload->>'closed', ''), '0001-01-01T00:00:00Z')::timestamptz,
+            (x.payload->>'status')::int,
+            (x.payload->>'severity')::int,
+            x.payload->>'sourceBrand',
+            x.payload->>'type',
+            d.alert_count,
+            CASE
+                WHEN d.incident_id IS NOT NULL                     THEN 'matched'
+                WHEN COALESCE(x.payload->>'dbotMirrorId', '') = '' THEN 'non_xdr_source'
+                ELSE                                                   'xdr_aged_out'
+            END,
+            NULLIF(NULLIF(x.payload->>'closed', ''), '0001-01-01T00:00:00Z')::timestamptz
+              - (x.payload->>'created')::timestamptz
+        FROM raw_xsoar.incidents x
+        LEFT JOIN mart_fact_xdr_incidents d
+               ON d.incident_id = NULLIF(x.payload->>'dbotMirrorId', '')
+        WHERE %(since)s::timestamptz IS NULL OR x._ingested_at > %(since)s::timestamptz
+        ON CONFLICT (xsoar_incident_id, created_at) DO UPDATE SET
+            xdr_created_at  = EXCLUDED.xdr_created_at,
+            xdr_resolved_at = EXCLUDED.xdr_resolved_at,
+            closed_at       = EXCLUDED.closed_at,
+            status          = EXCLUDED.status,
+            severity        = EXCLUDED.severity,
+            alert_count     = EXCLUDED.alert_count,
+            join_status     = EXCLUDED.join_status,
+            time_to_resolve = EXCLUDED.time_to_resolve
+    """,
+    fact_ddl="""
+        CREATE TABLE IF NOT EXISTS mart_fact_incident_lifecycle (
+            xsoar_incident_id text        NOT NULL,
+            created_at        timestamptz NOT NULL,
+            xdr_incident_id   text,
+            xdr_created_at    timestamptz,
+            xdr_resolved_at   timestamptz,
+            closed_at         timestamptz,
+            status            integer,
+            severity          integer,
+            source_brand      text,
+            incident_type     text,
+            alert_count       integer,
+            join_status       text        NOT NULL,
+            time_to_resolve   interval,
+            PRIMARY KEY (xsoar_incident_id, created_at)
+        ) PARTITION BY RANGE (created_at);
+        CREATE INDEX IF NOT EXISTS mart_fact_incident_lifecycle_created_at_idx
+            ON mart_fact_incident_lifecycle (created_at);
+        CREATE INDEX IF NOT EXISTS mart_fact_incident_lifecycle_join_status_idx
+            ON mart_fact_incident_lifecycle (join_status);
+    """,
+)
+
 TARGETS = {
     t.name: t
     for t in (
@@ -588,5 +680,6 @@ TARGETS = {
         XDR_INCIDENTS,
         XDR_ALERTS,
         XDR_ENDPOINTS,
+        INCIDENT_LIFECYCLE,
     )
 }
