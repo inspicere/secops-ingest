@@ -38,6 +38,19 @@ def body(sql: str | None) -> str:
     return _COMMENT.sub("", sql or "")
 
 
+def inserted_columns(sql: str) -> list[str]:
+    """The INSERT column list, in order."""
+    match = re.search(r"INSERT INTO \w+\s*\(([^)]*)\)", body(sql), re.DOTALL)
+    assert match, "upsert_sql has no INSERT column list"
+    return [c.strip() for c in match.group(1).split(",")]
+
+
+def updated_columns(sql: str) -> dict[str, str]:
+    """DO UPDATE assignments, as {assigned column: EXCLUDED column}."""
+    _, _, tail = body(sql).partition("DO UPDATE SET")
+    return dict(re.findall(r"(\w+)\s*=\s*EXCLUDED\.(\w+)", tail))
+
+
 @pytest.mark.parametrize("target", ALL, ids=lambda t: t.name)
 def test_upsert_is_incremental(target: Target) -> None:
     """Without the watermark parameter every run reprocesses the whole raw table."""
@@ -145,6 +158,32 @@ def test_defectdojo_grain_is_discovery_not_modification() -> None:
 
 
 @pytest.mark.parametrize("target", ALL, ids=lambda t: t.name)
+def test_do_update_assigns_each_column_from_its_own_excluded_column(
+    target: Target,
+) -> None:
+    """`a = EXCLUDED.b` is accepted by PostgreSQL whenever the types line up.
+
+    Two adjacent text columns swapped in this list produce no error and no
+    warning -- just a fact table that is quietly wrong in a way no count
+    reveals.
+    """
+    for assigned, excluded in updated_columns(target.upsert_sql).items():
+        assert assigned == excluded, (
+            f"{target.name}: {assigned} is refreshed from EXCLUDED.{excluded}")
+
+
+@pytest.mark.parametrize("target", ALL, ids=lambda t: t.name)
+def test_do_update_only_refreshes_columns_the_insert_supplies(
+    target: Target,
+) -> None:
+    """EXCLUDED holds the proposed row, so a column absent from the INSERT list
+    is refreshed to its default -- usually NULL -- rather than left alone."""
+    inserted = set(inserted_columns(target.upsert_sql))
+    stray = sorted(set(updated_columns(target.upsert_sql)) - inserted)
+    assert not stray, f"{target.name} refreshes columns it never inserts: {stray}"
+
+
+@pytest.mark.parametrize("target", ALL, ids=lambda t: t.name)
 def test_rollup_pair_is_all_or_nothing(target: Target) -> None:
     assert bool(target.rollup_table) == bool(target.rollup_sql)
 
@@ -195,6 +234,64 @@ def test_xsoar_target_reads_status_and_severity_as_integers() -> None:
     strings the original runbook assumed."""
     assert "(payload->>'status')::int" in XSOAR_INCIDENTS.upsert_sql
     assert "(payload->>'severity')::int" in XSOAR_INCIDENTS.upsert_sql
+
+
+def test_xsoar_upsert_refreshes_the_join_key_it_is_indexed_on() -> None:
+    """dbotMirrorId is not necessarily set when the incident is created.
+
+    Mirroring is established afterwards, so an incident can land with a NULL
+    xdr_incident_id and acquire one later. Omitting the column from DO UPDATE
+    froze that NULL for the life of the row -- on the one column this table
+    carries a dedicated index for, and the key the whole integration joins on.
+    """
+    updated = updated_columns(XSOAR_INCIDENTS.upsert_sql)
+    for column in ("xdr_incident_id", "incident_type", "source_brand"):
+        assert column in updated, f"{column} is never refreshed after first land"
+
+
+def test_xdr_upsert_refreshes_the_breakdown_with_the_total_it_sums_to() -> None:
+    """An incident accrues alerts after it opens.
+
+    Refreshing alert_count while freezing its per-severity components yields a
+    row reading alert_count = 10 over a breakdown summing to 3 -- not a stale
+    figure but a self-contradictory one, and invisible in either number alone.
+    """
+    updated = updated_columns(XDR_INCIDENTS.upsert_sql)
+    assert "alert_count" in updated
+    breakdown = ("high_severity_alert_count", "med_severity_alert_count",
+                 "low_severity_alert_count")
+    missing = [c for c in breakdown if c not in updated]
+    assert not missing, f"alert_count is refreshed without {missing}"
+    for column in ("host_count", "user_count", "description"):
+        assert column in updated
+
+
+def test_lifecycle_upsert_refreshes_the_key_behind_its_own_join_status() -> None:
+    """join_status is computed from the XDR id, so they are exactly as mutable
+    as each other. Updating the verdict but not the key produces rows claiming
+    'matched' while carrying nothing to say what they matched.
+    """
+    updated = updated_columns(INCIDENT_LIFECYCLE.upsert_sql)
+    assert "join_status" in updated
+    for column in ("xdr_incident_id", "source_brand", "incident_type"):
+        assert column in updated
+
+
+def test_endpoint_target_extracts_the_policy_assignment() -> None:
+    """This target's stated purpose is policy health, and it extracted no policy
+    column at all -- it could say whether an agent was running, never whether
+    the right policy was applied to it. Both fields verified present on the live
+    payload 2026-09-14.
+    """
+    sql = body(XDR_ENDPOINTS.upsert_sql)
+    assert "payload->>'assigned_prevention_policy'" in sql
+    assert "payload->>'assigned_extensions_policy'" in sql
+    for column in ("policy_name", "extensions_policy"):
+        assert column in inserted_columns(XDR_ENDPOINTS.upsert_sql)
+        assert column in (XDR_ENDPOINTS.fact_ddl or ""), f"{column} has no column"
+        # A policy reassignment is the drift this table exists to show, so a
+        # re-landed snapshot has to be able to correct it.
+        assert column in updated_columns(XDR_ENDPOINTS.upsert_sql)
 
 
 def test_xdr_target_divides_epoch_milliseconds() -> None:

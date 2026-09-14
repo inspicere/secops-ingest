@@ -345,12 +345,23 @@ XSOAR_INCIDENTS = Target(
             (payload->>'openDuration')::bigint
         FROM raw_xsoar.incidents
         WHERE %(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz
+        -- Every mutable column is refreshed, as on DEFECTDOJO above.
+        --
+        -- xdr_incident_id in particular. dbotMirrorId is NOT necessarily set
+        -- when the incident is created: mirroring is established afterwards, so
+        -- an incident that lands before its mirror link is established arrives
+        -- with a NULL join key. Leaving the column out of this list froze that
+        -- NULL forever -- on the one column the table carries an index for, and
+        -- the one the whole XSOAR/XDR integration joins on.
         ON CONFLICT (incident_id, created_at) DO UPDATE SET
             modified_at     = EXCLUDED.modified_at,
             closed_at       = EXCLUDED.closed_at,
             status          = EXCLUDED.status,
             severity        = EXCLUDED.severity,
             owner           = EXCLUDED.owner,
+            incident_type   = EXCLUDED.incident_type,
+            source_brand    = EXCLUDED.source_brand,
+            xdr_incident_id = EXCLUDED.xdr_incident_id,
             open_duration_s = EXCLUDED.open_duration_s
     """,
     fact_ddl="""
@@ -370,8 +381,12 @@ XSOAR_INCIDENTS = Target(
         ) PARTITION BY RANGE (created_at);
         CREATE INDEX IF NOT EXISTS mart_fact_xsoar_incidents_created_at_idx
             ON mart_fact_xsoar_incidents (created_at);
-        -- The lifecycle join drives off this column; without an index it is a
-        -- sequential scan of the whole fact table on every dashboard load.
+        -- NOT the lifecycle join's index. INCIDENT_LIFECYCLE is anchored on
+        -- raw_xsoar.incidents and reads dbotMirrorId straight out of the raw
+        -- payload, so it never touches this table at all. Kept because
+        -- ad-hoc joins and dashboard filters on the XDR id do read it here, and
+        -- without the index each one is a sequential scan of the whole fact
+        -- table -- but nothing in this package depends on it.
         CREATE INDEX IF NOT EXISTS mart_fact_xsoar_incidents_xdr_id_idx
             ON mart_fact_xsoar_incidents (xdr_incident_id);
     """,
@@ -412,13 +427,28 @@ XDR_INCIDENTS = Target(
             payload->>'assigned_user_mail'
         FROM raw_xdr.incidents
         WHERE %(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz
+        -- The per-severity breakdown is refreshed WITH alert_count, never
+        -- without it. An incident accrues alerts after it opens; refreshing the
+        -- total while freezing its components produced rows reading
+        -- alert_count = 10 over a breakdown summing to 3, which is not a
+        -- partially stale figure but an internally contradictory one -- and it
+        -- is invisible in either number read on its own.
+        --
+        -- host_count, user_count and description move for the same reason: an
+        -- incident grows to cover more hosts and users as it is triaged.
         ON CONFLICT (incident_id, created_at) DO UPDATE SET
-            modified_at = EXCLUDED.modified_at,
-            resolved_at = EXCLUDED.resolved_at,
-            status      = EXCLUDED.status,
-            severity    = EXCLUDED.severity,
-            alert_count = EXCLUDED.alert_count,
-            assignee    = EXCLUDED.assignee
+            modified_at               = EXCLUDED.modified_at,
+            resolved_at               = EXCLUDED.resolved_at,
+            status                    = EXCLUDED.status,
+            severity                  = EXCLUDED.severity,
+            description               = EXCLUDED.description,
+            alert_count               = EXCLUDED.alert_count,
+            high_severity_alert_count = EXCLUDED.high_severity_alert_count,
+            med_severity_alert_count  = EXCLUDED.med_severity_alert_count,
+            low_severity_alert_count  = EXCLUDED.low_severity_alert_count,
+            host_count                = EXCLUDED.host_count,
+            user_count                = EXCLUDED.user_count,
+            assignee                  = EXCLUDED.assignee
     """,
     fact_ddl="""
         CREATE TABLE IF NOT EXISTS mart_fact_xdr_incidents (
@@ -539,7 +569,7 @@ XDR_ENDPOINTS = Target(
         INSERT INTO mart_fact_xdr_endpoint_snapshots
             (endpoint_id, snapshot_at, endpoint_name, endpoint_status,
              agent_version, content_version, os_type, last_seen_at,
-             is_isolated, operational_status)
+             is_isolated, operational_status, policy_name, extensions_policy)
         SELECT
             source_id,
             _event_time,
@@ -552,15 +582,26 @@ XDR_ENDPOINTS = Target(
                  THEN to_timestamp((payload->>'last_seen')::bigint / 1000)
             END,
             payload->>'is_isolated',
-            payload->>'operational_status'
+            payload->>'operational_status',
+            -- The policy columns. Verified present on the live payload
+            -- 2026-09-14. Without them this target answers "is the agent
+            -- running" but not "is the right policy applied to it", which is
+            -- the half of policy health that this table exists for.
+            payload->>'assigned_prevention_policy',
+            payload->>'assigned_extensions_policy'
         FROM raw_xdr.endpoint_snapshots
         WHERE %(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz
+        -- Both policy columns are mutable: a reassignment is exactly the drift
+        -- this table is here to make visible, so a re-landed snapshot must be
+        -- able to correct them.
         ON CONFLICT (endpoint_id, snapshot_at) DO UPDATE SET
             endpoint_status    = EXCLUDED.endpoint_status,
             agent_version      = EXCLUDED.agent_version,
             content_version    = EXCLUDED.content_version,
             last_seen_at       = EXCLUDED.last_seen_at,
-            operational_status = EXCLUDED.operational_status
+            operational_status = EXCLUDED.operational_status,
+            policy_name        = EXCLUDED.policy_name,
+            extensions_policy  = EXCLUDED.extensions_policy
     """,
     fact_ddl="""
         CREATE TABLE IF NOT EXISTS mart_fact_xdr_endpoint_snapshots (
@@ -574,6 +615,8 @@ XDR_ENDPOINTS = Target(
             last_seen_at       timestamptz,
             is_isolated        text,
             operational_status text,
+            policy_name        text,
+            extensions_policy  text,
             PRIMARY KEY (endpoint_id, snapshot_at)
         ) PARTITION BY RANGE (snapshot_at);
         CREATE INDEX IF NOT EXISTS mart_fact_xdr_endpoint_snapshots_snapshot_at_idx
@@ -681,12 +724,21 @@ INCIDENT_LIFECYCLE = Target(
                 WHERE l.xsoar_incident_id = x.source_id
                   AND l.created_at = (x.payload->>'created')::timestamptz
                   AND l.join_status = 'pending_xdr')
+        -- xdr_incident_id MUST be refreshed alongside join_status. It is
+        -- derived from dbotMirrorId, which XSOAR sets when mirroring is
+        -- established rather than at incident creation, so it is exactly as
+        -- mutable as the status computed from it. Updating one and not the
+        -- other is how a row comes to claim 'matched' while carrying no key to
+        -- what it matched -- a self-contradiction no single column reveals.
         ON CONFLICT (xsoar_incident_id, created_at) DO UPDATE SET
+            xdr_incident_id = EXCLUDED.xdr_incident_id,
             xdr_created_at  = EXCLUDED.xdr_created_at,
             xdr_resolved_at = EXCLUDED.xdr_resolved_at,
             closed_at       = EXCLUDED.closed_at,
             status          = EXCLUDED.status,
             severity        = EXCLUDED.severity,
+            source_brand    = EXCLUDED.source_brand,
+            incident_type   = EXCLUDED.incident_type,
             alert_count     = EXCLUDED.alert_count,
             join_status     = EXCLUDED.join_status,
             time_to_resolve = EXCLUDED.time_to_resolve
