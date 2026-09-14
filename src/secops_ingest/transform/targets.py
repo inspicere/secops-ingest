@@ -308,8 +308,9 @@ DEFECTDOJO = Target(
 #: NOTE ON THIS INSTANCE: every sampled incident was closed (status=2, 500/500),
 #: because the dominant incident type is an automated remediation playbook. MTTR
 #: here measures automation latency, not analyst response. `open_duration_s` is
-#: the instance's own measure and is retained alongside the derived
-#: `time_to_resolve` so the two can be compared rather than silently conflated.
+#: the instance's own measure. Derived `time_to_resolve` lives on the lifecycle
+#: fact table built in a later task, since the same incident exists on both XSOAR
+#: and XDR sides and measuring it twice would double-count.
 XSOAR_INCIDENTS = Target(
     name="xsoar_incidents",
     raw_table="raw_xsoar.incidents",

@@ -13,7 +13,7 @@ import re
 import pytest
 
 from secops_ingest.transform.base import Target
-from secops_ingest.transform.targets import TARGETS
+from secops_ingest.transform.targets import TARGETS, XDR_INCIDENTS, XSOAR_INCIDENTS
 
 ALL = list(TARGETS.values())
 WITH_ROLLUP = [t for t in ALL if t.rollup_table]
@@ -139,9 +139,6 @@ def test_every_target_is_registered_under_its_own_name() -> None:
         assert target.name == name
 
 
-from secops_ingest.transform.targets import XDR_INCIDENTS, XSOAR_INCIDENTS
-
-
 def test_xsoar_target_partitions_on_created_and_upserts_on_the_partition_key() -> None:
     t = XSOAR_INCIDENTS
     assert t.raw_table == "raw_xsoar.incidents"
@@ -152,8 +149,15 @@ def test_xsoar_target_partitions_on_created_and_upserts_on_the_partition_key() -
 
 
 def test_xsoar_target_carries_the_xdr_join_key() -> None:
-    """dbotMirrorId is the XDR incident id. Without it there is no lifecycle."""
-    assert "dbotMirrorId" in XSOAR_INCIDENTS.upsert_sql
+    """dbotMirrorId is the XDR incident id. Without it there is no lifecycle.
+
+    These are substring assertions and do not verify positional correspondence
+    between the INSERT column list and the SELECT expressions — a SQL parser
+    would be needed for that. They catch obvious omissions and renamed fields,
+    but not a field selected into the wrong column. That level of verification
+    is not worth the parsing complexity here.
+    """
+    assert "payload->>'dbotMirrorId'" in XSOAR_INCIDENTS.upsert_sql
     assert "xdr_incident_id" in XSOAR_INCIDENTS.fact_ddl
 
 
@@ -164,8 +168,11 @@ def test_xsoar_target_guards_the_open_incident_sentinel() -> None:
     minus two thousand years and poisons every average built on it.
     """
     sql = XSOAR_INCIDENTS.upsert_sql
-    assert "0001-01-01" in sql
-    assert "NULLIF" in sql
+    # Assert all three guards explicitly. A partial regression dropping one of
+    # them would pass a simpler test, but these three checks catch it.
+    assert "NULLIF(NULLIF" in sql  # Nested guard for absent and empty string
+    assert "NULLIF(payload->>'closed', '')" in sql  # Empty string guard
+    assert "'0001-01-01T00:00:00Z'" in sql  # Go zero time guard
 
 
 def test_xsoar_target_reads_status_and_severity_as_integers() -> None:
@@ -176,8 +183,13 @@ def test_xsoar_target_reads_status_and_severity_as_integers() -> None:
 
 
 def test_xdr_target_divides_epoch_milliseconds() -> None:
-    """Miss the /1000 and every incident lands in the year 56,000."""
-    assert "/ 1000" in XDR_INCIDENTS.upsert_sql
+    """Miss the /1000 and every incident lands in the year 56,000.
+
+    There are three epoch conversions (creation_time, modification_time,
+    resolved_timestamp). A partial regression dropping the division on one or
+    two of them would pass a simpler test; this count catches partial misses.
+    """
+    assert XDR_INCIDENTS.upsert_sql.count("/ 1000") == 3
     assert XDR_INCIDENTS.fact_date_expr == "created_at"
 
 
