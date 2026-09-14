@@ -266,6 +266,63 @@ def test_lifecycle_classifies_unmatched_rows_rather_than_hiding_them() -> None:
     assert "join_status" in (INCIDENT_LIFECYCLE.fact_ddl or "")
 
 
+def test_lifecycle_retries_rows_still_waiting_for_their_xdr_side() -> None:
+    """The watermark only watches the XSOAR side, so a match can never happen late.
+
+    raw_table is raw_xsoar.incidents, so the incremental predicate is
+    `x._ingested_at > since` and a row is re-derived only when its XSOAR raw row
+    lands again. This instance auto-closes incidents, so `modified` stops
+    advancing and the raw row never re-lands -- an incident whose XDR
+    counterpart arrives afterwards would keep a NULL xdr_resolved_at forever.
+
+    `pending_xdr` marks the unmatched-but-still-within-retention rows, and the
+    EXISTS arm of the WHERE clause is what re-derives exactly those every run.
+    Losing either half silently reinstates the permanent miss.
+    """
+    sql = body(INCIDENT_LIFECYCLE.upsert_sql)
+    # Scoped to the classifying CASE, not to the whole statement. A whole-string
+    # search for 'pending_xdr' is satisfied by the retry predicate below, so it
+    # would still pass with the CASE branch deleted -- i.e. with the defect
+    # fully reinstated.
+    case = sql[sql.index("CASE"):sql.index("END")]
+    for status in ("matched", "non_xdr_source", "pending_xdr", "xdr_aged_out"):
+        assert f"'{status}'" in case, f"join_status {status} is not produced"
+    # The retry arm: an EXISTS back against this target's own fact table,
+    # restricted to the non-terminal state. Without it `pending_xdr` is just a
+    # relabelled `xdr_aged_out` that is still never revisited.
+    assert "EXISTS (" in sql
+    assert "FROM mart_fact_incident_lifecycle l" in sql
+    assert "l.join_status = 'pending_xdr'" in sql
+
+
+def test_lifecycle_pending_state_is_bounded_by_xdr_retention() -> None:
+    """`pending_xdr` must be self-limiting or the retry set grows without bound.
+
+    The 325-day horizon is XDR's retention: past it the XDR record genuinely
+    cannot arrive, the row becomes a terminal `xdr_aged_out`, and it drops out
+    of the retry set for good.
+    """
+    sql = body(INCIDENT_LIFECYCLE.upsert_sql)
+    assert "interval '325 days'" in sql
+    # The pending branch must be tried BEFORE the aged-out fallback, or every
+    # in-retention row falls straight through to the terminal state.
+    assert sql.index("'pending_xdr'") < sql.index("'xdr_aged_out'")
+
+
+def test_lifecycle_takes_one_xdr_row_per_incident() -> None:
+    """A plain LEFT JOIN fans out if the XDR fact ever holds two partitions for
+    one incident_id, and a fan-out here multiplies the row it is joined to.
+
+    The fact table is partitioned on created_at and keyed
+    (incident_id, created_at), so one id CAN legitimately hold more than one
+    row. The LATERAL picks the newest and caps the join at one.
+    """
+    sql = body(INCIDENT_LIFECYCLE.upsert_sql)
+    assert "LEFT JOIN LATERAL" in sql
+    assert "ORDER BY i.created_at DESC" in sql
+    assert "LIMIT 1" in sql
+
+
 def test_lifecycle_measures_resolution_from_the_xsoar_side() -> None:
     """The same incident exists on both sides; measuring it twice double-counts."""
     assert "time_to_resolve" in (INCIDENT_LIFECYCLE.fact_ddl or "")

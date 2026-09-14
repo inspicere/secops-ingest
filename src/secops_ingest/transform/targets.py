@@ -596,10 +596,42 @@ XDR_ENDPOINTS = Target(
 #: source); separately, XDR-sourced incidents whose XDR record has aged out
 #: carry an id that no longer resolves. Collapsing those into one "unmatched"
 #: bucket turns a data-availability gap into an apparent business fact, so
-#: join_status keeps them apart on the dashboard.
+#: join_status keeps them apart on the dashboard. A third unmatched population,
+#: `pending_xdr`, is split out of the aged-out one for the reason below.
 #:
 #: DO NOT SUM MTTR ACROSS THE TWO FACT TABLES. The same incident exists on both
 #: sides. This table is the only correct place to measure the lifecycle.
+#:
+#: `pending_xdr` EXISTS BECAUSE THE WATERMARK ONLY WATCHES THE XSOAR SIDE.
+#: raw_table is raw_xsoar.incidents, so the runner's watermark is
+#: max(_ingested_at) over XSOAR raw alone and the incremental predicate is
+#: `x._ingested_at > since`. A row is therefore re-derived only when its XSOAR
+#: raw row lands again. An incident whose XDR counterpart lands AFTER it does
+#: would keep its unmatched classification and a NULL xdr_resolved_at forever,
+#: because this instance auto-closes incidents: `modified` stops advancing, the
+#: XSOAR raw row never re-lands, and nothing ever re-runs the join for it.
+#:
+#: So an unmatched incident that is still inside XDR's 325-day retention is
+#: classified `pending_xdr` rather than `xdr_aged_out`, and the WHERE clause
+#: re-derives exactly those rows on every run via an EXISTS against this very
+#: fact table. This is SELF-LIMITING: the three terminal states (`matched`,
+#: `non_xdr_source`, and a genuine `xdr_aged_out` past the retention horizon)
+#: are never retried, so the retry set only shrinks as the XDR side arrives or
+#: the incident ages past 325 days.
+#:
+#: RUN ORDER MATTERS. `incident_lifecycle` must run AFTER `xdr_incidents` in any
+#: deployment. Running it first is not a correctness bug any more -- that is the
+#: point of `pending_xdr` -- but every new XDR-sourced incident then spends a
+#: whole cycle in `pending_xdr` before it matches.
+#:
+#: FULL REBUILD RECIPE. There is no `--full` flag; the runner derives everything
+#: from control.transform_watermark. To rebuild this table from the whole raw
+#: buffer, clear its watermark and run it again::
+#:
+#:     DELETE FROM control.transform_watermark WHERE target='incident_lifecycle';
+#:
+#: The upsert is idempotent, so the rebuild rewrites rows rather than doubling
+#: them, and the row count is bounded by what raw_xsoar.incidents still holds.
 #:
 #: The payload extraction is deliberately duplicated from XSOAR_INCIDENTS.
 #: Editing one without the other will make them drift.
@@ -628,14 +660,27 @@ INCIDENT_LIFECYCLE = Target(
             CASE
                 WHEN d.incident_id IS NOT NULL                     THEN 'matched'
                 WHEN COALESCE(x.payload->>'dbotMirrorId', '') = '' THEN 'non_xdr_source'
+                WHEN (x.payload->>'created')::timestamptz
+                     > now() - interval '325 days'                 THEN 'pending_xdr'
                 ELSE                                                   'xdr_aged_out'
             END,
             NULLIF(NULLIF(x.payload->>'closed', ''), '0001-01-01T00:00:00Z')::timestamptz
               - (x.payload->>'created')::timestamptz
         FROM raw_xsoar.incidents x
-        LEFT JOIN mart_fact_xdr_incidents d
-               ON d.incident_id = NULLIF(x.payload->>'dbotMirrorId', '')
-        WHERE %(since)s::timestamptz IS NULL OR x._ingested_at > %(since)s::timestamptz
+        LEFT JOIN LATERAL (
+            SELECT i.incident_id, i.created_at, i.resolved_at, i.alert_count
+            FROM mart_fact_xdr_incidents i
+            WHERE i.incident_id = NULLIF(x.payload->>'dbotMirrorId', '')
+            ORDER BY i.created_at DESC
+            LIMIT 1
+        ) d ON true
+        WHERE %(since)s::timestamptz IS NULL
+           OR x._ingested_at > %(since)s::timestamptz
+           OR EXISTS (
+                SELECT 1 FROM mart_fact_incident_lifecycle l
+                WHERE l.xsoar_incident_id = x.source_id
+                  AND l.created_at = (x.payload->>'created')::timestamptz
+                  AND l.join_status = 'pending_xdr')
         ON CONFLICT (xsoar_incident_id, created_at) DO UPDATE SET
             xdr_created_at  = EXCLUDED.xdr_created_at,
             xdr_resolved_at = EXCLUDED.xdr_resolved_at,
