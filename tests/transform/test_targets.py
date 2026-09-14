@@ -71,11 +71,19 @@ def test_rollup_has_no_high_cardinality_dimension(target: Target) -> None:
     """The rule the WAZUH target documents, enforced rather than described.
 
     A dimension bounded only by the size of the estate (component, agent, host,
-    file path) produces a rollup larger than the fact table it summarises. Those
-    attributes belong in the facts, where a dashboard can filter to one without
-    paying for all of them.
+    file path, endpoint) produces a rollup larger than the fact table it
+    summarises. Those attributes belong in the facts, where a dashboard can
+    filter to one without paying for all of them.
     """
-    forbidden = ("component_name", "agent_name", "file_path", "title", "description")
+    forbidden = (
+        "component_name",
+        "agent_name",
+        "file_path",
+        "title",
+        "description",
+        "endpoint_id",
+        "host_name",
+    )
     sql = body(target.rollup_sql).lower()
     offenders = [c for c in forbidden if c in sql]
     assert not offenders, f"{target.name} rollup groups on {offenders}"
@@ -216,7 +224,7 @@ def test_alerts_target_has_a_rollup_because_the_volume_requires_one() -> None:
 def test_alert_rollup_dimensions_are_all_low_cardinality() -> None:
     """endpoint_id is the tempting mistake: 1,630 endpoints would make the
     rollup larger than the fact table it summarises."""
-    sql = XDR_ALERTS.rollup_sql or ""
+    sql = body(XDR_ALERTS.rollup_sql)
     assert "endpoint_id" not in sql
     assert "host_name" not in sql
     for dim in ("severity", "category", "source"):
@@ -226,14 +234,12 @@ def test_alert_rollup_dimensions_are_all_low_cardinality() -> None:
 def test_alert_rollup_is_rebuilt_from_facts_not_from_raw() -> None:
     """Raw partitions are dropped on schedule; a rollup derived from raw could
     not be rebuilt afterwards."""
-    assert "mart_fact_xdr_alerts" in (XDR_ALERTS.rollup_sql or "")
-    assert "raw_xdr" not in (XDR_ALERTS.rollup_sql or "")
+    assert "mart_fact_xdr_alerts" in body(XDR_ALERTS.rollup_sql)
+    assert "raw_xdr" not in body(XDR_ALERTS.rollup_sql)
 
 
 def test_endpoint_target_is_keyed_per_snapshot_not_per_endpoint() -> None:
     """A current-state table would overwrite its own history and make drift
     invisible, which is the only thing this source is for."""
-    assert "PRIMARY KEY (endpoint_id, snapshot_at)" in (
-        XDR_ENDPOINTS.fact_ddl or ""
-    )
+    assert "PRIMARY KEY (endpoint_id, snapshot_at)" in body(XDR_ENDPOINTS.fact_ddl)
     assert XDR_ENDPOINTS.fact_date_expr == "snapshot_at"
