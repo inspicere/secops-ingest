@@ -48,32 +48,3 @@ def test_no_two_sources_share_a_table() -> None:
             f"{name} and {tables.get(module.SOURCE.table)} both write "
             f"{module.SOURCE.table}")
         tables[module.SOURCE.table] = name
-
-
-def test_every_transform_target_is_registered() -> None:
-    """Every Target instance defined at module scope must be in TARGETS.
-
-    An unregistered Target is unreachable code that no scheduler can invoke.
-    """
-    from secops_ingest.transform import targets as targets_module
-    from secops_ingest.transform.base import Target
-
-    # Collect all Target instances defined at module scope
-    defined_targets = {
-        name: obj
-        for name, obj in vars(targets_module).items()
-        if isinstance(obj, Target)
-    }
-
-    # Collect all registered targets
-    registered_targets = set(targets_module.TARGETS.values())
-
-    # Find any targets that are defined but not registered
-    unregistered = [
-        name for name, target in defined_targets.items()
-        if target not in registered_targets
-    ]
-
-    assert not unregistered, (
-        f"Unregistered transform targets: {', '.join(sorted(unregistered))}"
-    )

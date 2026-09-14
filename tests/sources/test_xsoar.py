@@ -128,3 +128,35 @@ def test_event_time_is_created_because_the_partition_key_must_be_immutable(
 def test_to_row_uses_zero_run_id_as_null(source: XsoarSource) -> None:
     _sid, _p, _e, run_id = source.to_row(incident("1", "2026-09-09T00:00:00.000Z"), 0)
     assert run_id is None
+
+
+def test_authenticate_resolves_the_secret_and_returns_standard_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The secret name and the API path are both wrong-able in ways nothing else
+    catches: a wrong secret name resolves a different tenant's credentials, and
+    a wrong path builds a base URL that 404s every request.
+
+    XSOAR is on /xsoar/public/v1, not the /public_api/v1 the three XDR
+    connectors share -- the single field that differs between them.
+    """
+    monkeypatch.setenv("SECOPS_XSOAR_SECRET", "xsoar-test-secret")
+    resolve_args: list[tuple[str, str]] = []
+
+    def mock_resolve(secret: str, path: str) -> _cortex.CortexCreds:
+        resolve_args.append((secret, path))
+        return _cortex.CortexCreds(
+            key="test-key", key_id="42", base=f"https://api-tenant.example.com{path}")
+
+    monkeypatch.setattr(xsoar_mod, "resolve", mock_resolve)
+    headers = XsoarSource().authenticate()
+
+    assert resolve_args == [("xsoar-test-secret", "/xsoar/public/v1")]
+    assert headers == {
+        "Authorization": "test-key",
+        "x-xdr-auth-id": "42",
+        "Content-Type": "application/json",
+    }
+    # Advanced auth 401s on these tenants; sending its fields is a regression.
+    assert "x-xdr-nonce" not in headers
+    assert "x-xdr-timestamp" not in headers

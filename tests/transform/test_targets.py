@@ -51,6 +51,64 @@ def updated_columns(sql: str) -> dict[str, str]:
     return dict(re.findall(r"(\w+)\s*=\s*EXCLUDED\.(\w+)", tail))
 
 
+def _split_top_level(text: str) -> list[str]:
+    """Split on commas that are not inside parentheses."""
+    parts: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for char in text:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        if char == "," and depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    if "".join(current).strip():
+        parts.append("".join(current).strip())
+    return parts
+
+
+def selected_expressions(sql: str) -> list[str]:
+    """The top-level SELECT expressions of an upsert, in order.
+
+    Everything between the outer SELECT and its own FROM. Subquery FROMs are
+    inside parentheses, so tracking depth is enough to find the right one --
+    this does not need to be a SQL parser, only good enough to line the SELECT
+    list up with the INSERT list positionally.
+    """
+    text = body(sql)
+    start = text.index("SELECT", text.index("INSERT INTO")) + len("SELECT")
+    depth = 0
+    end = len(text)
+    for i in range(start, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+        elif depth == 0 and text.startswith("FROM ", i) and text[i - 1].isspace():
+            end = i
+            break
+    return _split_top_level(text[start:end])
+
+
+def selected_by_column(sql: str) -> dict[str, str]:
+    """{inserted column: the expression that fills it}.
+
+    Substring checks against the whole statement cannot tell which column an
+    expression lands in, which is how a column comes to be filled from
+    something that merely looks plausible. Pairing the two lists positionally
+    is what makes "this column is derived from that side" testable at all.
+    """
+    columns = inserted_columns(sql)
+    expressions = selected_expressions(sql)
+    assert len(columns) == len(expressions), (
+        f"{len(columns)} columns against {len(expressions)} select expressions")
+    return dict(zip(columns, expressions, strict=True))
+
+
 @pytest.mark.parametrize("target", ALL, ids=lambda t: t.name)
 def test_upsert_is_incremental(target: Target) -> None:
     """Without the watermark parameter every run reprocesses the whole raw table."""
@@ -191,6 +249,92 @@ def test_rollup_pair_is_all_or_nothing(target: Target) -> None:
 def test_every_target_is_registered_under_its_own_name() -> None:
     for name, target in TARGETS.items():
         assert target.name == name
+
+
+def test_every_transform_target_is_registered() -> None:
+    """Every Target instance defined at module scope must be in TARGETS.
+
+    An unregistered Target is unreachable code that no scheduler can invoke.
+
+    Lives here rather than in tests/sources/: it touches no connector and no
+    HTTP client, and under the module-level importorskip("httpx") over there it
+    was silently skipped in any install without the 'http' extra -- including
+    the one a reviewer most often has.
+    """
+    from secops_ingest.transform import targets as targets_module
+
+    defined = {name: obj for name, obj in vars(targets_module).items()
+               if isinstance(obj, Target)}
+    registered = set(targets_module.TARGETS.values())
+    unregistered = sorted(n for n, t in defined.items() if t not in registered)
+    assert not unregistered, f"Unregistered transform targets: {unregistered}"
+
+
+# -- structural invariants the runner and the schema generator depend on ------
+#
+# R11 was a target whose raw_table was not schema-qualified. Nothing in the
+# target definition objected; it failed later, elsewhere, in a generator. These
+# are the mechanical checks that would have caught it at the point it was
+# written, applied to every target rather than to the one that broke.
+
+
+@pytest.mark.parametrize("target", ALL, ids=lambda t: t.name)
+def test_raw_table_is_schema_qualified(target: Target) -> None:
+    """schema/__main__.py partitions raw_table on the dot and rejects it
+    otherwise, and runner.py feeds the split to sql.Identifier(*parts) to build
+    the watermark query. An unqualified name produces a bare identifier that
+    resolves against the search_path -- or nothing at all.
+    """
+    schema, dot, table = target.raw_table.partition(".")
+    assert dot and schema and table, (
+        f"{target.name}: raw_table {target.raw_table!r} is not schema-qualified")
+
+
+@pytest.mark.parametrize("target", ALL, ids=lambda t: t.name)
+def test_fact_table_is_not_schema_qualified(target: Target) -> None:
+    """The mirror image of the rule above, and the reason it is easy to get
+    backwards. fact_table goes through validate_identifier, which accepts a
+    plain lowercase identifier only -- a dot raises InvalidIdentifier.
+    """
+    assert "." not in target.fact_table, (
+        f"{target.name}: fact_table {target.fact_table!r} must be a bare identifier")
+
+
+@pytest.mark.parametrize("target", ALL, ids=lambda t: t.name)
+def test_upsert_reads_the_table_the_target_declares(target: Target) -> None:
+    """raw_table is not documentation: the runner takes the watermark and the
+    affected-days list from THAT table while the upsert reads whatever its own
+    FROM names. If they disagree the two run on different data and the
+    watermark advances over rows the upsert never saw.
+    """
+    assert target.raw_table in body(target.upsert_sql), (
+        f"{target.name}: upsert_sql never reads {target.raw_table}")
+
+
+@pytest.mark.parametrize("target", ALL, ids=lambda t: t.name)
+def test_the_partition_key_is_in_the_conflict_target(target: Target) -> None:
+    """Every fact table here is partitioned on fact_date_expr, and PostgreSQL
+    forces the partition key into the primary key. A conflict target that omits
+    it has no matching unique index, so the upsert fails at runtime with
+    "no unique or exclusion constraint matching the ON CONFLICT specification".
+
+    Deliberately a test and not a check in Target.__post_init__: it holds
+    because every target so far partitions on a plain column, which is a
+    property of this set of targets rather than of the Target contract.
+    """
+    _, _, conflict = body(target.upsert_sql).partition("ON CONFLICT")
+    conflict = conflict.split(")", 1)[0]
+    assert target.fact_date_expr in conflict, (
+        f"{target.name}: partition key {target.fact_date_expr} is not in "
+        f"ON CONFLICT ({conflict.lstrip(' (')})")
+
+
+@pytest.mark.parametrize("target", ALL, ids=lambda t: t.name)
+def test_the_insert_and_select_lists_are_the_same_length(target: Target) -> None:
+    """A column added to one list and not the other is a runtime error at best
+    and a silent one-place shift of every following column at worst."""
+    assert len(inserted_columns(target.upsert_sql)) == len(
+        selected_expressions(target.upsert_sql))
 
 
 def test_xsoar_target_partitions_on_created_and_upserts_on_the_partition_key() -> None:
@@ -421,9 +565,32 @@ def test_lifecycle_takes_one_xdr_row_per_incident() -> None:
 
 
 def test_lifecycle_measures_resolution_from_the_xsoar_side() -> None:
-    """The same incident exists on both sides; measuring it twice double-counts."""
+    """The same incident exists on both sides; measuring it twice double-counts.
+
+    This asserts the DERIVATION, not the presence of the column names. The
+    obvious version -- "closed_at appears in the SQL" -- passes just as happily
+    when closed_at is filled from d.resolved_at, which is the exact
+    mis-sourcing this test is named for: the XDR side resolves when detection
+    closes it, the XSOAR side when the response actually finished, and the two
+    are different numbers.
+    """
     assert "time_to_resolve" in (INCIDENT_LIFECYCLE.fact_ddl or "")
-    assert "closed_at" in INCIDENT_LIFECYCLE.upsert_sql
+    selected = selected_by_column(INCIDENT_LIFECYCLE.upsert_sql)
+
+    closed = selected["closed_at"]
+    assert "x.payload->>'closed'" in closed
+    assert "d." not in closed, f"closed_at is taken from the XDR side: {closed}"
+
+    ttr = selected["time_to_resolve"]
+    assert "x.payload->>'closed'" in ttr
+    assert "- (x.payload->>'created')::timestamptz" in ttr, (
+        f"time_to_resolve does not subtract the XSOAR created time: {ttr}")
+    assert "d." not in ttr, f"time_to_resolve reaches into the XDR side: {ttr}"
+
+    # The XDR timestamps still land, in their own columns, so the two sides can
+    # be compared -- they just do not feed the XSOAR-side measure.
+    assert selected["xdr_created_at"] == "d.created_at"
+    assert selected["xdr_resolved_at"] == "d.resolved_at"
 
 
 def test_lifecycle_filters_on_the_anchor_tables_ingested_at() -> None:
