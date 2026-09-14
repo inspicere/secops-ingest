@@ -80,12 +80,30 @@ class XdrEndpointsSource:
         return self._pinned
 
     def fetch(self, creds: Any, cursor: str | None) -> Iterator[dict[str, Any]]:
-        """Yield every endpoint. `cursor` is deliberately unused."""
+        """Yield every endpoint. `cursor` is deliberately unused.
+
+        AN EXPLICIT SORT IS NOT COSMETIC HERE. The estate is read with 17
+        offset-paged requests, and without a `sort` the server's ordering is
+        undefined. If that default order is derived from anything mutable --
+        last check-in, status, operational state -- an endpoint that changes
+        mid-scan moves within the ordering and the next offset window starts
+        past a row that was never returned.
+
+        A missing endpoint in this table does not read as a paging artefact. It
+        reads as an agent that vanished from the estate, which is the exact
+        false signal this connector exists to avoid raising.
+
+        `endpoint_id` is immutable, so ordering on it is stable across the whole
+        scan regardless of what changes underneath. Verified accepted (HTTP 200)
+        against the live tenant on 2026-09-14.
+        """
         self._snapshot_at()
         frm = 0
         while True:
             body = {"request_data": {"search_from": frm,
-                                     "search_to": frm + self.page_size}}
+                                     "search_to": frm + self.page_size,
+                                     "sort": {"field": "endpoint_id",
+                                              "keyword": "asc"}}}
             started = time.monotonic()
             payload = with_retries(partial(self._post, creds, body))
             reply = payload.get("reply") or {}

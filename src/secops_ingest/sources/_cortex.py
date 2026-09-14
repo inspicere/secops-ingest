@@ -80,6 +80,18 @@ def resolve(secret: str, path: str) -> CortexCreds:
     # or without it so an operator pasting the console URL still works.
     if not host.startswith("api-"):
         host = f"api-{host}"
+
+    # The tenant FQDN is registered for the same reason the key is, and it is
+    # not belt-and-braces. httpx logs the full request URL at INFO, and cli.py
+    # configures INFO by default with the RedactingFilter attached -- and that
+    # filter only scrubs values someone registered. Without this line the
+    # identifier this module deliberately keeps out of the repository is written
+    # to the journal on every single request.
+    #
+    # It also neutralises CortexCreds' default __repr__, which prints `base`
+    # verbatim into any traceback that happens to carry the dataclass.
+    register_secret(host)
+
     return CortexCreds(key=key, key_id=key_id,
                        base=f"{parts.scheme or 'https'}://{host}{path}")
 

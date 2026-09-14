@@ -66,6 +66,10 @@ class XdrSource:
 
     # -- fetching -----------------------------------------------------------
 
+    def _now_ms(self) -> int:
+        """Separated so tests can freeze the clock."""
+        return int(time.time() * 1000)
+
     def fetch(self, creds: Any, cursor: str | None) -> Iterator[dict[str, Any]]:
         """Yield incidents modified at or after `cursor`, oldest first.
 
@@ -74,11 +78,28 @@ class XdrSource:
         all of them but the one that set the watermark. Re-reading the boundary
         costs nothing because landing is an upsert keyed on
         (source_id, _event_time).
+
+        THE UPPER BOUND IS PINNED ONCE, BEFORE THE FIRST PAGE. This connector
+        sorts ascending on the very field it filters on, and `get_incidents`
+        pages by offset. An incident touched while the scan is in progress moves
+        to the END of that sort, shifting every row behind it one place forward,
+        so the next offset window starts past a row that was never returned. The
+        loss is permanent, not transient: the skipped row's modification_time is
+        below the watermark this run then advances to, so no later run asks for
+        it either.
+
+        Pinning an upper bound at run start makes the result set stable for the
+        length of the scan, exactly as xsoar.py pins `toDate`. Anything modified
+        after the pin is simply picked up next run. `operator: "lte"` on
+        modification_time was verified accepted (HTTP 200) against the live
+        tenant on 2026-09-14.
         """
         filters: list[dict[str, Any]] = []
         if cursor:
             filters.append({"field": "modification_time", "operator": "gte",
                             "value": int(cursor)})
+        filters.append({"field": "modification_time", "operator": "lte",
+                        "value": self._now_ms()})
 
         frm = 0
         while True:

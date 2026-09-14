@@ -92,6 +92,66 @@ def test_resolve_registers_the_key_for_redaction(
     assert "k" * 128 in seen
 
 
+def test_resolve_registers_the_tenant_host_for_redaction(
+    stub: StubProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tenant FQDN is the identifier this platform keeps out of the repo --
+    and httpx logs the full request URL at INFO, which cli.py enables by
+    default. RedactingFilter only scrubs values that were registered, so
+    without this the hostname is written to the journal on every request.
+
+    Registering it also neutralises CortexCreds' default __repr__, which prints
+    `base` verbatim into any traceback carrying the dataclass.
+    """
+    seen: list[str] = []
+    monkeypatch.setattr(_cortex, "register_secret", seen.append)
+    creds = _cortex.resolve("xdr", "/p")
+    assert "api-tenant.example.com" in seen
+    # And it is the host actually used, not some other spelling of it.
+    assert "api-tenant.example.com" in creds.base
+
+
+def test_the_registered_host_is_the_one_after_the_api_prefix_is_added(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Registering the stored value rather than the assembled one would leave
+    the host that actually appears in every URL unredacted."""
+    p = StubProvider({"x.api_key": "k" * 128, "x.api_key_id": "1",
+                      "x.url": "https://tenant.example.com"})
+    monkeypatch.setattr(_cortex, "get_provider", lambda: p)
+    seen: list[str] = []
+    monkeypatch.setattr(_cortex, "register_secret", seen.append)
+    _cortex.resolve("x", "/p")
+    assert "api-tenant.example.com" in seen
+
+
+def test_a_registered_host_is_actually_scrubbed_from_a_log_line(
+    stub: StubProvider,
+) -> None:
+    """End to end through the real registry: an httpx-shaped INFO line carrying
+    the request URL must come out with the tenant removed."""
+    import logging
+
+    from secops_ingest import redaction
+
+    # The registry is process-wide by design. Snapshot and restore it, or this
+    # test silently changes what every later test's logs look like.
+    before = set(redaction._REGISTRY)
+    try:
+        creds = _cortex.resolve("xdr", "/public_api/v1")
+        record = logging.LogRecord(
+            "httpx", logging.INFO, __file__, 1,
+            'HTTP Request: POST %s "HTTP/1.1 200 OK"',
+            (f"{creds.base}/incidents/get_incidents/",), None,
+        )
+        redaction.RedactingFilter().filter(record)
+        assert "api-tenant.example.com" not in record.getMessage()
+        assert redaction.PLACEHOLDER in record.getMessage()
+    finally:
+        redaction._REGISTRY.clear()
+        redaction._REGISTRY.update(before)
+
+
 def test_env_int_rejects_a_non_integer(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SECOPS_T", "abc")
     with pytest.raises(ValueError):

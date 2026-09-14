@@ -73,19 +73,60 @@ def test_fetch_walks_the_window_forward(source: XdrSource) -> None:
     assert windows == [(0, 2), (2, 4)]
 
 
+def bounds(body: dict[str, Any]) -> dict[str, Any]:
+    """The modification_time filters of one request, keyed by operator."""
+    return {f["operator"]: f["value"]
+            for f in body["request_data"]["filters"]
+            if f["field"] == "modification_time"}
+
+
 def test_cursor_becomes_a_modification_time_filter(source: XdrSource) -> None:
     rec = Recorder([[]], total=0)
     source._post = rec  # type: ignore[method-assign]
+    source._now_ms = lambda: 1_789_999_999_999  # type: ignore[method-assign]
     list(source.fetch({}, "1789000000000"))
-    assert rec.bodies[0]["request_data"]["filters"] == [
-        {"field": "modification_time", "operator": "gte", "value": 1789000000000}]
+    assert bounds(rec.bodies[0]) == {"gte": 1789000000000, "lte": 1_789_999_999_999}
 
 
-def test_no_filters_are_sent_without_a_cursor(source: XdrSource) -> None:
+def test_the_window_is_bounded_at_both_ends(source: XdrSource) -> None:
+    """Sorting ascending on the same field being filtered, with offset paging,
+    means an incident touched mid-scan moves to the end of the sort and shifts
+    every later row forward -- so a row is stepped over at the next page
+    boundary. It is then below the watermark this run advances to, so no later
+    run asks for it either. The upper bound makes the result set stable.
+    """
     rec = Recorder([[]], total=0)
     source._post = rec  # type: ignore[method-assign]
+    source._now_ms = lambda: 1_789_999_999_999  # type: ignore[method-assign]
+    list(source.fetch({}, "1789000000000"))
+    assert set(bounds(rec.bodies[0])) == {"gte", "lte"}
+
+
+def test_only_the_upper_bound_is_sent_without_a_cursor(source: XdrSource) -> None:
+    """A first run is unbounded below on purpose -- it is a backfill -- but it
+    is the longest scan there is, so it needs the upper bound most."""
+    rec = Recorder([[]], total=0)
+    source._post = rec  # type: ignore[method-assign]
+    source._now_ms = lambda: 1_789_999_999_999  # type: ignore[method-assign]
     list(source.fetch({}, None))
-    assert rec.bodies[0]["request_data"]["filters"] == []
+    assert bounds(rec.bodies[0]) == {"lte": 1_789_999_999_999}
+
+
+def test_the_upper_bound_is_pinned_once_for_the_whole_run(source: XdrSource) -> None:
+    """Recomputing the bound per page would defeat it entirely: each request
+    would admit whatever was modified since the previous one, which is the
+    moving result set the bound exists to prevent.
+
+    The clock ticks on every read here, so a per-page bound shows up as more
+    than one distinct value rather than passing by coincidence.
+    """
+    ticking = iter([1_000, 2_000, 3_000, 4_000, 5_000])
+    source._now_ms = lambda: next(ticking)  # type: ignore[method-assign]
+    rec = Recorder([[inc("1", 1, 2), inc("2", 3, 4)], [inc("3", 5, 6)]], total=3)
+    source._post = rec  # type: ignore[method-assign]
+    list(source.fetch({}, None))
+    assert len(rec.bodies) == 2, "the test must actually page to mean anything"
+    assert len({bounds(b)["lte"] for b in rec.bodies}) == 1
 
 
 def test_sort_is_ascending_on_modification_time(source: XdrSource) -> None:

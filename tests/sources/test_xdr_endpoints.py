@@ -85,6 +85,24 @@ def test_the_watermark_is_the_snapshot_time(source: XdrEndpointsSource) -> None:
     assert source.watermark_of(endpoint("a")) == FROZEN
 
 
+def test_paging_is_ordered_on_an_immutable_field(source: XdrEndpointsSource) -> None:
+    """Without an explicit sort the server's ordering across these 17 offset
+    pages is undefined, and any default derived from a mutable attribute
+    (last check-in, status) lets an endpoint move mid-scan and be stepped over.
+
+    A missing endpoint here does not read as a paging artefact -- it reads as an
+    agent that disappeared from the estate, the exact false signal this
+    connector exists to avoid. endpoint_id cannot change, so the order holds for
+    the length of the scan.
+    """
+    rec = Recorder([[endpoint("a"), endpoint("b")], [endpoint("c")]])
+    source._post = rec  # type: ignore[method-assign]
+    list(source.fetch({}, None))
+    assert len(rec.bodies) == 2, "the test must actually page to mean anything"
+    for b in rec.bodies:
+        assert b["request_data"]["sort"] == {"field": "endpoint_id", "keyword": "asc"}
+
+
 def test_paging_walks_the_window(source: XdrEndpointsSource) -> None:
     rec = Recorder([[endpoint("a"), endpoint("b")], [endpoint("c")]])
     source._post = rec  # type: ignore[method-assign]
