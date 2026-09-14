@@ -163,3 +163,53 @@ def test_cache_avoids_a_second_backend_call(seed: Any) -> None:
     provider._fetch = counting  # type: ignore[method-assign]
     assert provider.get(name) == "cached"
     assert calls == [], "a cached value still hit the backend"
+
+
+# -- field selection ---------------------------------------------------------
+#
+# Credentials issued and rotated together live in one secret, addressed as
+# <secret>.<field>. See VaultSecretProvider's docstring for why the pair must
+# share a version history rather than occupy two paths.
+
+
+def test_field_selection_reads_one_field_of_a_multi_key_secret(seed: Any) -> None:
+    name = seed({"url": "https://api-tenant", "api_key": "k", "api_key_id": "42"})
+    provider = VaultSecretProvider()
+    assert provider.get(f"{name}.url") == "https://api-tenant"
+    assert provider.get(f"{name}.api_key") == "k"
+    assert provider.get(f"{name}.api_key_id") == "42"
+
+
+def test_field_selection_resolves_what_would_otherwise_be_ambiguous(seed: Any) -> None:
+    """The multi-key secret that is an error unqualified is fine qualified."""
+    name = seed({"username": "a", "password": "b"})
+    with pytest.raises(SecretError):
+        VaultSecretProvider().get(name)
+    assert VaultSecretProvider().get(f"{name}.password") == "b"
+
+
+def test_missing_field_on_an_existing_secret_raises_not_found(seed: Any) -> None:
+    """A typo'd field must fail, not fall back to the whole secret.
+
+    Falling back would resolve `xdr.api_kye` to whatever single key the secret
+    happened to have, which is how a connector ends up authenticating with a
+    URL.
+    """
+    name = seed({"api_key": "k"})
+    with pytest.raises(SecretNotFound):
+        VaultSecretProvider().get(f"{name}.api_kye")
+
+
+def test_missing_field_does_not_leak_backend_detail(seed: Any) -> None:
+    name = seed({"api_key": "k"})
+    with pytest.raises(SecretNotFound) as exc:
+        VaultSecretProvider().get(f"{name}.absent")
+    text = str(exc.value)
+    assert f"{MOUNT}/data" not in text
+    assert "/v1/" not in text
+
+
+def test_unqualified_names_are_unchanged_by_field_support(seed: Any) -> None:
+    """The dot is opt-in: names without one behave exactly as before."""
+    name = seed({"value": "unqualified-still-works"})
+    assert VaultSecretProvider().get(name) == "unqualified-still-works"
