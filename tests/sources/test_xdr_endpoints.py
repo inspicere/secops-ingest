@@ -7,6 +7,7 @@ every row in a run shares one snapshot timestamp.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -122,3 +123,46 @@ def test_authenticate_resolves_the_secret_and_returns_standard_headers(
     # Ensure no nonce or timestamp headers
     assert "x-xdr-nonce" not in headers
     assert "x-xdr-timestamp" not in headers
+
+
+def test_snapshot_time_is_pinned_across_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The snapshot time must be pinned on first call and reused for subsequent
+    calls within the same run. This is critical: without pinning, a run spanning
+    midnight would split one snapshot across two partitions."""
+    monkeypatch.setattr(
+        endpoints_mod, "resolve",
+        lambda secret, path: _cortex.CortexCreds(
+            key="k", key_id="1", base=f"https://api-tenant.example.com{path}"))
+    source = XdrEndpointsSource()
+
+    # Call _snapshot_at twice and assert both return the exact same value
+    first_call = source._snapshot_at()
+    second_call = source._snapshot_at()
+    assert first_call == second_call
+
+    # Assert the value parses as an ISO-8601 timestamp with UTC offset
+    from datetime import datetime
+    parsed = datetime.fromisoformat(first_call)
+    assert parsed.utcoffset() == timedelta(0)
+
+
+def test_authenticate_starts_a_new_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Calling authenticate() must reset the pinned snapshot time so the next
+    run starts with a fresh snapshot timestamp."""
+    monkeypatch.setattr(
+        endpoints_mod, "resolve",
+        lambda secret, path: _cortex.CortexCreds(
+            key="k", key_id="1", base=f"https://api-tenant.example.com{path}"))
+    source = XdrEndpointsSource()
+
+    # Pin a value by calling _snapshot_at
+    source._snapshot_at()
+    assert source._pinned is not None
+
+    # Call authenticate, which should reset _pinned
+    source.authenticate()
+    assert source._pinned is None
