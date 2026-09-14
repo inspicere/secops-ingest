@@ -137,3 +137,52 @@ def test_rollup_pair_is_all_or_nothing(target: Target) -> None:
 def test_every_target_is_registered_under_its_own_name() -> None:
     for name, target in TARGETS.items():
         assert target.name == name
+
+
+from secops_ingest.transform.targets import XDR_INCIDENTS, XSOAR_INCIDENTS
+
+
+def test_xsoar_target_partitions_on_created_and_upserts_on_the_partition_key() -> None:
+    t = XSOAR_INCIDENTS
+    assert t.raw_table == "raw_xsoar.incidents"
+    assert t.fact_date_expr == "created_at"
+    # Partitioned tables force the partition key into the primary key, so it
+    # must appear in the conflict target or the upsert fails at runtime.
+    assert "ON CONFLICT (incident_id, created_at)" in t.upsert_sql
+
+
+def test_xsoar_target_carries_the_xdr_join_key() -> None:
+    """dbotMirrorId is the XDR incident id. Without it there is no lifecycle."""
+    assert "dbotMirrorId" in XSOAR_INCIDENTS.upsert_sql
+    assert "xdr_incident_id" in XSOAR_INCIDENTS.fact_ddl
+
+
+def test_xsoar_target_guards_the_open_incident_sentinel() -> None:
+    """No open incident existed to sample, so every plausible representation of
+    "not closed" must be treated as open -- absent, empty, or the Go zero time.
+    A missed guard makes an open incident report a resolution time of roughly
+    minus two thousand years and poisons every average built on it.
+    """
+    sql = XSOAR_INCIDENTS.upsert_sql
+    assert "0001-01-01" in sql
+    assert "NULLIF" in sql
+
+
+def test_xsoar_target_reads_status_and_severity_as_integers() -> None:
+    """Measured: status and severity are ints (status=2 for closed), not the
+    strings the original runbook assumed."""
+    assert "(payload->>'status')::int" in XSOAR_INCIDENTS.upsert_sql
+    assert "(payload->>'severity')::int" in XSOAR_INCIDENTS.upsert_sql
+
+
+def test_xdr_target_divides_epoch_milliseconds() -> None:
+    """Miss the /1000 and every incident lands in the year 56,000."""
+    assert "/ 1000" in XDR_INCIDENTS.upsert_sql
+    assert XDR_INCIDENTS.fact_date_expr == "created_at"
+
+
+def test_both_incident_targets_select_on_ingested_at() -> None:
+    """The transform asks "what landed since my watermark", which for a
+    mutating source includes rows whose event time is months old."""
+    for t in (XSOAR_INCIDENTS, XDR_INCIDENTS):
+        assert "_ingested_at > %(since)s::timestamptz" in t.upsert_sql

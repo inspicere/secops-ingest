@@ -301,4 +301,142 @@ DEFECTDOJO = Target(
     """,
 )
 
-TARGETS = {t.name: t for t in (EXAMPLE, WAZUH, DEFECTDOJO)}
+#: XSOAR is the anchor of the incident lifecycle: it holds ~2.75 years against
+#: XDR's 325-day retention, and it carries the XDR incident id on every mirrored
+#: incident. Build and backfill this before the XDR fact.
+#:
+#: NOTE ON THIS INSTANCE: every sampled incident was closed (status=2, 500/500),
+#: because the dominant incident type is an automated remediation playbook. MTTR
+#: here measures automation latency, not analyst response. `open_duration_s` is
+#: the instance's own measure and is retained alongside the derived
+#: `time_to_resolve` so the two can be compared rather than silently conflated.
+XSOAR_INCIDENTS = Target(
+    name="xsoar_incidents",
+    raw_table="raw_xsoar.incidents",
+    fact_table="mart_fact_xsoar_incidents",
+    fact_date_expr="created_at",
+    upsert_sql="""
+        INSERT INTO mart_fact_xsoar_incidents
+            (incident_id, created_at, modified_at, closed_at, status, severity,
+             owner, incident_type, source_brand, xdr_incident_id, open_duration_s)
+        SELECT
+            source_id,
+            (payload->>'created')::timestamptz,
+            (payload->>'modified')::timestamptz,
+            -- "Not closed" has no single representation here, and no open
+            -- incident existed to sample. Treat absent, empty and the Go zero
+            -- time as open; anything else is a real resolution timestamp.
+            NULLIF(NULLIF(payload->>'closed', ''), '0001-01-01T00:00:00Z')::timestamptz,
+            -- Integers, not strings: status 2 is closed. The original runbook
+            -- read these as text and would have rendered "2" on a dashboard.
+            (payload->>'status')::int,
+            (payload->>'severity')::int,
+            payload->>'owner',
+            payload->>'type',
+            payload->>'sourceBrand',
+            -- The join key. XSOAR carries the XDR incident id here on every
+            -- mirrored incident; parentXDRIncident and CustomFields.xdrincidentid
+            -- carry it too, and this one is the cheapest to reach.
+            payload->>'dbotMirrorId',
+            (payload->>'openDuration')::bigint
+        FROM raw_xsoar.incidents
+        WHERE %(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz
+        ON CONFLICT (incident_id, created_at) DO UPDATE SET
+            modified_at     = EXCLUDED.modified_at,
+            closed_at       = EXCLUDED.closed_at,
+            status          = EXCLUDED.status,
+            severity        = EXCLUDED.severity,
+            owner           = EXCLUDED.owner,
+            open_duration_s = EXCLUDED.open_duration_s
+    """,
+    fact_ddl="""
+        CREATE TABLE IF NOT EXISTS mart_fact_xsoar_incidents (
+            incident_id     text        NOT NULL,
+            created_at      timestamptz NOT NULL,
+            modified_at     timestamptz,
+            closed_at       timestamptz,
+            status          integer,
+            severity        integer,
+            owner           text,
+            incident_type   text,
+            source_brand    text,
+            xdr_incident_id text,
+            open_duration_s bigint,
+            PRIMARY KEY (incident_id, created_at)
+        ) PARTITION BY RANGE (created_at);
+        CREATE INDEX IF NOT EXISTS mart_fact_xsoar_incidents_created_at_idx
+            ON mart_fact_xsoar_incidents (created_at);
+        -- The lifecycle join drives off this column; without an index it is a
+        -- sequential scan of the whole fact table on every dashboard load.
+        CREATE INDEX IF NOT EXISTS mart_fact_xsoar_incidents_xdr_id_idx
+            ON mart_fact_xsoar_incidents (xdr_incident_id);
+    """,
+)
+
+#: XDR timestamps are epoch MILLISECONDS throughout. Every one of them is
+#: divided by 1000 before to_timestamp; missing that puts the row in roughly the
+#: year 56,000, which is obvious on a time-series chart and invisible in a count.
+XDR_INCIDENTS = Target(
+    name="xdr_incidents",
+    raw_table="raw_xdr.incidents",
+    fact_table="mart_fact_xdr_incidents",
+    fact_date_expr="created_at",
+    upsert_sql="""
+        INSERT INTO mart_fact_xdr_incidents
+            (incident_id, created_at, modified_at, resolved_at, status, severity,
+             description, alert_count, high_severity_alert_count,
+             med_severity_alert_count, low_severity_alert_count,
+             host_count, user_count, assignee)
+        SELECT
+            source_id,
+            to_timestamp((payload->>'creation_time')::bigint / 1000),
+            to_timestamp((payload->>'modification_time')::bigint / 1000),
+            -- resolved_timestamp is 0 on an unresolved incident rather than
+            -- null, and 0 converts to 1970 instead of failing.
+            CASE WHEN COALESCE((payload->>'resolved_timestamp')::bigint, 0) > 0
+                 THEN to_timestamp((payload->>'resolved_timestamp')::bigint / 1000)
+            END,
+            payload->>'status',
+            payload->>'severity',
+            payload->>'description',
+            (payload->>'alert_count')::int,
+            (payload->>'high_severity_alert_count')::int,
+            (payload->>'med_severity_alert_count')::int,
+            (payload->>'low_severity_alert_count')::int,
+            (payload->>'host_count')::int,
+            (payload->>'user_count')::int,
+            payload->>'assigned_user_mail'
+        FROM raw_xdr.incidents
+        WHERE %(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz
+        ON CONFLICT (incident_id, created_at) DO UPDATE SET
+            modified_at = EXCLUDED.modified_at,
+            resolved_at = EXCLUDED.resolved_at,
+            status      = EXCLUDED.status,
+            severity    = EXCLUDED.severity,
+            alert_count = EXCLUDED.alert_count,
+            assignee    = EXCLUDED.assignee
+    """,
+    fact_ddl="""
+        CREATE TABLE IF NOT EXISTS mart_fact_xdr_incidents (
+            incident_id               text        NOT NULL,
+            created_at                timestamptz NOT NULL,
+            modified_at               timestamptz,
+            resolved_at               timestamptz,
+            status                    text,
+            severity                  text,
+            description               text,
+            alert_count               integer,
+            high_severity_alert_count integer,
+            med_severity_alert_count  integer,
+            low_severity_alert_count  integer,
+            host_count                integer,
+            user_count                integer,
+            assignee                  text,
+            PRIMARY KEY (incident_id, created_at)
+        ) PARTITION BY RANGE (created_at);
+        CREATE INDEX IF NOT EXISTS mart_fact_xdr_incidents_created_at_idx
+            ON mart_fact_xdr_incidents (created_at);
+    """,
+)
+
+TARGETS = {t.name: t for t in (EXAMPLE, WAZUH, DEFECTDOJO, XSOAR_INCIDENTS, XDR_INCIDENTS)}
