@@ -6,6 +6,7 @@ import pytest
 
 from secops_ingest.packs.model import Pack
 from secops_ingest.packs.registry import DuplicateTarget, all_targets
+from secops_ingest.schema import InvalidIdentifier
 from secops_ingest.transform.base import Target
 
 VENDOR_TARGET = Target(
@@ -45,3 +46,24 @@ def test_two_packs_claiming_one_target_name_is_fatal() -> None:
         all_targets({"vendor": VENDOR, "other": other})
     assert "vendor" in str(excinfo.value)
     assert "other" in str(excinfo.value)
+
+
+def test_invalid_target_name_is_rejected_at_the_registry_boundary() -> None:
+    # Target.__post_init__ does not check the name's shape -- it becomes an
+    # argparse choice and a control.* column value only once it reaches the
+    # registry, so that is where it must be validated. Constructing the
+    # Target itself must still succeed; existing targets and the transform
+    # runner are untouched by this rule.
+    bad_target = Target(
+        name="Bad-Name",
+        raw_table="raw_vendor.things",
+        fact_table="mart_fact_vendor_things",
+        fact_date_expr="seen_at",
+        upsert_sql="INSERT INTO mart_fact_vendor_things SELECT %(since)s::timestamptz",
+    )
+    pack = Pack(
+        name="vendor", version="0.1.0", requires_core=">=0",
+        sources={"things": "vendor.things:SOURCE"}, targets=(bad_target,),
+    )
+    with pytest.raises(InvalidIdentifier):
+        all_targets({"vendor": pack})

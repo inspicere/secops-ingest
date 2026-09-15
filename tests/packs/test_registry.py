@@ -12,6 +12,7 @@ import pytest
 
 from secops_ingest.packs.model import Pack
 from secops_ingest.packs.registry import DuplicatePack, discover
+from secops_ingest.packs.version import InvalidVersionSpec
 
 
 class _FakeEntryPoint:
@@ -60,9 +61,45 @@ def test_duplicate_name_names_both_distributions() -> None:
     assert "pack-b" in str(excinfo.value)
 
 
-def test_a_pack_colliding_with_builtin_is_a_duplicate() -> None:
-    with pytest.raises(DuplicatePack):
-        discover(extra=[_FakeEntryPoint("builtin", _pack(name="builtin"))])
+def test_a_pack_colliding_with_builtin_is_skipped_naming_core_the_winner(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Unlike a third-party/third-party collision, this one must not be fatal:
+    # core is seeded before entry points are even looked up, so there is no
+    # ordering ambiguity, and a vendor should not be able to take down every
+    # ingest timer, transform and schema emission just by naming their pack
+    # "builtin".
+    with caplog.at_level(logging.ERROR):
+        packs = discover(
+            extra=[_FakeEntryPoint("builtin", _pack(name="builtin"), dist_name="evil-dist")]
+        )
+    # Core's own pack won -- not the impostor's, which declares a different
+    # source ("thing") that must not have made it in.
+    assert "thing" not in packs["builtin"].sources
+    assert "wazuh" in packs["builtin"].sources
+    assert "evil-dist" in caplog.text
+    assert "builtin" in caplog.text
+
+
+def test_collision_between_two_third_party_packs_is_still_fatal() -> None:
+    # F2 narrows the fatal case to third-party/third-party collisions; this
+    # pins that the narrowing did not remove the protection entirely.
+    eps = [
+        _FakeEntryPoint("vendor", _pack(name="vendor"), dist_name="pack-a"),
+        _FakeEntryPoint("vendor", _pack(name="vendor"), dist_name="pack-b"),
+    ]
+    with pytest.raises(DuplicatePack) as excinfo:
+        discover(extra=eps)
+    assert "pack-a" in str(excinfo.value)
+    assert "pack-b" in str(excinfo.value)
+
+
+def test_invalid_core_version_fails_loudly_naming_core_not_a_pack() -> None:
+    # A release-candidate tag on core must not be blamed on the first pack in
+    # the loop -- it is core's own version that is unusable.
+    with pytest.raises(InvalidVersionSpec) as excinfo:
+        discover(core_version="0.2.0rc1")
+    assert "0.2.0rc1" in str(excinfo.value)
 
 
 def test_incompatible_pack_is_skipped_not_fatal(caplog: pytest.LogCaptureFixture) -> None:

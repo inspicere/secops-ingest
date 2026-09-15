@@ -6,8 +6,13 @@ for secret backends.
 Failure policy is deliberately split. A pack that cannot be used is SKIPPED with
 a loud log, because one broken pack must not take down every other pack's
 timers; the operator finds out through `pack list` or through that source
-failing by name. A NAME COLLISION is fatal, because silently preferring one of
-two packs would make behaviour depend on entry-point iteration order.
+failing by name. A NAME COLLISION between two third-party packs is fatal,
+because silently preferring one of them would make behaviour depend on
+entry-point iteration order. A collision against `builtin` is different: core
+is seeded deterministically before entry points are even looked up, so there is
+no ordering ambiguity to protect against -- core always wins, and the offending
+pack is SKIPPED with a loud log instead of taking every timer, transform and
+schema emission down with it.
 """
 
 from __future__ import annotations
@@ -18,8 +23,9 @@ from importlib.metadata import EntryPoint, entry_points
 from typing import TYPE_CHECKING, Any
 
 from .. import __version__
+from ..schema import validate_identifier
 from .model import Pack
-from .version import InvalidVersionSpec, matches
+from .version import InvalidVersionSpec, matches, parse_version
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, keeps the import lazy
     from ..transform.base import Target
@@ -54,11 +60,20 @@ def discover(
             nothing.
 
     Raises:
-        DuplicatePack: two packs claim the same name.
+        DuplicatePack: two third-party packs claim the same name.
+        InvalidVersionSpec: the running core version is not a plain numeric
+            release, so no pack's `requires_core` could be checked against it.
     """
     from ..builtin import PACK as BUILTIN
 
     core = core_version or __version__
+    try:
+        parse_version(core)
+    except InvalidVersionSpec as exc:
+        raise InvalidVersionSpec(
+            f"running core version {core!r} is unusable: {exc}"
+        ) from exc
+
     found: dict[str, Pack] = {BUILTIN.name: BUILTIN}
     origins: dict[str, str] = {BUILTIN.name: "secops-ingest (core)"}
 
@@ -84,6 +99,13 @@ def discover(
             continue
 
         if pack.name in origins:
+            if pack.name == BUILTIN.name:
+                log.error(
+                    "pack entry point %r from %s collides with the core pack "
+                    "name %r; core wins and this pack is skipped. Rename it.",
+                    ep.name, origin, pack.name,
+                )
+                continue
             raise DuplicatePack(
                 f"pack {pack.name!r} is registered by both "
                 f"{origins[pack.name]} and {origin}"
@@ -154,13 +176,16 @@ def all_targets(packs: Mapping[str, Pack] | None = None) -> dict[str, Target]:
     """Every transform target from every usable pack, keyed by target name.
 
     Target names become table names and CLI arguments, so a collision is fatal
-    rather than resolved by iteration order.
+    rather than resolved by iteration order, and the name itself is validated
+    here rather than in `Target.__post_init__` -- this is the boundary where
+    every pack's targets actually meet the CLI and the warehouse.
     """
     registry = discover() if packs is None else packs
     targets: dict[str, Target] = {}
     owners: dict[str, str] = {}
     for pack in registry.values():
         for target in pack.targets:
+            validate_identifier(target.name)
             if target.name in targets:
                 raise DuplicateTarget(
                     f"transform target {target.name!r} is declared by both "
