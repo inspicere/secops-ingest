@@ -162,6 +162,20 @@ my_backend = "my_package.provider:MyProvider"
 `get_provider("my_backend")` then works with no change here and no pull request. AWS Secrets
 Manager, Azure Key Vault, 1Password, or an internal system are all somebody else's package.
 
+### Packs
+
+A pack bundles one vendor's connectors, transform targets and dashboards into a
+distribution that installs and versions independently. Register one with:
+
+    [project.entry-points."secops_ingest.packs"]
+    knowbe4 = "secops_pack_knowbe4:PACK"
+
+`python -m secops_ingest.packs list` shows what the current environment can see.
+
+The module exposing `PACK` must import cheaply -- connector dependencies are
+imported only when a source runs, which is why `Pack.sources` holds
+`"module:attr"` strings rather than objects.
+
 ## Writing a connector
 
 A source is a plain object with four methods and two attributes. No base class to inherit, no

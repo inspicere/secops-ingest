@@ -25,6 +25,9 @@ dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.5", "mypy>=1.10"]
 delinea = "secops_ingest.secrets.delinea:DelineaSecretProvider"
 vault = "secops_ingest.secrets.vault:VaultSecretProvider"
 
+# Packs register under secops_ingest.packs with a PACK constant.
+# Core registers via builtin.py instead, so tests can run from src/ without an install.
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
