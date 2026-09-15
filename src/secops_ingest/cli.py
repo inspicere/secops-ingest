@@ -14,29 +14,35 @@ import logging
 import sys
 from typing import Any
 
+from .packs.registry import AmbiguousSource, UnknownSource, resolve_source
 from .redaction import RedactingFilter
 
 
 def _load_source(name: str) -> Any:
-    target = f"secops_ingest.sources.{name}"
+    """Resolve a source reference and import the connector it names.
+
+    Two failures are kept distinct. An unregistered name is a usage error and
+    exits with a message naming it. An ImportError raised INSIDE the connector
+    -- a typo, a missing optional dependency -- surfaces as itself, because
+    reporting it as "unknown source" sends someone to debug the module name
+    instead of the real cause.
+    """
     try:
-        module = importlib.import_module(f".sources.{name}", package="secops_ingest")
-    except ModuleNotFoundError as exc:
-        # Only "the connector does not exist" should report as an unknown
-        # source. An ImportError raised INSIDE the connector (a typo, a missing
-        # optional dependency) must surface as itself, or it sends someone to
-        # debug the module name instead of the real cause.
-        if exc.name == target:
-            raise SystemExit(f"unknown source: {name}") from exc
-        raise
-    if not hasattr(module, "SOURCE"):
-        raise SystemExit(f"source module {name} does not define SOURCE")
-    return module.SOURCE
+        target = resolve_source(name)
+    except (UnknownSource, AmbiguousSource) as exc:
+        raise SystemExit(str(exc)) from exc
+
+    module_path, _, attr = target.partition(":")
+    module = importlib.import_module(module_path)
+    try:
+        return getattr(module, attr)
+    except AttributeError as exc:
+        raise SystemExit(f"source module {module_path} does not define {attr}") from exc
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="secops_ingest")
-    parser.add_argument("source", help="connector name, e.g. wazuh")
+    parser.add_argument("source", help="connector name, e.g. wazuh or builtin.wazuh")
     parser.add_argument("--dry-run", action="store_true",
                         help="fetch and validate, write nothing")
     parser.add_argument("--batch-size", type=int, default=None)

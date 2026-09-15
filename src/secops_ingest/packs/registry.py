@@ -13,7 +13,7 @@ two packs would make behaviour depend on entry-point iteration order.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from importlib.metadata import EntryPoint, entry_points
 from typing import Any
 
@@ -105,3 +105,39 @@ def discover(
         found[pack.name] = pack
 
     return found
+
+
+class UnknownSource(LookupError):
+    """No registered pack provides the named source."""
+
+
+class AmbiguousSource(LookupError):
+    """More than one pack provides a source under this bare name."""
+
+
+def resolve_source(ref: str, packs: Mapping[str, Pack] | None = None) -> str:
+    """Return the "module:attr" target for a source reference.
+
+    Accepts `pack.source`, or a bare `source` when exactly one pack provides it.
+    Bare names are what existing systemd units and Ansible inventories pass, so
+    they keep working; a bare name that two packs claim is an error rather than
+    a coin flip.
+    """
+    registry = discover() if packs is None else packs
+
+    if "." in ref:
+        pack_name, _, source_name = ref.partition(".")
+        pack = registry.get(pack_name)
+        if pack is None or source_name not in pack.sources:
+            raise UnknownSource(f"unknown source: {ref}")
+        return pack.sources[source_name]
+
+    hits = [(pack.name, pack.sources[ref]) for pack in registry.values() if ref in pack.sources]
+    if not hits:
+        raise UnknownSource(f"unknown source: {ref}")
+    if len(hits) > 1:
+        candidates = ", ".join(sorted(f"{pack_name}.{ref}" for pack_name, _ in hits))
+        raise AmbiguousSource(
+            f"source {ref!r} is provided by more than one pack; name one of: {candidates}"
+        )
+    return hits[0][1]
