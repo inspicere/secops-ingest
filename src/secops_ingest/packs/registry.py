@@ -80,11 +80,13 @@ def discover(
             )
             continue
 
-        if pack.name in found:
+        if pack.name in origins:
             raise DuplicatePack(
                 f"pack {pack.name!r} is registered by both "
                 f"{origins[pack.name]} and {origin}"
             )
+
+        origins[pack.name] = origin
 
         try:
             usable = matches(core, pack.requires_core)
@@ -101,6 +103,5 @@ def discover(
             continue
 
         found[pack.name] = pack
-        origins[pack.name] = origin
 
     return found

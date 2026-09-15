@@ -103,3 +103,44 @@ def test_entry_point_that_is_not_a_pack_is_skipped(caplog: pytest.LogCaptureFixt
     with caplog.at_level(logging.ERROR):
         packs = discover(extra=eps)
     assert "wrong" not in packs
+
+
+def test_incompatible_pack_first_then_compatible_same_name_is_duplicate() -> None:
+    # Incompatible pack loads first, then compatible with same name.
+    # Both should be tracked; duplicate should raise regardless of order.
+    eps = [
+        _FakeEntryPoint("vendor", _pack(name="vendor", requires=">=9,<10"),
+                       dist_name="pack-a"),
+        _FakeEntryPoint("vendor", _pack(name="vendor", requires=">=0"),
+                       dist_name="pack-b"),
+    ]
+    with pytest.raises(DuplicatePack) as excinfo:
+        discover(core_version="0.1.0", extra=eps)
+    assert "pack-a" in str(excinfo.value)
+    assert "pack-b" in str(excinfo.value)
+
+
+def test_compatible_pack_first_then_incompatible_same_name_is_duplicate() -> None:
+    # Compatible pack loads first, then incompatible with same name.
+    # Collision should raise regardless of order.
+    eps = [
+        _FakeEntryPoint("vendor", _pack(name="vendor", requires=">=0"),
+                       dist_name="pack-a"),
+        _FakeEntryPoint("vendor", _pack(name="vendor", requires=">=9,<10"),
+                       dist_name="pack-b"),
+    ]
+    with pytest.raises(DuplicatePack) as excinfo:
+        discover(core_version="0.1.0", extra=eps)
+    assert "pack-a" in str(excinfo.value)
+    assert "pack-b" in str(excinfo.value)
+
+
+def test_incompatible_unique_pack_is_skipped_not_fatal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Regression: incompatible pack with unique name should be skipped gracefully.
+    eps = [_FakeEntryPoint("unique", _pack(name="unique", requires=">=9,<10"))]
+    with caplog.at_level(logging.WARNING):
+        packs = discover(core_version="0.1.0", extra=eps)
+    assert "unique" not in packs
+    assert "unique" in caplog.text
