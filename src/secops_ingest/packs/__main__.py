@@ -8,16 +8,28 @@ optional dependency.
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 
+from ..redaction import RedactingFilter
 from .registry import DuplicatePack, DuplicateTarget, all_targets, discover
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="secops_ingest.packs")
     parser.add_argument("command", choices=["list"])
-    args = parser.parse_args(argv)
-    assert args.command == "list"
+    parser.parse_args(argv)
+
+    # Installed before any registry call: a pack that raises on load is logged
+    # by registry.py through this handler, and secrets can end up embedded in
+    # an import error just as easily as in a connector's own logging.
+    handler = logging.StreamHandler()
+    handler.addFilter(RedactingFilter())
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        handlers=[handler],
+    )
 
     try:
         packs = discover()

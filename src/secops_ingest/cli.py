@@ -14,7 +14,7 @@ import logging
 import sys
 from typing import Any
 
-from .packs.registry import AmbiguousSource, UnknownSource, resolve_source
+from .packs.registry import AmbiguousSource, DuplicatePack, UnknownSource, resolve_source
 from .redaction import RedactingFilter
 
 
@@ -26,10 +26,14 @@ def _load_source(name: str) -> Any:
     -- a typo, a missing optional dependency -- surfaces as itself, because
     reporting it as "unknown source" sends someone to debug the module name
     instead of the real cause.
+
+    A registry-wide failure -- a third-party pack colliding with another one --
+    is also reported as a clean message rather than a traceback: it is an
+    installation problem, not a bug in this process.
     """
     try:
         target = resolve_source(name)
-    except (UnknownSource, AmbiguousSource) as exc:
+    except (UnknownSource, AmbiguousSource, DuplicatePack) as exc:
         raise SystemExit(str(exc)) from exc
 
     module_path, _, attr = target.partition(":")

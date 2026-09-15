@@ -167,6 +167,25 @@ def test_unknown_target_is_an_error_not_silence() -> None:
         main(["--target", "no_such_target"])
 
 
+def test_registry_collision_is_a_clean_exit_not_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Before this fix, schema/__main__.py caught nothing from all_targets():
+    # a colliding pack installed anywhere made `python -m secops_ingest.schema`
+    # die with a raw traceback instead of a one-line, non-zero exit.
+    from secops_ingest.packs.registry import DuplicatePack
+
+    def boom() -> dict[str, object]:
+        raise DuplicatePack("pack 'vendor' is registered by both pack-a and pack-b")
+
+    monkeypatch.setattr("secops_ingest.schema.__main__.all_targets", boom)
+
+    assert main([]) == 1
+
+    captured = capsys.readouterr()
+    assert "pack 'vendor' is registered by both pack-a and pack-b" in captured.err
+
+
 def test_control_can_be_skipped(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["--no-control"]) == 0
     assert "control.ingest_run" not in capsys.readouterr().out

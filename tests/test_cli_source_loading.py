@@ -31,3 +31,17 @@ def test_missing_attribute_names_the_module_and_attribute(
     monkeypatch.setattr(cli, "resolve_source", lambda ref: "secops_ingest.redaction:NOPE")
     with pytest.raises(SystemExit, match="does not define NOPE"):
         cli._load_source("wazuh")
+
+
+def test_registry_collision_exits_clean_instead_of_a_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Before this fix, cli.py caught only UnknownSource/AmbiguousSource, so a
+    # colliding third-party pack made `python -m secops_ingest <source>` die
+    # with a raw traceback from resolve_source()'s own discover() call.
+    def boom(ref: str) -> str:
+        raise cli.DuplicatePack("pack 'vendor' is registered by both pack-a and pack-b")
+
+    monkeypatch.setattr(cli, "resolve_source", boom)
+    with pytest.raises(SystemExit, match="pack 'vendor' is registered by both"):
+        cli._load_source("wazuh")

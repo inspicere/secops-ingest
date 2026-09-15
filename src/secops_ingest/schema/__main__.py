@@ -15,9 +15,11 @@ imported, so this works with no optional dependency installed.
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 
-from ..packs.registry import all_targets
+from ..packs.registry import DuplicatePack, DuplicateTarget, all_targets
+from ..redaction import RedactingFilter
 from . import (
     control_sql,
     grants_sql,
@@ -32,6 +34,18 @@ def _banner(text: str) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Installed before any registry call: all_targets() below walks every
+    # installed pack, and a pack that raises on load is logged by registry.py
+    # through this handler -- an import error can embed a secret as easily as
+    # a connector's own logging can.
+    handler = logging.StreamHandler()
+    handler.addFilter(RedactingFilter())
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        handlers=[handler],
+    )
+
     parser = argparse.ArgumentParser(prog="secops_ingest.schema")
     parser.add_argument(
         "--target", action="append", metavar="NAME",
@@ -63,7 +77,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--read-role", metavar="ROLE",
                         help="read-only reporting role (Metabase, Grafana, ...)")
     args = parser.parse_args(argv)
-    targets = all_targets()
+    try:
+        targets = all_targets()
+    except (DuplicatePack, DuplicateTarget) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
     # --raw alone means "just these tables"; naming targets as well brings both.
     names = args.target if args.target else ([] if args.raw else sorted(targets))

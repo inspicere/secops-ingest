@@ -6,27 +6,38 @@ import argparse
 import logging
 import sys
 
-from ..packs.registry import all_targets
+from ..packs.registry import DuplicatePack, DuplicateTarget, all_targets
 from ..redaction import RedactingFilter
 from . import runner
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Installed before all_targets() runs: that call walks every installed
+    # pack, and a pack that raises on load is logged by registry.py through
+    # this handler -- an import error can embed a secret as easily as a
+    # connector's own logging can.
+    handler = logging.StreamHandler()
+    handler.addFilter(RedactingFilter())
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        handlers=[handler],
+    )
+    log = logging.getLogger(__name__)
+
     parser = argparse.ArgumentParser(prog="secops_ingest.transform")
-    targets = all_targets()
+    try:
+        targets = all_targets()
+    except (DuplicatePack, DuplicateTarget) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     parser.add_argument("target", choices=sorted(targets))
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
-    handler = logging.StreamHandler()
-    handler.addFilter(RedactingFilter())
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        handlers=[handler],
-    )
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    log = logging.getLogger(__name__)
     try:
         result = runner.execute(targets[args.target])
     except Exception:
