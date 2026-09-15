@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from . import __version__
 from .packs.model import Pack
-from .transform.targets import DEFECTDOJO, EXAMPLE, WAZUH
+from .transform.targets import TARGETS
 
 PACK = Pack(
     name="builtin",
@@ -24,5 +24,8 @@ PACK = Pack(
         "wazuh": "secops_ingest.sources.wazuh:SOURCE",
         "defectdojo": "secops_ingest.sources.defectdojo:SOURCE",
     },
-    targets=(EXAMPLE, WAZUH, DEFECTDOJO),
+    # Derived from TARGETS rather than listed again, so a target added there is
+    # never invisible to the CLI: production and the test suite now read the
+    # same declaration.
+    targets=tuple(TARGETS.values()),
 )
