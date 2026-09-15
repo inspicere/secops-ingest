@@ -6,14 +6,15 @@ import argparse
 import logging
 import sys
 
+from ..packs.registry import all_targets
 from ..redaction import RedactingFilter
 from . import runner
-from .targets import TARGETS
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="secops_ingest.transform")
-    parser.add_argument("target", choices=sorted(TARGETS))
+    targets = all_targets()
+    parser.add_argument("target", choices=sorted(targets))
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -27,7 +28,7 @@ def main(argv: list[str] | None = None) -> int:
 
     log = logging.getLogger(__name__)
     try:
-        result = runner.execute(TARGETS[args.target])
+        result = runner.execute(targets[args.target])
     except Exception:
         # Log here as well as in the runner: a bare `return 1` produced an exit
         # code with no output at all, which is indistinguishable from a crash.

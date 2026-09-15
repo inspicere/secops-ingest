@@ -15,11 +15,14 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable, Mapping
 from importlib.metadata import EntryPoint, entry_points
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .. import __version__
 from .model import Pack
 from .version import InvalidVersionSpec, matches
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, keeps the import lazy
+    from ..transform.base import Target
 
 log = logging.getLogger(__name__)
 
@@ -141,3 +144,28 @@ def resolve_source(ref: str, packs: Mapping[str, Pack] | None = None) -> str:
             f"source {ref!r} is provided by more than one pack; name one of: {candidates}"
         )
     return hits[0][1]
+
+
+class DuplicateTarget(RuntimeError):
+    """Two packs declare a transform target under the same name."""
+
+
+def all_targets(packs: Mapping[str, Pack] | None = None) -> dict[str, Target]:
+    """Every transform target from every usable pack, keyed by target name.
+
+    Target names become table names and CLI arguments, so a collision is fatal
+    rather than resolved by iteration order.
+    """
+    registry = discover() if packs is None else packs
+    targets: dict[str, Target] = {}
+    owners: dict[str, str] = {}
+    for pack in registry.values():
+        for target in pack.targets:
+            if target.name in targets:
+                raise DuplicateTarget(
+                    f"transform target {target.name!r} is declared by both "
+                    f"packs {owners[target.name]!r} and {pack.name!r}"
+                )
+            targets[target.name] = target
+            owners[target.name] = pack.name
+    return targets
