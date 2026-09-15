@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from .registry import all_targets, discover
+from .registry import DuplicatePack, DuplicateTarget, all_targets, discover
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -19,10 +19,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     assert args.command == "list"
 
-    packs = discover()
-    targets = all_targets(packs)
+    try:
+        packs = discover()
+        targets = all_targets(packs)
+    except (DuplicatePack, DuplicateTarget) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
     for name in sorted(packs):
         pack = packs[name]
+        # Safe to compare Target objects by value: all_targets() enforces
+        # global uniqueness of target.name across packs before this runs.
         owned = sorted(t for t, target in targets.items() if target in pack.targets)
         print(f"{name}  {pack.version}  (core {pack.requires_core})")
         print(f"    sources: {', '.join(sorted(pack.sources)) or '-'}")
