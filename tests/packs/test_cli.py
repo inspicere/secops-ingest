@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 
 from secops_ingest.packs.__main__ import main
 from secops_ingest.packs.model import Pack
-from secops_ingest.packs.registry import DuplicatePack, discover
+from secops_ingest.packs.registry import discover
 
 
 class _FakeEntryPoint:
@@ -24,6 +22,13 @@ class _FakeEntryPoint:
         if isinstance(self._value, Exception):
             raise self._value
         return self._value
+
+
+def _vendor_pack(name: str = "vendor") -> Pack:
+    return Pack(
+        name=name, version="0.1.0", requires_core=">=0",
+        sources={"thing": "vendor_pack.thing:SOURCE"},
+    )
 
 
 def test_list_builtin_structure(capsys: pytest.CaptureFixture[str]) -> None:
@@ -62,34 +67,25 @@ def test_list_builtin_structure(capsys: pytest.CaptureFixture[str]) -> None:
 def test_collision_duplicate_pack_exits_with_code_1(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Duplicate pack name exits with code 1 and prints error to stderr."""
-    # Create a fake pack with the same name as builtin.
-    def fake_discover(**kwargs: Any) -> dict[str, Pack]:
-        real_packs = discover(**kwargs)
-        # Simulate a collision by adding a second "builtin" pack.
-        fake_pack = Pack(
-            name="builtin",
-            version="0.2.0",
-            requires_core=">=0",
-            sources={},
-            targets=[],
-        )
-        real_packs["builtin"] = fake_pack
-        # This would normally raise DuplicatePack, but we can't easily trigger
-        # that without going through entry points. Instead, use monkeypatch.
-        raise DuplicatePack(
-            "pack 'builtin' is registered by both secops-ingest (core) and "
-            "test-dist"
-        )
+    """A real collision between two third-party packs exits clean, code 1.
 
-    monkeypatch.setattr("secops_ingest.packs.__main__.discover", fake_discover)
+    Goes through actual discovery (via the injectable `extra` entry points)
+    rather than hand-writing the message discover() would produce, so this
+    test breaks the moment the real message changes -- not the other way
+    around.
+    """
+    eps = [
+        _FakeEntryPoint("vendor", _vendor_pack(), dist_name="pack-a"),
+        _FakeEntryPoint("vendor", _vendor_pack(), dist_name="pack-b"),
+    ]
+    monkeypatch.setattr(
+        "secops_ingest.packs.__main__.discover", lambda: discover(extra=eps)
+    )
 
-    # Call main and verify exit code is 1.
     assert main(["list"]) == 1
 
-    # Verify error message went to stderr, not stdout.
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert "pack 'builtin' is registered by both" in captured.err
-    assert "secops-ingest (core)" in captured.err
-    assert "test-dist" in captured.err
+    assert "pack 'vendor' is registered by both" in captured.err
+    assert "pack-a" in captured.err
+    assert "pack-b" in captured.err
