@@ -140,6 +140,16 @@ class AmbiguousSource(LookupError):
     """More than one pack provides a source under this bare name."""
 
 
+def _available_sources(registry: Mapping[str, Pack]) -> str:
+    """Every qualified source reference, for an "available: ..." message."""
+    names = sorted(
+        f"{pack.name}.{source_name}"
+        for pack in registry.values()
+        for source_name in pack.sources
+    )
+    return ", ".join(names) if names else "-"
+
+
 def resolve_source(ref: str, packs: Mapping[str, Pack] | None = None) -> str:
     """Return the "module:attr" target for a source reference.
 
@@ -154,12 +164,16 @@ def resolve_source(ref: str, packs: Mapping[str, Pack] | None = None) -> str:
         pack_name, _, source_name = ref.partition(".")
         pack = registry.get(pack_name)
         if pack is None or source_name not in pack.sources:
-            raise UnknownSource(f"unknown source: {ref}")
+            raise UnknownSource(
+                f"unknown source: {ref}; available: {_available_sources(registry)}"
+            )
         return pack.sources[source_name]
 
     hits = [(pack.name, pack.sources[ref]) for pack in registry.values() if ref in pack.sources]
     if not hits:
-        raise UnknownSource(f"unknown source: {ref}")
+        raise UnknownSource(
+            f"unknown source: {ref}; available: {_available_sources(registry)}"
+        )
     if len(hits) > 1:
         candidates = ", ".join(sorted(f"{pack_name}.{ref}" for pack_name, _ in hits))
         raise AmbiguousSource(

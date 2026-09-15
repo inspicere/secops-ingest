@@ -49,6 +49,30 @@ def test_known_pack_unknown_source() -> None:
         resolve_source("beta.missing", REGISTRY)
 
 
+def test_unknown_source_lists_the_available_qualified_references() -> None:
+    # Matches the style of secops_ingest.secrets.get_provider's "available: "
+    # message -- a typo like this must not leave the operator guessing.
+    with pytest.raises(UnknownSource) as excinfo:
+        resolve_source("nothing", REGISTRY)
+    message = str(excinfo.value)
+    assert "available:" in message
+    assert "alpha.shared" in message
+    assert "alpha.only_alpha" in message
+    assert "beta.shared" in message
+
+
+def test_unknown_qualified_source_also_lists_availability() -> None:
+    # A source belonging to a pack skipped for a version mismatch must read
+    # differently from a plain typo -- listing what IS available makes that
+    # visible instead of two identical "unknown source" messages.
+    with pytest.raises(UnknownSource) as excinfo:
+        resolve_source("beta.missing", REGISTRY)
+    message = str(excinfo.value)
+    assert "available:" in message
+    assert "alpha.shared" in message
+    assert "beta.shared" in message
+
+
 def test_builtin_sources_resolve_bare_by_default() -> None:
     # No registry passed: discovery runs, and core's sources must be reachable
     # by the bare names already in production.
