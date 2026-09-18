@@ -8,7 +8,6 @@ import sys
 
 from ..packs.registry import DuplicatePack, DuplicateTarget, all_targets
 from ..redaction import RedactingFilter
-from . import runner
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -37,6 +36,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    # Imported here, not at module scope: runner pulls in psycopg, which is the
+    # optional "postgres" extra. A module-level import meant this entry point
+    # could not even be imported without a database driver, so its own test
+    # skipped in every CI run -- CI installs [dev,http] and [vault,dev], never
+    # postgres -- and the error handling below was never exercised anywhere.
+    # Argument parsing and registry failures need no driver; only running a
+    # transform does.
+    from . import runner
 
     try:
         result = runner.execute(targets[args.target])

@@ -5,6 +5,12 @@ a colliding pack installed anywhere made this entry point die with a raw
 traceback instead of a one-line, non-zero exit -- and it configured no
 logging at all, so registry.py's own `log.exception` for a pack that raised
 on load went out through `logging.lastResort`, unformatted and unscrubbed.
+
+These tests need no database: the entry point imports `runner` -- and through
+it psycopg -- only when it is about to run a transform, so parsing arguments
+and failing on a bad registry stay driver-free. That is deliberate. While the
+import sat at module scope this file skipped in every CI run, because CI
+installs [dev,http] and [vault,dev] and never the postgres extra.
 """
 
 from __future__ import annotations
@@ -12,12 +18,6 @@ from __future__ import annotations
 import logging
 
 import pytest
-
-# transform.__main__ imports runner, which imports psycopg at module level --
-# an optional dependency (the "postgres" extra) that is deliberately absent
-# from the default dev environment, same as httpx/hvac elsewhere in this
-# suite.
-pytest.importorskip("psycopg", reason="needs the 'postgres' extra")
 
 from secops_ingest.packs.registry import DuplicatePack, DuplicateTarget
 from secops_ingest.transform.__main__ import main
@@ -72,10 +72,25 @@ def test_logging_is_configured_with_the_redacting_filter_before_discovery(
 
     monkeypatch.setattr("secops_ingest.transform.__main__.all_targets", spy)
 
-    # all_targets() is patched to return no targets, so argparse's `choices`
-    # rejects any value passed here -- that failure is fine, it happens after
-    # the discovery call this test is checking.
-    with pytest.raises(SystemExit):
-        main(["anything"])
+    # logging.basicConfig is a NO-OP when the root logger already has handlers,
+    # and under pytest it always does. Without clearing them the entry point's
+    # own configuration never runs and this test asserts nothing about the code
+    # -- which is exactly what happened while the file was skipped: it was
+    # written, committed, and never executed once. A real `python -m` process
+    # starts with an unconfigured root, so clearing reproduces production
+    # rather than faking it.
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    root.handlers = []
+    try:
+        # all_targets() is patched to return no targets, so argparse's `choices`
+        # rejects any value passed here -- that failure is fine, it happens
+        # after the discovery call this test is checking.
+        with pytest.raises(SystemExit):
+            main(["anything"])
+    finally:
+        for installed in root.handlers:
+            installed.close()
+        root.handlers, root.level = saved_handlers, saved_level
 
     assert seen_filters_during_discovery == [True]
