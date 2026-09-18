@@ -101,6 +101,61 @@ modification time descending and stops at the first record older than the
 watermark. Against a ~50,000-finding instance that reads five records instead of
 fifty thousand.
 
+### Cortex XSOAR and Cortex XDR
+
+Four connectors against Palo Alto's Cortex products: `xsoar` (incidents),
+`xdr` (incidents), `xdr_alerts` (the detection layer beneath them) and
+`xdr_endpoints` (a daily agent and policy snapshot).
+
+Credentials are **one secret per vendor**, addressed `<vendor>.<field>`, with
+three fields: `api_key`, `api_key_id` and `url`. A key and its id are issued and
+rotated together, so they share a version history rather than sitting in
+separate paths where a half-applied rotation pairs a new key with an old id. The
+tenant URL is a field of that secret rather than an environment variable,
+deliberately: it is the identifier this platform keeps out of inventory.
+
+```bash
+export SECOPS_SECRETS_BACKEND=env
+export SECOPS_SECRET_XDR_API_KEY=...
+export SECOPS_SECRET_XDR_API_KEY_ID=42        # the ID column of the API Keys table
+export SECOPS_SECRET_XDR_URL=https://api-tenant.example.com
+python -m secops_ingest xdr --dry-run
+```
+
+`x-xdr-auth-id` is required for **Standard** keys, not only Advanced ones —
+every request without it returns 401. The id is not handed over when the key is
+copied; it is the ID column of the console's API Keys table, which is why it can
+appear not to exist at all.
+
+Every variable below is optional; the default is in brackets.
+
+| Variable | Meaning |
+|---|---|
+| `SECOPS_XSOAR_SECRET` | secret to resolve [`xsoar`] |
+| `SECOPS_XSOAR_PAGE_SIZE` | incidents per request [`100`] |
+| `SECOPS_XDR_SECRET` | secret to resolve [`xdr`] |
+| `SECOPS_XDR_PAGE_SIZE` | incidents per request [`100`, capped at 100] |
+| `SECOPS_XDR_ALERTS_SECRET` | secret to resolve [`xdr`] |
+| `SECOPS_XDR_ALERTS_PAGE_SIZE` | alerts per request [`100`, capped at 100] |
+| `SECOPS_XDR_ALERTS_LAG_SECONDS` | late-arrival overlap [`1800`] |
+| `SECOPS_XDR_ALERTS_BACKFILL_DAYS` | horizon on the first run [`90`] |
+| `SECOPS_XDR_ENDPOINTS_SECRET` | secret to resolve [`xdr`] |
+| `SECOPS_XDR_ENDPOINTS_PAGE_SIZE` | endpoints per request [`100`, capped at 100] |
+
+The page caps are the API's, not a preference: a `search_to - search_from` span
+above 100 returns HTTP 400 rather than truncating. A larger value is clamped
+rather than rejected.
+
+Two of these defaults are load-bearing rather than tuning knobs.
+`SECOPS_XDR_ALERTS_LAG_SECONDS` is the trailing window re-read on every run,
+because XDR's index time trails detection time by a measured 7–627 seconds and
+the only filterable field orders on detection time — an alert indexed after the
+watermark passed its detection time would otherwise be stepped over for good.
+And `SECOPS_XDR_ALERTS_BACKFILL_DAYS` exists because this collection is three
+orders of magnitude larger than the others (~17,700 alerts/day): an empty
+watermark here means "the last N days", not "everything". Widening it is a
+deliberate act.
+
 ## Secret backends
 
 Selected by `SECOPS_SECRETS_BACKEND`, defaulting to `env`.
