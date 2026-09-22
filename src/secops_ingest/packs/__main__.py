@@ -41,6 +41,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, keeps the import lazy
     import psycopg
     from psycopg import sql
 
+    from ..transform.base import Target
+
 log = logging.getLogger(__name__)
 
 
@@ -65,6 +67,27 @@ def _discover_packs() -> dict[str, Pack] | None:
     """
     try:
         return discover()
+    except (DuplicatePack, DuplicateTarget) as exc:
+        print(str(exc), file=sys.stderr)
+        return None
+
+
+def _discover_targets(packs: dict[str, Pack]) -> dict[str, Target] | None:
+    """all_targets(packs), reporting a target-name collision as one clean stderr line.
+
+    Every subcommand that is about to WRITE or DESTROY a pack's tables and
+    control rows by target name -- `enable` and `drop`, not just `list` --
+    needs this checked first. `drop`'s `DELETE ... WHERE target = ANY(...)`
+    only stays scoped to the pack being dropped because target names are
+    globally unique; that uniqueness is exactly what `all_targets()` enforces
+    (it raises DuplicateTarget on a collision), so both commands must call it,
+    before anything is written or destroyed, or the guarantee they rely on is
+    never actually checked on the path that matters. Same shape as
+    `_discover_packs()`: returns None on failure so a caller can just check
+    for that and return 1.
+    """
+    try:
+        return all_targets(packs)
     except (DuplicatePack, DuplicateTarget) as exc:
         print(str(exc), file=sys.stderr)
         return None
@@ -114,10 +137,8 @@ def _cmd_list() -> int:
     packs = _discover_packs()
     if packs is None:
         return 1
-    try:
-        targets = all_targets(packs)
-    except (DuplicatePack, DuplicateTarget) as exc:
-        print(str(exc), file=sys.stderr)
+    targets = _discover_targets(packs)
+    if targets is None:
         return 1
 
     for name in sorted(packs):
@@ -143,6 +164,12 @@ def _cmd_enable(name: str) -> int:
     # EXISTS; verified against the live database.
     packs = _discover_packs()
     if packs is None:
+        return 1
+    # A target-name collision between two OTHER installed packs must refuse
+    # here too, not just in `list`: the DDL this command is about to apply is
+    # keyed by target name, same as `drop`'s deletes are, and the uniqueness
+    # it relies on is worth nothing if only `list` ever checks it.
+    if _discover_targets(packs) is None:
         return 1
     pack = packs.get(name)
     if pack is None:
@@ -297,6 +324,15 @@ def _cmd_drop(name: str, yes_destroy_data: bool) -> int:
     packs = _discover_packs()
     if packs is None:
         return 1
+    # Checked before anything is written or destroyed: this command's control
+    # deletes below are scoped `WHERE target = ANY(...)` by name, and that
+    # scoping is only actually safe if no two installed packs can share a
+    # target name. all_targets() is what enforces that; without calling it
+    # here, two colliding packs could both be enabled and `drop` on one would
+    # delete the OTHER's transform_run/transform_watermark/transform_coverage
+    # rows right along with it.
+    if _discover_targets(packs) is None:
+        return 1
     pack = packs.get(name)
     if pack is None:
         print(_explain_unregistered(name), file=sys.stderr)
@@ -355,14 +391,16 @@ def _cmd_drop(name: str, yes_destroy_data: bool) -> int:
                         (targets,),
                     )
                     # transform_coverage is the ledger that makes dropping a raw
-                    # partition safe elsewhere; it is keyed by target, and
-                    # target names are globally unique across every installed
-                    # pack (registry.all_targets() enforces this). Deleting
-                    # this pack's own rows re-arms the guard only for targets
-                    # this pack owns -- whose raw tables were just dropped
-                    # above, so there is nothing left for the guard to
-                    # protect -- and cannot touch another pack's rows, because
-                    # no other pack's target can share these names.
+                    # partition safe elsewhere; it is keyed by target. Target
+                    # names are enforced globally unique across every installed
+                    # pack at both enable and drop time -- see the
+                    # _discover_targets() call above, which refuses to run
+                    # this command at all on a collision -- so deleting this
+                    # pack's own rows re-arms the guard only for targets this
+                    # pack owns -- whose raw tables were just dropped above, so
+                    # there is nothing left for the guard to protect -- and
+                    # cannot touch another pack's rows, because no other
+                    # installed pack's target is allowed to share these names.
                     cur.execute(
                         "DELETE FROM control.transform_coverage WHERE target = ANY(%s)",
                         (targets,),

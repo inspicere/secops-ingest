@@ -147,6 +147,103 @@ def test_drop_unknown_pack_names_it(
     assert "nosuchpack" in capsys.readouterr().err
 
 
+def _colliding_pack() -> object:
+    from secops_ingest.packs.model import Pack
+    from secops_ingest.transform.base import Target
+
+    colliding = Target(
+        name="example_messages",  # collides with builtin's own target name
+        raw_table="raw_evil.messages",
+        fact_table="mart_fact_evil_messages",
+        fact_date_expr="seen_at",
+        upsert_sql="INSERT INTO mart_fact_evil_messages SELECT %(since)s::timestamptz",
+    )
+    return Pack(
+        name="evil",
+        version="0.1.0",
+        requires_core=">=0",
+        sources={"thing": "evil.thing:SOURCE"},
+        targets=(colliding,),
+    )
+
+
+def test_enable_refuses_on_a_target_name_collision(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """all_targets() must be checked on enable's path too, not just list's.
+
+    A pack declaring a target name that collides with an already-installed
+    pack's target must stop `enable` cold -- on EITHER pack's name -- before
+    any DDL is generated or applied, because that DDL and drop's later
+    deletes are both keyed by target name.
+    """
+    from secops_ingest.packs.registry import discover
+
+    class _FakeEntryPoint:
+        name = "evil"
+        dist = type("Dist", (), {"name": "evil-dist"})()
+
+        def load(self) -> object:
+            return _colliding_pack()
+
+    monkeypatch.setattr(
+        "secops_ingest.packs.__main__.discover",
+        lambda: discover(extra=[_FakeEntryPoint()]),
+    )
+    monkeypatch.setenv("SECOPS_DB_DSN", "postgresql://unused")
+
+    assert main(["enable", "builtin"]) == 1
+    err = capsys.readouterr().err
+    assert "example_messages" in err
+    assert "builtin" in err
+    assert "evil" in err
+
+    assert main(["enable", "evil"]) == 1
+    err = capsys.readouterr().err
+    assert "example_messages" in err
+    assert "builtin" in err
+    assert "evil" in err
+
+
+def test_drop_refuses_on_a_target_name_collision_and_destroys_nothing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The property that matters for a destructive verb: not just exit 1.
+
+    `drop`'s control-row deletes are scoped `WHERE target = ANY(...)` by
+    name, which is only safe if target names are unique across every
+    installed pack. `psycopg.connect` is stubbed to raise if it is ever
+    called at all, so this proves the collision is caught before any
+    connection opens -- nothing gets a chance to be destroyed, not merely
+    that the command happens to exit non-zero.
+    """
+    psycopg = pytest.importorskip("psycopg", reason="needs the 'postgres' extra")
+    from secops_ingest.packs.registry import discover
+
+    class _FakeEntryPoint:
+        name = "evil"
+        dist = type("Dist", (), {"name": "evil-dist"})()
+
+        def load(self) -> object:
+            return _colliding_pack()
+
+    def _must_not_connect(dsn: str) -> None:
+        raise AssertionError("drop must refuse before opening a connection")
+
+    monkeypatch.setattr(
+        "secops_ingest.packs.__main__.discover",
+        lambda: discover(extra=[_FakeEntryPoint()]),
+    )
+    monkeypatch.setattr(psycopg, "connect", _must_not_connect)
+    monkeypatch.setenv("SECOPS_DB_DSN", "postgresql://unused")
+
+    assert main(["drop", "builtin", "--yes-destroy-data"]) == 1
+    err = capsys.readouterr().err
+    assert "example_messages" in err
+    assert "builtin" in err
+    assert "evil" in err
+
+
 def test_disable_unregistered_with_no_row_names_the_pack(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -473,3 +473,73 @@ def test_drop_leaves_other_packs_tables_and_control_rows_alone(  # type: ignore[
         # cousin, the `conn` fixture's own live-database guard, on the very
         # next test run against this real, persistent database.
         assert main(["drop", "other", "--yes-destroy-data"]) == 0
+
+
+def test_drop_refuses_on_a_target_name_collision_and_leaves_tables_in_place(  # type: ignore[no-untyped-def]
+    conn, monkeypatch
+) -> None:
+    """all_targets() must be checked on drop's path too, against a real warehouse.
+
+    Registers a second pack whose target collides by name with builtin's own
+    `example_messages`, the way tests/packs/test_registry.py injects a fake
+    entry point. `drop --yes-destroy-data` must refuse before ever opening a
+    connection -- the control-row deletes in `_cmd_drop` are only safe to
+    scope `WHERE target = ANY(...)` because target names are supposed to be
+    globally unique, and this is exactly the collision that would break that
+    assumption. Proven here by planting real tables first (`enable`, with no
+    collision registered yet) and then asserting they are still there after
+    the refusal.
+    """
+    from secops_ingest.packs import __main__ as main_mod
+    from secops_ingest.packs.__main__ import main
+    from secops_ingest.packs.model import Pack
+    from secops_ingest.packs.registry import discover
+    from secops_ingest.transform.base import Target
+
+    monkeypatch.setenv("SECOPS_DB_DSN", os.environ["SECOPS_TEST_DSN"])
+    assert main(["enable", "builtin"]) == 0
+    assert _table_exists(conn, "raw_example.messages")
+
+    colliding = Target(
+        name="example_messages",  # collides with builtin's own target name
+        raw_table="raw_evil.messages",
+        fact_table="mart_fact_evil_messages",
+        fact_date_expr="seen_at",
+        upsert_sql="INSERT INTO mart_fact_evil_messages SELECT %(since)s::timestamptz",
+    )
+    evil_pack = Pack(
+        name="evil",
+        version="0.1.0",
+        requires_core=">=0",
+        sources={"thing": "evil.thing:SOURCE"},
+        targets=(colliding,),
+    )
+
+    class _FakeEntryPoint:
+        name = "evil"
+        dist = type("Dist", (), {"name": "evil-dist"})()
+
+        def load(self) -> Pack:
+            return evil_pack
+
+    original_discover = main_mod.discover
+    try:
+        monkeypatch.setattr(
+            main_mod, "discover", lambda: discover(extra=[_FakeEntryPoint()])
+        )
+
+        assert main(["drop", "builtin", "--yes-destroy-data"]) == 1
+
+        # Nothing was destroyed: the real table planted before the collision
+        # was registered is still there, and so is builtin's control row.
+        assert _table_exists(conn, "raw_example.messages")
+        assert pack_state.get_state(conn, "builtin") is not None
+        assert pack_state.get_state(conn, "builtin").state == "ENABLED"  # type: ignore[union-attr]
+    finally:
+        # Restore the real discover() (not a full monkeypatch.undo(), which
+        # would also revert SECOPS_DB_DSN) so this cleanup call is not itself
+        # blocked by the collision it just proved -- leaving builtin enabled
+        # here would poison the live-database guard on the next test run,
+        # same lesson as the fixture above this one.
+        monkeypatch.setattr(main_mod, "discover", original_discover)
+        assert main(["drop", "builtin", "--yes-destroy-data"]) == 0
