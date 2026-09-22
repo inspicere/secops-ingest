@@ -18,12 +18,21 @@ only, so that `list` keeps working with neither installed.
 `drop` is the exception to this feature's whole design: every other verb is
 recoverable ("disable, never drop" -- removal stops a pack and leaves the
 warehouse intact), and `drop` is the deliberate, singular way to actually
-destroy a pack's data. It always prints what it would drop and how many rows
-are in each table -- "0 rows" and "4,000,000 rows" must not read the same to
-someone about to type the flag -- and it only drops anything when called with
-`--yes-destroy-data`. Without that flag it exits non-zero: this is a refusal,
-not a report, and a script that ignores the exit code must not then proceed
-as though the data were gone.
+destroy a pack's data. It always prints what it would drop (or, given the
+flag, what it destroyed) and how many rows are in each table -- "0 rows" and
+"4,000,000 rows" must not read the same to someone about to type the flag --
+and it only drops anything when called with `--yes-destroy-data`. Without
+that flag it exits non-zero: this is a refusal, not a report, and a script
+that ignores the exit code must not then proceed as though the data were
+gone.
+
+`drop` also requires the pack to already be DISABLED: dropping data out from
+under a still-running connector would leave it authenticating and failing
+every interval once the tables it depends on are gone, and requiring the
+disable first closes the window where a run in flight could race the drop.
+The `control.pack` row itself is left behind, still DISABLED, rather than
+deleted -- a deleted row reads as "never seen here", which is exactly the
+state a surviving timer's PROCEED-by-default gate treats as safe to run.
 """
 
 from __future__ import annotations
@@ -32,6 +41,7 @@ import argparse
 import logging
 import os
 import sys
+from collections.abc import Mapping
 from importlib.metadata import entry_points
 from typing import TYPE_CHECKING
 
@@ -99,7 +109,7 @@ def _discover_targets(packs: dict[str, Pack]) -> dict[str, Target] | None:
         return None
 
 
-def _explain_unregistered(name: str) -> str:
+def _explain_unregistered(name: str, packs: Mapping[str, Pack]) -> str:
     """Why `name` did not come back from discover(): unknown, or dropped for a
     core-version mismatch.
 
@@ -110,6 +120,11 @@ def _explain_unregistered(name: str) -> str:
     ones discover() itself sees, purely to explain an absence; it changes
     nothing, and callers only reach it once discover() has already failed to
     find the pack.
+
+    `packs` is only used for the plain "unknown pack" case, to list what IS
+    registered -- the same "available: ..." convention
+    `registry.UnknownSource` already uses, so a typo's error message actually
+    helps rather than just naming what was typed.
     """
     for ep in entry_points(group=ENTRY_POINT_GROUP):
         try:
@@ -128,7 +143,8 @@ def _explain_unregistered(name: str) -> str:
                 f"pack {name!r} requires core {candidate.requires_core}, "
                 f"but this install is core {__version__}"
             )
-    return f"unknown pack: {name!r}"
+    available = ", ".join(sorted(packs)) or "-"
+    return f"unknown pack: {name!r}; available: {available}"
 
 
 def _require_dsn() -> str | None:
@@ -247,7 +263,7 @@ def _cmd_enable(name: str) -> int:
         return 1
     pack = packs.get(name)
     if pack is None:
-        print(_explain_unregistered(name), file=sys.stderr)
+        print(_explain_unregistered(name, packs), file=sys.stderr)
         return 1
 
     dsn = _require_dsn()
@@ -271,14 +287,25 @@ def _cmd_enable(name: str) -> int:
 
     from . import state as pack_state
 
+    # Connect and operate are reported as separate failures, same distinction
+    # `list` already makes in `_load_pack_states`: a DSN/network/host problem
+    # points an operator somewhere different than a DDL or GRANT problem does,
+    # and collapsing both into one message names the wrong thing.
     try:
-        with psycopg.connect(dsn) as conn:
-            pack_state.apply_ddl(conn, control_sql())
-            pack_state.apply_ddl(conn, target_ddl)
-            pack_state.set_state(conn, name, pack.version, "ENABLED")
+        conn = psycopg.connect(dsn)
     except psycopg.Error as exc:
-        print(f"could not enable pack {name!r}: {exc}", file=sys.stderr)
+        print(f"could not connect to enable pack {name!r}: {exc}", file=sys.stderr)
         return 1
+
+    try:
+        pack_state.apply_ddl(conn, control_sql())
+        pack_state.apply_ddl(conn, target_ddl)
+        pack_state.set_state(conn, name, pack.version, "ENABLED")
+    except psycopg.Error as exc:
+        print(f"connected, but could not enable pack {name!r}: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
     return 0
 
 
@@ -296,30 +323,39 @@ def _cmd_disable(name: str) -> int:
 
     from . import state as pack_state
 
+    # Same connect/operate split as `enable` and `list` -- see the comment in
+    # `_cmd_enable`.
     try:
-        with psycopg.connect(dsn) as conn:
-            if pack is not None:
-                # Registered: converge to DISABLED unconditionally, whether or
-                # not it was ever enabled before. control_sql() only creates
-                # control.pack (and its siblings) -- never a raw_* schema --
-                # so a pack that was never enabled still gets a row here
-                # without this ever looking like "data was touched".
-                from ..schema import control_sql
-
-                pack_state.apply_ddl(conn, control_sql())
-                pack_state.set_state(conn, name, pack.version, "DISABLED")
-                return 0
-
-            existing = pack_state.get_state(conn, name)
-            if existing is None:
-                print(_explain_unregistered(name), file=sys.stderr)
-                return 1
-            # Unregistered but has history (e.g. the pack was uninstalled):
-            # disable it without guessing at a version it no longer declares.
-            pack_state.set_state(conn, name, existing.version, "DISABLED")
+        conn = psycopg.connect(dsn)
     except psycopg.Error as exc:
-        print(f"could not disable pack {name!r}: {exc}", file=sys.stderr)
+        print(f"could not connect to disable pack {name!r}: {exc}", file=sys.stderr)
         return 1
+
+    try:
+        if pack is not None:
+            # Registered: converge to DISABLED unconditionally, whether or
+            # not it was ever enabled before. control_sql() only creates
+            # control.pack (and its siblings) -- never a raw_* schema --
+            # so a pack that was never enabled still gets a row here
+            # without this ever looking like "data was touched".
+            from ..schema import control_sql
+
+            pack_state.apply_ddl(conn, control_sql())
+            pack_state.set_state(conn, name, pack.version, "DISABLED")
+            return 0
+
+        existing = pack_state.get_state(conn, name)
+        if existing is None:
+            print(_explain_unregistered(name, packs), file=sys.stderr)
+            return 1
+        # Unregistered but has history (e.g. the pack was uninstalled):
+        # disable it without guessing at a version it no longer declares.
+        pack_state.set_state(conn, name, existing.version, "DISABLED")
+    except psycopg.Error as exc:
+        print(f"connected, but could not disable pack {name!r}: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
     return 0
 
 
@@ -364,9 +400,9 @@ def _row_count(conn: psycopg.Connection, qualified: str) -> int:
     nothing in it, and that is exactly what the inventory should say.
     """
     import psycopg
+    from psycopg import sql
 
     ident = _qualified_ident(qualified)
-    from psycopg import sql
 
     try:
         with conn.cursor() as cur:
@@ -378,15 +414,53 @@ def _row_count(conn: psycopg.Connection, qualified: str) -> int:
     return int(row[0]) if row is not None else 0
 
 
-def _print_inventory(tables: list[str], counts: dict[str, int]) -> int:
-    """Print every table with its row count and the total; return the total."""
+def _print_inventory(
+    name: str, tables: list[str], counts: dict[str, int], *, destroying: bool
+) -> None:
+    """Print every table `drop` would touch for `name`, with its row count.
+
+    `destroying` picks the header's verb -- "destroying" once
+    `--yes-destroy-data` was given and this is really about to happen,
+    "would destroy" when it is not and this is a refusal. Byte-identical
+    stdout between those two cases is exactly the bug this guards against: a
+    converge log or 3am scrollback must be able to tell "refused, touched
+    nothing" apart from "destroyed all of this" from the text alone.
+    """
+    verb = "destroying" if destroying else "would destroy"
+    print(f"{verb} the data for pack {name!r}:")
     total = 0
     for table in tables:
         count = counts[table]
         total += count
         print(f"{table}: {count} row(s)")
     print(f"total: {total} row(s)")
-    return total
+
+
+def _colliding_source(
+    name: str, pack: Pack, packs: Mapping[str, Pack]
+) -> tuple[str, str] | None:
+    """First (source_name, other_pack_name) where some OTHER registered pack
+    also provides one of `pack`'s source names, or None.
+
+    Two packs sharing a bare source name is legal -- `enable` never refuses
+    it, and an operator-typed reference is disambiguated by qualification in
+    `registry.resolve_source` -- but `control.ingest_watermark.source` and
+    `control.ingest_run.source` store only the BARE name. `drop`'s deletes
+    are scoped `WHERE source = ANY(...)` against that bare name, so on a
+    collision it cannot tell which pack's rows it is about to remove. The
+    real fix is storing qualified source names in those tables, a schema
+    change out of scope for this wave; this is the fail-closed guard until
+    that lands. `_discover_targets()`'s uniqueness check does not cover this
+    -- it only enforces TARGET names, and this is about SOURCE names, which
+    the design deliberately leaves free to collide at enable time.
+    """
+    for source_name in pack.sources:
+        for other_name in sorted(packs):
+            if other_name == name:
+                continue
+            if source_name in packs[other_name].sources:
+                return source_name, other_name
+    return None
 
 
 def _cmd_drop(name: str, yes_destroy_data: bool) -> int:
@@ -409,7 +483,30 @@ def _cmd_drop(name: str, yes_destroy_data: bool) -> int:
         return 1
     pack = packs.get(name)
     if pack is None:
-        print(_explain_unregistered(name), file=sys.stderr)
+        print(_explain_unregistered(name, packs), file=sys.stderr)
+        print(
+            f"note: a pack that is enabled but not installed has no Target or "
+            f"Source definitions left here to know what to remove -- "
+            f"`disable {name}` instead; only a currently installed pack can be "
+            "dropped by name.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Source-name collision against another registered pack: refuse before
+    # anything is destroyed. Pure registry data, same as the target-name
+    # check above, so this too is checked before a connection is ever opened.
+    collision = _colliding_source(name, pack, packs)
+    if collision is not None:
+        source_name, other_name = collision
+        print(
+            f"pack {name!r}: source {source_name!r} is also provided by pack "
+            f"{other_name!r}; refusing to drop -- control.ingest_watermark and "
+            f"control.ingest_run key rows by the bare source name only, so "
+            f"{name!r}'s bookkeeping for {source_name!r} cannot be told apart "
+            f"from {other_name!r}'s. Nothing was destroyed.",
+            file=sys.stderr,
+        )
         return 1
 
     dsn = _require_dsn()
@@ -425,70 +522,118 @@ def _cmd_drop(name: str, yes_destroy_data: bool) -> int:
 
     from . import state as pack_state
 
+    # Connect and operate are reported as separate failures -- see the
+    # comment in `_cmd_enable`.
     try:
-        with psycopg.connect(dsn) as conn:
-            # The inventory is printed first, unconditionally, whether or not
-            # the flag was given -- so a converge log always shows what would
-            # be (or was) destroyed, and how much was in it.
-            counts = {table: _row_count(conn, table) for table in tables}
-            _print_inventory(tables, counts)
-
-            if not yes_destroy_data:
-                return 1
-
-            # DROP TABLE IF EXISTS, never CASCADE: a partitioned table's
-            # partitions go with it, but anything else depending on these
-            # tables must fail loudly rather than be destroyed silently.
-            for table in tables:
-                ident = _qualified_ident(table)
-                with conn.cursor() as cur:
-                    cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(ident))
-            conn.commit()
-
-            with conn.cursor() as cur:
-                if sources:
-                    cur.execute(
-                        "DELETE FROM control.ingest_watermark WHERE source = ANY(%s)",
-                        (sources,),
-                    )
-                    cur.execute(
-                        "DELETE FROM control.ingest_run WHERE source = ANY(%s)",
-                        (sources,),
-                    )
-                if targets:
-                    cur.execute(
-                        "DELETE FROM control.transform_watermark WHERE target = ANY(%s)",
-                        (targets,),
-                    )
-                    cur.execute(
-                        "DELETE FROM control.transform_run WHERE target = ANY(%s)",
-                        (targets,),
-                    )
-                    # transform_coverage is the ledger that makes dropping a raw
-                    # partition safe elsewhere; it is keyed by target. Target
-                    # names are enforced globally unique across every installed
-                    # pack at both enable and drop time -- see the
-                    # _discover_targets() call above, which refuses to run
-                    # this command at all on a collision -- so deleting this
-                    # pack's own rows re-arms the guard only for targets this
-                    # pack owns -- whose raw tables were just dropped above, so
-                    # there is nothing left for the guard to protect -- and
-                    # cannot touch another pack's rows, because no other
-                    # installed pack's target is allowed to share these names.
-                    cur.execute(
-                        "DELETE FROM control.transform_coverage WHERE target = ANY(%s)",
-                        (targets,),
-                    )
-            conn.commit()
-
-            # The control.pack row is deleted strictly last, after every table
-            # and every other control row is already gone -- the mirror image
-            # of `enable`, which writes its row strictly last only after
-            # everything it depends on exists.
-            pack_state.delete_state(conn, name)
+        conn = psycopg.connect(dsn)
     except psycopg.Error as exc:
-        print(f"could not drop pack {name!r}: {exc}", file=sys.stderr)
+        print(f"could not connect to drop pack {name!r}: {exc}", file=sys.stderr)
         return 1
+
+    try:
+        # `drop` requires the pack to already be DISABLED. A still-ENABLED
+        # pack has a timer that may run at any moment; dropping its tables
+        # out from under that timer, or racing a run already in flight, is
+        # exactly what `disable` exists to prevent first. No row at all is
+        # refused the same way: `run._pack_state_of` treats a missing row as
+        # PROCEED (deliberately, for warehouses from before pack state
+        # existed), so a pack that was never enabled/disabled has the same
+        # "nothing is stopping a connector from running" problem.
+        state = pack_state.get_state(conn, name)
+        if state is None or state.state != "DISABLED":
+            current = "has no recorded state" if state is None else f"is {state.state}"
+            print(
+                f"pack {name!r} {current} in this warehouse; refusing to drop "
+                f"-- run `disable {name}` first. A running connector must be "
+                "stopped before its data is removed, which also closes the "
+                "window where a run in flight could race this drop.",
+                file=sys.stderr,
+            )
+            return 1
+
+        # The inventory is printed unconditionally, whether or not the flag
+        # was given, so a converge log always shows what would be (or was)
+        # destroyed and how much was in it -- and its header now says which
+        # of those two happened, since identical stdout either way is exactly
+        # what made a refusal indistinguishable from a real destruction.
+        counts = {table: _row_count(conn, table) for table in tables}
+        _print_inventory(name, tables, counts, destroying=yes_destroy_data)
+
+        if not yes_destroy_data:
+            print(
+                "refusing: pass --yes-destroy-data to actually destroy this data.",
+            )
+            return 1
+
+        # Bookkeeping is deleted FIRST, tables dropped second -- the inverse
+        # of `_cmd_enable`'s ordering (see the "written strictly last" comment
+        # there): there, the control row must never claim more than the DDL
+        # actually applied; here, the control rows must never claim a cursor
+        # or a covered period for a table that no longer exists. A crash
+        # between these two steps leaves a state that is trivial to finish --
+        # re-run `drop`, or run `enable` again, both idempotent -- but the
+        # reverse (tables gone, bookkeeping intact) is not recoverable: raw is
+        # a bounded re-derivation buffer (ADR-0002), a resumed worker would
+        # trust the stale watermark and never re-fetch the gap, and
+        # transform_coverage would keep raw expiry armed for periods whose
+        # facts no longer exist.
+        with conn.cursor() as cur:
+            if sources:
+                cur.execute(
+                    "DELETE FROM control.ingest_watermark WHERE source = ANY(%s)",
+                    (sources,),
+                )
+                cur.execute(
+                    "DELETE FROM control.ingest_run WHERE source = ANY(%s)",
+                    (sources,),
+                )
+            if targets:
+                cur.execute(
+                    "DELETE FROM control.transform_watermark WHERE target = ANY(%s)",
+                    (targets,),
+                )
+                cur.execute(
+                    "DELETE FROM control.transform_run WHERE target = ANY(%s)",
+                    (targets,),
+                )
+                # transform_coverage is the ledger that makes dropping a raw
+                # partition safe elsewhere; it is keyed by target. Target
+                # names are enforced globally unique across every installed
+                # pack at both enable and drop time -- see the
+                # _discover_targets() call above, which refuses to run
+                # this command at all on a collision -- so deleting this
+                # pack's own rows re-arms the guard only for targets this
+                # pack owns -- whose raw tables are about to be dropped below,
+                # so there is nothing left for the guard to protect -- and
+                # cannot touch another pack's rows, because no other
+                # installed pack's target is allowed to share these names.
+                cur.execute(
+                    "DELETE FROM control.transform_coverage WHERE target = ANY(%s)",
+                    (targets,),
+                )
+        conn.commit()
+
+        # DROP TABLE IF EXISTS, never CASCADE: a partitioned table's
+        # partitions go with it, but anything else depending on these
+        # tables must fail loudly rather than be destroyed silently.
+        for table in tables:
+            ident = _qualified_ident(table)
+            with conn.cursor() as cur:
+                cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(ident))
+        conn.commit()
+
+        # The control.pack row is left in place, still DISABLED (checked
+        # above, and nothing here touches control.pack) rather than deleted.
+        # Deleting it would hand back exactly the property `disable` exists
+        # to remove: `run._pack_state_of` treats no row at all as PROCEED, so
+        # a surviving timer for a dropped pack would stop refusing and run
+        # for real against tables that no longer exist.
+        print(f"destroyed the data for pack {name!r}.")
+    except psycopg.Error as exc:
+        print(f"connected, but could not drop pack {name!r}: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
     return 0
 
 
