@@ -154,3 +154,31 @@ jobs:
       - name: OpenBao logs
         if: failure()
         run: docker logs openbao
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: pw
+          POSTGRES_DB: secops
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install with the postgres extra
+        run: pip install -e ".[postgres,dev]"
+      # Fail here rather than letting the tests skip: SECOPS_TEST_DSN is set
+      # below regardless, so a database that never came up would otherwise
+      # surface as a pass.
+      - name: Pack state against a real PostgreSQL
+        env:
+          SECOPS_TEST_DSN: postgresql://postgres:pw@127.0.0.1:5432/secops
+        run: pytest tests/packs/test_state_integration.py -v
