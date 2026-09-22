@@ -225,7 +225,9 @@ def test_mart_partitions_emitted_only_for_partitioned_facts(
 
 
 def g(**kw: object) -> str:
-    return grants_sql(["raw_wazuh"], ["mart_fact_wazuh_alerts", "mart_rollup_wazuh_daily"], **kw)  # type: ignore[arg-type]
+    return grants_sql(  # type: ignore[arg-type]
+        ["raw_wazuh"], ["mart_fact_wazuh_alerts", "mart_rollup_wazuh_daily"], **kw
+    )
 
 
 def test_no_roles_means_no_grants() -> None:

@@ -10,8 +10,12 @@ import pytest
 
 psycopg = pytest.importorskip("psycopg", reason="needs the 'postgres' extra")
 
-from secops_ingest.common import run as run_mod
-from secops_ingest.packs.state import PackState
+# Deliberately below the importorskip: both modules import `psycopg` themselves
+# (transitively, through packs/state.py), so importing them before the skip
+# check would turn "postgres extra not installed" into a collection-time
+# ImportError instead of a clean skip.
+from secops_ingest.common import run as run_mod  # noqa: E402
+from secops_ingest.packs.state import PackState  # noqa: E402
 
 
 @contextmanager

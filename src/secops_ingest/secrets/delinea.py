@@ -51,7 +51,9 @@ class DelineaSecretProvider(SecretProvider):
             self._client = self._build_client(SecretServer)
         return self._client
 
-    def _build_client(self, secret_server_cls: Any) -> Any:  # pragma: no cover - needs a live server
+    def _build_client(
+        self, secret_server_cls: Any
+    ) -> Any:  # pragma: no cover - needs a live server
         # SDK client registration is the intended path; the SDK resolves its
         # machine-bound credential itself.
         return secret_server_cls(self._base_url)
