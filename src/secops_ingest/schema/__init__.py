@@ -109,6 +109,28 @@ CREATE TABLE IF NOT EXISTS control.transform_coverage (
     completed_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (target, period)
 );
+
+-- Which packs are installed and whether they may run.
+--
+-- The row outlives the distribution deliberately. `pip uninstall` of a pack
+-- leaves this row behind, and `pack list` reports the result as "enabled but
+-- not installed" -- a real state, and the one the DefectDojo incident looked
+-- like from the outside: a host pinned to a ref while running a copy that
+-- predated the connector, failing as "unknown source" and blaming the
+-- connector rather than the install.
+--
+-- `version` is what makes a silent no-op upgrade visible. The package version
+-- stays 0.1.0 across refs, so `pip install --upgrade` can resolve to nothing,
+-- exit 0, and report success; comparing this column to the installed pack's
+-- version is how that is caught.
+CREATE TABLE IF NOT EXISTS control.pack (
+    name        text PRIMARY KEY,
+    version     text        NOT NULL,
+    state       text        NOT NULL
+                CHECK (state IN ('ENABLED','DISABLED')),
+    enabled_at  timestamptz,
+    disabled_at timestamptz
+);
 """
 
 
