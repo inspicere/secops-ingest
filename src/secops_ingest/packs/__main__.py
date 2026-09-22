@@ -119,6 +119,12 @@ def _cmd_enable(name: str) -> int:
     # Resolved from the registry before anything touches a connection: the
     # unknown-pack failure must be about the name, not about a DSN that
     # happens not to resolve. See test_enable_unknown_pack_names_it.
+    #
+    # The control row is written strictly last, after both DDL applications have
+    # committed, so a failure in between can never leave a row claiming ENABLED
+    # with no tables behind it -- and the reverse (re-running after a partial
+    # failure) self-heals, because every statement below is CREATE ... IF NOT
+    # EXISTS; verified against the live database.
     packs = _discover_packs()
     if packs is None:
         return 1
@@ -177,7 +183,13 @@ def _cmd_disable(name: str) -> int:
         with psycopg.connect(dsn) as conn:
             if pack is not None:
                 # Registered: converge to DISABLED unconditionally, whether or
-                # not it was ever enabled before.
+                # not it was ever enabled before. control_sql() only creates
+                # control.pack (and its siblings) -- never a raw_* schema --
+                # so a pack that was never enabled still gets a row here
+                # without this ever looking like "data was touched".
+                from ..schema import control_sql
+
+                pack_state.apply_ddl(conn, control_sql())
                 pack_state.set_state(conn, name, pack.version, "DISABLED")
                 return 0
 

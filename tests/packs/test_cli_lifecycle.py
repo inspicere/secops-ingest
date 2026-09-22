@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Self
+
 import pytest
 
 from secops_ingest.packs.__main__ import main
@@ -124,3 +126,35 @@ def test_enable_target_not_schema_qualified_reports_pack_and_target(
     err = capsys.readouterr().err
     assert "badpack" in err
     assert "bad_target" in err
+
+
+def test_disable_unregistered_with_no_row_names_the_pack(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`disable nosuchpack` must fail naming the pack, not just exit non-zero.
+
+    Unlike `enable`, `disable`'s failure decision for an unregistered pack
+    depends on whether the warehouse has a row for it (a pack that was
+    uninstalled but once ran here should still disable cleanly), so it
+    genuinely has to connect before it can tell "never existed" apart from
+    "known, no row". The DSN is deliberately unusable, as the other tests in
+    this file use, but `psycopg.connect` and `state.get_state` are stubbed so
+    the connection "succeeds" and reports no row -- proving this exit 1 comes
+    from the pack being unknown, not from the fake DSN failing to resolve.
+    """
+    psycopg = pytest.importorskip("psycopg", reason="needs the 'postgres' extra")
+
+    class _FakeConnection:
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *exc_info: object) -> None:
+            return None
+
+    monkeypatch.setattr(psycopg, "connect", lambda dsn: _FakeConnection())
+    monkeypatch.setattr("secops_ingest.packs.state.get_state", lambda conn, name: None)
+    monkeypatch.setenv("SECOPS_DB_DSN", "postgresql://unused")
+
+    assert main(["disable", "nosuchpack"]) == 1
+    err = capsys.readouterr().err
+    assert "nosuchpack" in err

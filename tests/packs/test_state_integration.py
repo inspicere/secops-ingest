@@ -249,3 +249,41 @@ def test_enable_twice_is_idempotent(conn, monkeypatch) -> None:  # type: ignore[
     monkeypatch.setenv("SECOPS_DB_DSN", os.environ["SECOPS_TEST_DSN"])
     assert main(["enable", "builtin"]) == 0
     assert main(["enable", "builtin"]) == 0
+
+
+def test_disable_without_a_prior_enable_succeeds(conn, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Disabling something that was never enabled must not fail a converge.
+
+    An Ansible run that flips a pack off has to be idempotent whether or not
+    it was ever on -- `builtin` here has no row at all, since `control` was
+    just dropped by the fixture and no enable has run.
+
+    What this implementation actually does: it writes a DISABLED row rather
+    than leaving no row behind. That is deliberate, not incidental -- a
+    stored DISABLED row lets a later `control.pack` query tell "known to
+    this install, and off" apart from "never seen here at all", which no row
+    cannot do. Writing it costs nothing extra: control_sql() only touches
+    `control.*`, so this is still "the row and nothing else" -- in
+    particular, no raw_* schema gets created by it, which the assertion below
+    pins by count rather than by absolute zero: earlier tests in this module
+    may have already left raw_* schemas behind (the `conn` fixture only drops
+    `control`, on purpose -- see its docstring), so this compares the count
+    before and after rather than assuming a pristine database.
+    """
+    from secops_ingest.packs.__main__ import main
+
+    raw_tables_before = conn.execute(
+        "SELECT count(*) FROM information_schema.tables WHERE table_schema LIKE 'raw_%'"
+    ).fetchone()[0]
+
+    monkeypatch.setenv("SECOPS_DB_DSN", os.environ["SECOPS_TEST_DSN"])
+    assert main(["disable", "builtin"]) == 0
+
+    got = pack_state.get_state(conn, "builtin")
+    assert got is not None
+    assert got.state == "DISABLED"
+
+    raw_tables_after = conn.execute(
+        "SELECT count(*) FROM information_schema.tables WHERE table_schema LIKE 'raw_%'"
+    ).fetchone()[0]
+    assert raw_tables_after == raw_tables_before
