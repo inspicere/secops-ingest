@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Self
+
 import pytest
 
 from secops_ingest.packs.__main__ import main
@@ -75,6 +77,64 @@ def test_list_says_state_is_unknown_without_a_database(
     out = capsys.readouterr().out
     assert "builtin" in out
     assert "unknown" in out.lower()
+
+
+def test_list_labels_a_connection_failure_as_a_connect_problem(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A DSN that cannot even be connected to must be labelled as such.
+
+    No real database involved -- `psycopg.connect` is stubbed to raise
+    directly, so this never leaves the process.
+    """
+    psycopg = pytest.importorskip("psycopg", reason="needs the 'postgres' extra")
+
+    def _boom(dsn: str) -> None:
+        raise psycopg.OperationalError("could not translate host name")
+
+    monkeypatch.setenv("SECOPS_DB_DSN", "postgresql://unreachable/db")
+    monkeypatch.setattr(psycopg, "connect", _boom)
+
+    assert main(["list"]) == 0
+    out = capsys.readouterr().out
+    assert "builtin" in out
+    assert "could not connect" in out.lower()
+    assert "could not read" not in out.lower()
+
+
+def test_list_labels_a_query_failure_as_a_read_problem_not_a_connect_problem(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A reachable database that then refuses the query is a different failure.
+
+    This is the bug the reviewer caught: a successful connect followed by a
+    permission-denied read (e.g. USAGE on `control` but no SELECT on
+    `control.pack`) was being reported as "could not connect", which points
+    an operator at the network/host/DSN when the actual fix is a GRANT. No
+    real database is needed here either -- `psycopg.connect` returns a stub
+    connection, and `all_states` is made to raise directly.
+    """
+    psycopg = pytest.importorskip("psycopg", reason="needs the 'postgres' extra")
+
+    class _StubConn:
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *exc_info: object) -> bool:
+            return False
+
+    def _boom(conn: object) -> None:
+        raise psycopg.errors.InsufficientPrivilege("permission denied for table pack")
+
+    monkeypatch.setenv("SECOPS_DB_DSN", "postgresql://reachable/db")
+    monkeypatch.setattr(psycopg, "connect", lambda dsn: _StubConn())
+    monkeypatch.setattr("secops_ingest.packs.state.all_states", _boom)
+
+    assert main(["list"]) == 0
+    out = capsys.readouterr().out
+    assert "builtin" in out
+    assert "could not read" in out.lower()
+    assert "could not connect" not in out.lower()
 
 
 def test_collision_duplicate_pack_exits_with_code_1(

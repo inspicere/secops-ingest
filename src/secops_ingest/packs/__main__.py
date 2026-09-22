@@ -150,11 +150,15 @@ def _load_pack_states(
     `extra` is every name in `states` that is not a currently registered
     pack: a row with no pack behind it, the "enabled but not installed" case.
 
-    No `SECOPS_DB_DSN`, no `psycopg`, and a connection failure are all
-    reported the same way -- as "no database" for the caller's message --
-    because in every one of those cases `list` has no state to report and
-    must say so without failing the command that exists for exactly this
-    situation.
+    No `SECOPS_DB_DSN` and no `psycopg` are both reported as "no database":
+    in either case there is nothing to connect to at all. A failure to
+    connect and a failure to read, once a connection exists, are kept
+    separate on purpose -- they point an operator at different fixes (the
+    DSN/network/host versus a grant on `control.pack`), and collapsing the
+    two into one label is exactly the kind of message that names the wrong
+    thing. Every path here still exits 0 and still lets the caller print the
+    packs: `list` is a diagnostic and must never fail because the thing it is
+    diagnosing is broken.
     """
     dsn = os.environ.get("SECOPS_DB_DSN")
     if not dsn:
@@ -168,10 +172,15 @@ def _load_pack_states(
     from . import state as pack_state
 
     try:
-        with psycopg.connect(dsn) as conn:
-            states = pack_state.all_states(conn)
+        conn = psycopg.connect(dsn)
     except psycopg.Error as exc:
         return {}, f"could not connect: {exc}", set()
+
+    try:
+        with conn:
+            states = pack_state.all_states(conn)
+    except psycopg.Error as exc:
+        return {}, f"connected, but could not read pack state: {exc}", set()
 
     return states, None, set(states) - set(packs)
 
