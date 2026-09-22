@@ -310,3 +310,166 @@ def test_worker_pack_state_of_reflects_disable_and_enable(  # type: ignore[no-un
 
     assert main(["enable", "builtin"]) == 0
     assert _pack_state_of(conn, "wazuh") is None
+
+
+def _table_exists(conn, qualified: str) -> bool:  # type: ignore[no-untyped-def]
+    schema, _, table = qualified.partition(".")
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = %s AND table_name = %s",
+            (schema, table),
+        ).fetchone()
+    )
+
+
+def test_dry_run_lists_tables_and_destroys_nothing(conn, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    from secops_ingest.packs.__main__ import main
+
+    monkeypatch.setenv("SECOPS_DB_DSN", os.environ["SECOPS_TEST_DSN"])
+    assert main(["enable", "builtin"]) == 0
+    assert main(["drop", "builtin"]) != 0
+    assert _table_exists(conn, "raw_example.messages")
+    assert pack_state.get_state(conn, "builtin") is not None
+    assert "raw_example.messages" in capsys.readouterr().out
+
+
+def test_drop_removes_tables_and_control_rows(conn, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from secops_ingest.packs.__main__ import main
+
+    monkeypatch.setenv("SECOPS_DB_DSN", os.environ["SECOPS_TEST_DSN"])
+    assert main(["enable", "builtin"]) == 0
+    assert _table_exists(conn, "raw_example.messages")
+    assert main(["drop", "builtin", "--yes-destroy-data"]) == 0
+    assert not _table_exists(conn, "raw_example.messages")
+    assert pack_state.get_state(conn, "builtin") is None
+
+
+def test_drop_reports_row_counts_before_destroying(conn, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    from secops_ingest.packs.__main__ import main
+
+    monkeypatch.setenv("SECOPS_DB_DSN", os.environ["SECOPS_TEST_DSN"])
+    main(["enable", "builtin"])
+    main(["drop", "builtin", "--yes-destroy-data"])
+    out = capsys.readouterr().out
+    # The count is the whole point: "0 rows" and "4,000,000 rows" should not
+    # read the same to someone about to type the flag.
+    assert "row" in out.lower()
+
+
+def test_drop_a_pack_with_nothing_to_drop_is_not_an_error(conn, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from secops_ingest.packs.__main__ import main
+
+    monkeypatch.setenv("SECOPS_DB_DSN", os.environ["SECOPS_TEST_DSN"])
+    pack_state.apply_ddl(conn, control_sql())
+    assert main(["drop", "builtin", "--yes-destroy-data"]) == 0
+
+
+def test_drop_leaves_other_packs_tables_and_control_rows_alone(  # type: ignore[no-untyped-def]
+    conn, monkeypatch
+) -> None:
+    """The property most likely to break and least likely to be noticed.
+
+    Builds a second synthetic pack, the way tests/packs/test_registry.py
+    injects a fake entry point, so both `builtin` and `other` are enabled at
+    once against the same warehouse. `control.ingest_watermark` and
+    `control.transform_coverage` are shared tables keyed by source/target
+    name -- if `drop`'s DELETEs are not scoped tightly enough to the pack
+    being dropped, this is where it would show: `other`'s row would vanish
+    right alongside `builtin`'s.
+    """
+    from secops_ingest.packs.__main__ import main
+    from secops_ingest.packs.model import Pack
+    from secops_ingest.packs.registry import discover
+    from secops_ingest.transform.base import Target
+
+    other_target = Target(
+        name="other_things",
+        raw_table="raw_other.things",
+        fact_table="mart_fact_other_things",
+        fact_date_expr="seen_at",
+        upsert_sql="INSERT INTO mart_fact_other_things SELECT %(since)s::timestamptz",
+        fact_ddl="CREATE TABLE IF NOT EXISTS mart_fact_other_things (seen_at timestamptz);",
+    )
+    other_pack = Pack(
+        name="other",
+        version="0.1.0",
+        requires_core=">=0",
+        sources={"thing": "other_pack.thing:SOURCE"},
+        targets=(other_target,),
+    )
+
+    class _FakeEntryPoint:
+        name = "other"
+        dist = type("Dist", (), {"name": "other-dist"})()
+
+        def load(self) -> Pack:
+            return other_pack
+
+    monkeypatch.setattr(
+        "secops_ingest.packs.__main__.discover",
+        lambda: discover(extra=[_FakeEntryPoint()]),
+    )
+    monkeypatch.setenv("SECOPS_DB_DSN", os.environ["SECOPS_TEST_DSN"])
+
+    assert main(["enable", "builtin"]) == 0
+    assert main(["enable", "other"]) == 0
+
+    try:
+        conn.execute(
+            "INSERT INTO control.ingest_watermark (source, cursor_value) VALUES (%s, %s)",
+            ("example", "builtin-cursor"),
+        )
+        conn.execute(
+            "INSERT INTO control.ingest_watermark (source, cursor_value) VALUES (%s, %s)",
+            ("thing", "other-cursor"),
+        )
+        conn.execute(
+            "INSERT INTO control.transform_coverage (target, period, fact_rows) "
+            "VALUES (%s, %s, %s)",
+            ("example_messages", "2026-01-01", 10),
+        )
+        conn.execute(
+            "INSERT INTO control.transform_coverage (target, period, fact_rows) "
+            "VALUES (%s, %s, %s)",
+            ("other_things", "2026-01-01", 5),
+        )
+        conn.commit()
+
+        assert main(["drop", "builtin", "--yes-destroy-data"]) == 0
+
+        # `other`'s tables, unrelated to `builtin`, are untouched. fact_table
+        # and rollup_table are not schema-qualified -- they live wherever the
+        # connection's search_path put them, i.e. public.
+        assert _table_exists(conn, "raw_other.things")
+        assert _table_exists(conn, "public.mart_fact_other_things")
+
+        # `other`'s control.pack row survives, still ENABLED.
+        other_state = pack_state.get_state(conn, "other")
+        assert other_state is not None
+        assert other_state.state == "ENABLED"
+
+        # `builtin`'s row for its own source is gone; `other`'s is not.
+        remaining_watermarks = {
+            row[0]
+            for row in conn.execute("SELECT source FROM control.ingest_watermark").fetchall()
+        }
+        assert "example" not in remaining_watermarks
+        assert "thing" in remaining_watermarks
+
+        # The coverage ledger is scoped per target: dropping builtin must not
+        # re-arm the raw-expiry guard for a target it does not own.
+        remaining_coverage = {
+            row[0]
+            for row in conn.execute("SELECT target FROM control.transform_coverage").fetchall()
+        }
+        assert "example_messages" not in remaining_coverage
+        assert "other_things" in remaining_coverage
+    finally:
+        # `other` is never dropped by the assertions above (that is the whole
+        # point of this test), so it -- and the row this test planted for it
+        # -- would otherwise survive this test and trip
+        # `test_the_guard_refuses_a_database_holding_real_ingest_history`'s
+        # cousin, the `conn` fixture's own live-database guard, on the very
+        # next test run against this real, persistent database.
+        assert main(["drop", "other", "--yes-destroy-data"]) == 0

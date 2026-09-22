@@ -128,6 +128,25 @@ def test_enable_target_not_schema_qualified_reports_pack_and_target(
     assert "bad_target" in err
 
 
+def test_drop_without_the_flag_refuses_and_exits_nonzero(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A refusal, not a report: a script that ignores the exit code must not
+    # then proceed as though the data were gone.
+    monkeypatch.setenv("SECOPS_DB_DSN", "postgresql://unused")
+    assert main(["drop", "builtin"]) != 0
+    out = capsys.readouterr()
+    assert "DROP" not in out.out.upper() or "would" in out.out.lower()
+
+
+def test_drop_unknown_pack_names_it(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("SECOPS_DB_DSN", "postgresql://unused")
+    assert main(["drop", "nosuchpack", "--yes-destroy-data"]) == 1
+    assert "nosuchpack" in capsys.readouterr().err
+
+
 def test_disable_unregistered_with_no_row_names_the_pack(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

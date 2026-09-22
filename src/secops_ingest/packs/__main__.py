@@ -1,4 +1,4 @@
-"""python -m secops_ingest.packs {list,enable,disable}
+"""python -m secops_ingest.packs {list,enable,disable,drop}
 
 `list` reports what this environment can see. Enabled/disabled state lives in
 the warehouse and is not read here, so `list` needs no database and no
@@ -9,6 +9,16 @@ broken, so it must not need the thing that might be broken.
 create the pack's schema. Both need a database and the `postgres` extra, so
 `packs/state.py` and `psycopg` are imported lazily, inside their handlers
 only, so that `list` keeps working with neither installed.
+
+`drop` is the exception to this feature's whole design: every other verb is
+recoverable ("disable, never drop" -- removal stops a pack and leaves the
+warehouse intact), and `drop` is the deliberate, singular way to actually
+destroy a pack's data. It always prints what it would drop and how many rows
+are in each table -- "0 rows" and "4,000,000 rows" must not read the same to
+someone about to type the flag -- and it only drops anything when called with
+`--yes-destroy-data`. Without that flag it exits non-zero: this is a refusal,
+not a report, and a script that ignores the exit code must not then proceed
+as though the data were gone.
 """
 
 from __future__ import annotations
@@ -18,12 +28,18 @@ import logging
 import os
 import sys
 from importlib.metadata import entry_points
+from typing import TYPE_CHECKING
 
 from .. import __version__
 from ..redaction import RedactingFilter
+from ..schema import validate_identifier
 from .model import Pack
 from .registry import ENTRY_POINT_GROUP, DuplicatePack, DuplicateTarget, all_targets, discover
 from .version import InvalidVersionSpec, matches
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, keeps the import lazy
+    import psycopg
+    from psycopg import sql
 
 log = logging.getLogger(__name__)
 
@@ -206,6 +222,164 @@ def _cmd_disable(name: str) -> int:
     return 0
 
 
+def _pack_tables(pack: Pack) -> list[str]:
+    """Every table `drop` would touch for `pack`, in creation order, deduplicated.
+
+    From the pack's targets: each raw_table, each fact_table, and each
+    rollup_table that is set (rollup_table is optional per target).
+    """
+    tables: list[str] = []
+    seen: set[str] = set()
+    for target in pack.targets:
+        for table in (target.raw_table, target.fact_table, target.rollup_table):
+            if table and table not in seen:
+                seen.add(table)
+                tables.append(table)
+    return tables
+
+
+def _qualified_ident(qualified: str) -> sql.Identifier:
+    """Turn 'schema.table' or a bare 'table' into a validated, quoted Identifier.
+
+    raw_table is schema-qualified; fact_table and rollup_table are not -- they
+    resolve against the connection's search_path, same as the DDL that created
+    them (see schema.ddl_for_targets). Every component goes through
+    validate_identifier before it ever reaches psycopg.sql.Identifier: these
+    names arrive from a pack, which is not the same as trusted.
+    """
+    from psycopg import sql
+
+    parts = qualified.split(".")
+    for part in parts:
+        validate_identifier(part)
+    return sql.Identifier(*parts)
+
+
+def _row_count(conn: psycopg.Connection, qualified: str) -> int:
+    """Current row count for `qualified`, or 0 if the table does not exist.
+
+    A table that was never created (e.g. `enable` never ran, or a prior
+    `drop` already removed it) is not an error here -- there is simply
+    nothing in it, and that is exactly what the inventory should say.
+    """
+    import psycopg
+
+    ident = _qualified_ident(qualified)
+    from psycopg import sql
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql.SQL("SELECT count(*) FROM {}").format(ident))
+            row = cur.fetchone()
+    except psycopg.errors.UndefinedTable:
+        conn.rollback()
+        return 0
+    return int(row[0]) if row is not None else 0
+
+
+def _print_inventory(tables: list[str], counts: dict[str, int]) -> int:
+    """Print every table with its row count and the total; return the total."""
+    total = 0
+    for table in tables:
+        count = counts[table]
+        total += count
+        print(f"{table}: {count} row(s)")
+    print(f"total: {total} row(s)")
+    return total
+
+
+def _cmd_drop(name: str, yes_destroy_data: bool) -> int:
+    # Resolved from the registry first, exactly like `enable`: an unknown pack
+    # is a naming problem, not a database problem, and must fail as one before
+    # any connection is opened. It also means `drop` can only ever destroy
+    # tables it can still name -- an uninstalled pack whose Target definitions
+    # are gone cannot be dropped by name, only disabled.
+    packs = _discover_packs()
+    if packs is None:
+        return 1
+    pack = packs.get(name)
+    if pack is None:
+        print(_explain_unregistered(name), file=sys.stderr)
+        return 1
+
+    dsn = _require_dsn()
+    if dsn is None:
+        return 1
+
+    tables = _pack_tables(pack)
+    sources = list(pack.sources)
+    targets = [t.name for t in pack.targets]
+
+    import psycopg
+    from psycopg import sql
+
+    from . import state as pack_state
+
+    try:
+        with psycopg.connect(dsn) as conn:
+            # The inventory is printed first, unconditionally, whether or not
+            # the flag was given -- so a converge log always shows what would
+            # be (or was) destroyed, and how much was in it.
+            counts = {table: _row_count(conn, table) for table in tables}
+            _print_inventory(tables, counts)
+
+            if not yes_destroy_data:
+                return 1
+
+            # DROP TABLE IF EXISTS, never CASCADE: a partitioned table's
+            # partitions go with it, but anything else depending on these
+            # tables must fail loudly rather than be destroyed silently.
+            for table in tables:
+                ident = _qualified_ident(table)
+                with conn.cursor() as cur:
+                    cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(ident))
+            conn.commit()
+
+            with conn.cursor() as cur:
+                if sources:
+                    cur.execute(
+                        "DELETE FROM control.ingest_watermark WHERE source = ANY(%s)",
+                        (sources,),
+                    )
+                    cur.execute(
+                        "DELETE FROM control.ingest_run WHERE source = ANY(%s)",
+                        (sources,),
+                    )
+                if targets:
+                    cur.execute(
+                        "DELETE FROM control.transform_watermark WHERE target = ANY(%s)",
+                        (targets,),
+                    )
+                    cur.execute(
+                        "DELETE FROM control.transform_run WHERE target = ANY(%s)",
+                        (targets,),
+                    )
+                    # transform_coverage is the ledger that makes dropping a raw
+                    # partition safe elsewhere; it is keyed by target, and
+                    # target names are globally unique across every installed
+                    # pack (registry.all_targets() enforces this). Deleting
+                    # this pack's own rows re-arms the guard only for targets
+                    # this pack owns -- whose raw tables were just dropped
+                    # above, so there is nothing left for the guard to
+                    # protect -- and cannot touch another pack's rows, because
+                    # no other pack's target can share these names.
+                    cur.execute(
+                        "DELETE FROM control.transform_coverage WHERE target = ANY(%s)",
+                        (targets,),
+                    )
+            conn.commit()
+
+            # The control.pack row is deleted strictly last, after every table
+            # and every other control row is already gone -- the mirror image
+            # of `enable`, which writes its row strictly last only after
+            # everything it depends on exists.
+            pack_state.delete_state(conn, name)
+    except psycopg.Error as exc:
+        print(f"could not drop pack {name!r}: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="secops_ingest.packs")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -214,6 +388,15 @@ def main(argv: list[str] | None = None) -> int:
     enable_parser.add_argument("name")
     disable_parser = subparsers.add_parser("disable", help="disable a pack in the warehouse")
     disable_parser.add_argument("name")
+    drop_parser = subparsers.add_parser(
+        "drop", help="destroy a pack's tables and control rows in the warehouse"
+    )
+    drop_parser.add_argument("name")
+    drop_parser.add_argument(
+        "--yes-destroy-data",
+        action="store_true",
+        help="actually drop the tables listed in the inventory; without this, nothing is destroyed",
+    )
     args = parser.parse_args(argv)
 
     _configure_logging()
@@ -222,7 +405,9 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_list()
     if args.command == "enable":
         return _cmd_enable(args.name)
-    return _cmd_disable(args.name)
+    if args.command == "disable":
+        return _cmd_disable(args.name)
+    return _cmd_drop(args.name, args.yes_destroy_data)
 
 
 if __name__ == "__main__":
