@@ -12,6 +12,7 @@ for longer than the raw window, the period is lost permanently.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,24 @@ class Target:
     fact_ddl: str | None = None
     rollup_ddl: str | None = None
 
+    #: Re-derive every row on every run, ignoring the incremental watermark.
+    #:
+    #: OFF for every source-shaped target, and it must stay that way: the whole
+    #: point of the watermark is that a run costs the changed slice rather than
+    #: the collection.
+    #:
+    #: ON for a target that JOINS a second table the watermark cannot see. The
+    #: runner's staleness guard asks one question -- has `raw_table` received
+    #: anything since the watermark -- and skips the upsert entirely when the
+    #: answer is no. For a join, that answer is not the same as "is there work to
+    #: do": the other side can change with `raw_table` completely untouched, and
+    #: those rows then never get re-derived. A predicate inside the upsert cannot
+    #: save it, because the upsert is what gets skipped.
+    #:
+    #: Only worth setting on a target whose full derive is cheap. Measured for
+    #: incident_lifecycle: ~48k rows, well under a second.
+    full_refresh: bool = False
+
     def __post_init__(self) -> None:
         if "%(since)s" not in self.upsert_sql:
             raise ValueError(
@@ -79,3 +98,27 @@ class Target:
             raise ValueError(
                 f"target {self.name}: rollup_ddl given but no rollup_table"
             )
+
+
+def should_skip(target: Target, since: Any, new_mark: Any) -> bool:
+    """Is there provably nothing to do?
+
+    Pure and separate from execute() deliberately. This guard silently defeated
+    a correctness fix that lived inside a target's upsert_sql: the fix was a
+    predicate in the WHERE clause, and this decides whether that statement runs
+    at all. Nothing executed it, so three reviews of the SQL all passed. Keeping
+    it here means the decision is testable without a database, for the same
+    reason common/watermark.py exists.
+
+    A full-refresh target is never skipped: its work is not measured by whether
+    `raw_table` moved.
+    """
+    if target.full_refresh:
+        return False
+    return new_mark is None or (since is not None and new_mark <= since)
+
+
+def effective_since(target: Target, since: Any) -> Any:
+    """The value bound to %(since)s. None on a full refresh, so the upsert's
+    `%(since)s::timestamptz IS NULL` branch re-derives every row."""
+    return None if target.full_refresh else since
