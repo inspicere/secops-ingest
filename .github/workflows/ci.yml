@@ -48,6 +48,29 @@ jobs:
       - name: Tests
         run: pytest -q --cov=secops_ingest --cov-report=term-missing
 
+  # The extras-free `Types` step above types every optional backend as Any
+  # (see the mypy override comment in pyproject.toml), which hides errors that
+  # only show up against the drivers' real stubs -- an unchecked fetchone()
+  # result, for instance. This job is the one that would have caught that: it
+  # installs every optional extra and re-runs mypy against their real types.
+  # A single Python version is enough; this is about which types are visible
+  # to mypy, not about interpreter compatibility, which the matrix above
+  # already covers.
+  mypy-with-drivers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install with every optional extra
+        run: pip install -e ".[dev,http,postgres,vault,delinea]"
+
+      - name: Types (with drivers installed)
+        run: mypy src
+
   hygiene:
     runs-on: ubuntu-latest
     steps:

@@ -67,3 +67,37 @@ def test_invalid_target_name_is_rejected_at_the_registry_boundary() -> None:
     )
     with pytest.raises(InvalidIdentifier):
         all_targets({"vendor": pack})
+
+
+def _minimal_target(
+    rollup_table: str | None = None, rollup_sql: str | None = None
+) -> Target:
+    return Target(
+        name="vendor_things",
+        raw_table="raw_vendor.things",
+        fact_table="mart_fact_vendor_things",
+        fact_date_expr="seen_at",
+        upsert_sql="INSERT INTO mart_fact_vendor_things SELECT %(since)s::timestamptz",
+        rollup_table=rollup_table,
+        rollup_sql=rollup_sql,
+    )
+
+
+def test_rollup_sql_without_rollup_table_is_rejected() -> None:
+    # An out-of-tree pack author who fills in rollup_sql but forgets
+    # rollup_table would otherwise reach sql.Identifier(None) mid-transform,
+    # at 3am, instead of at declaration time.
+    with pytest.raises(ValueError, match="rollup_table and rollup_sql must be set together"):
+        _minimal_target(rollup_sql="INSERT INTO mart_rollup_vendor_things SELECT 1")
+
+
+def test_rollup_table_without_rollup_sql_is_rejected() -> None:
+    with pytest.raises(ValueError, match="rollup_table and rollup_sql must be set together"):
+        _minimal_target(rollup_table="mart_rollup_vendor_things")
+
+
+def test_neither_rollup_field_is_fine() -> None:
+    # A target with no rollup stage at all is a normal, supported shape.
+    target = _minimal_target()
+    assert target.rollup_table is None
+    assert target.rollup_sql is None

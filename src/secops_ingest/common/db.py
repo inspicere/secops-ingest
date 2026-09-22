@@ -58,7 +58,12 @@ def start_run(conn: psycopg.Connection, source: str) -> int:
             "VALUES (%s, 'RUNNING') RETURNING run_id",
             (source,),
         )
-        run_id = cur.fetchone()[0]
+        row = cur.fetchone()
+        if row is None:
+            raise RuntimeError(
+                "INSERT ... RETURNING run_id produced no row for control.ingest_run"
+            )
+        run_id = row[0]
     conn.commit()          # visible immediately, so a crash leaves a RUNNING row
     return int(run_id)
 
