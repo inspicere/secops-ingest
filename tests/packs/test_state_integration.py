@@ -220,3 +220,32 @@ def test_the_guard_refuses_a_database_holding_real_ingest_history() -> None:
         finally:
             c.execute("DROP SCHEMA IF EXISTS control CASCADE")
             c.commit()
+
+
+def test_enable_then_disable_round_trip(conn, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from secops_ingest.packs.__main__ import main
+
+    monkeypatch.setenv("SECOPS_DB_DSN", os.environ["SECOPS_TEST_DSN"])
+    assert main(["enable", "builtin"]) == 0
+    assert pack_state.get_state(conn, "builtin").state == "ENABLED"  # type: ignore[union-attr]
+    assert main(["disable", "builtin"]) == 0
+    assert pack_state.get_state(conn, "builtin").state == "DISABLED"  # type: ignore[union-attr]
+
+
+def test_enable_creates_the_packs_tables(conn, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from secops_ingest.packs.__main__ import main
+
+    monkeypatch.setenv("SECOPS_DB_DSN", os.environ["SECOPS_TEST_DSN"])
+    assert main(["enable", "builtin"]) == 0
+    got = conn.execute(
+        "SELECT count(*) FROM information_schema.tables WHERE table_schema LIKE 'raw_%'"
+    ).fetchone()[0]
+    assert got > 0
+
+
+def test_enable_twice_is_idempotent(conn, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from secops_ingest.packs.__main__ import main
+
+    monkeypatch.setenv("SECOPS_DB_DSN", os.environ["SECOPS_TEST_DSN"])
+    assert main(["enable", "builtin"]) == 0
+    assert main(["enable", "builtin"]) == 0
