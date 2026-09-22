@@ -58,12 +58,29 @@ class Result:
     error: str | None = None
 
 
+def _owning_packs(source_name: str) -> list[str]:
+    """Names of every registered pack that claims `source_name`, sorted.
+
+    Ordinarily 0 or 1. More than one is the same collision
+    `registry.resolve_source` refuses as `AmbiguousSource` for an
+    operator-typed reference -- but `execute()` only ever has the Source
+    object's own bare name to go on, not the qualified reference ("beta.shared")
+    that resolved it, so it cannot tell which of the candidates is meant.
+    """
+    return sorted(pack.name for pack in _discover_packs().values() if source_name in pack.sources)
+
+
 def _owning_pack(source_name: str) -> str | None:
-    """Name of the pack that registers `source_name`, or None if none does."""
-    for pack in _discover_packs().values():
-        if source_name in pack.sources:
-            return pack.name
-    return None
+    """Name of the pack that registers `source_name`, if exactly one does.
+
+    The real fix for ambiguity is to thread the operator's qualified reference
+    (e.g. "beta.shared") through into `execute()`, so this never has to guess
+    at all. That changes `execute()`'s signature and the `Source` protocol's
+    contract, which is out of scope for this change; `_pack_state_of`'s
+    fail-closed "AMBIGUOUS" result is the stand-in guard until that lands.
+    """
+    owners = _owning_packs(source_name)
+    return owners[0] if len(owners) == 1 else None
 
 
 def _pack_state_of(conn: Any, source_name: str) -> str | None:
@@ -75,10 +92,18 @@ def _pack_state_of(conn: Any, source_name: str) -> str | None:
     warehouse provisioned before packs had state), the pack has no stored row,
     or the row says ENABLED. Only a stored DISABLED row returns anything, so a
     caller only ever needs to compare the result to that one string.
+
+    "AMBIGUOUS" is the fail-closed exception to that: when more than one
+    registered pack claims `source_name`, there is no single pack to ask, so
+    this refuses rather than guessing and risking a DISABLED pack's connector
+    running because it was silently judged against an unrelated ENABLED one.
     """
-    owner = _owning_pack(source_name)
-    if owner is None:
+    owners = _owning_packs(source_name)
+    if len(owners) > 1:
+        return "AMBIGUOUS"
+    if not owners:
         return None
+    owner = owners[0]
 
     from ..packs import state as pack_state  # lazy: needs the 'postgres' extra
 
@@ -91,7 +116,20 @@ def _pack_state_of(conn: Any, source_name: str) -> str | None:
 def execute(source: Source, *, dry_run: bool = False, batch_size: int = DEFAULT_BATCH) -> Result:
     """Run one ingest cycle. Never returns silently on failure."""
     with db.connect() as conn:
-        if _pack_state_of(conn, source.name) == "DISABLED":
+        state = _pack_state_of(conn, source.name)
+        if state == "AMBIGUOUS":
+            # Same collision registry.resolve_source calls AmbiguousSource for,
+            # and the same message voice: name the source and every candidate
+            # so the operator knows exactly what to disambiguate.
+            candidates = ", ".join(
+                f"{pack_name}.{source.name}" for pack_name in _owning_packs(source.name)
+            )
+            log.error(
+                "source %r is provided by more than one pack; name one of: %s",
+                source.name, candidates,
+            )
+            return Result("AMBIGUOUS", 0, 0)
+        if state == "DISABLED":
             # Deliberately before start_run: a disabled source must leave no
             # trace in control.ingest_run, not a RUNNING row that never
             # completes. The operator disabled this on purpose, so this exits

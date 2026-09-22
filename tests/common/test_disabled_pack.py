@@ -144,3 +144,74 @@ def test_missing_pack_table_proceeds(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.status == "SUCCESS"
     assert source.fetched is True
     assert started == ["wazuh"]
+
+
+class _FakePack:
+    """Duck-types `packs.model.Pack` well enough for `_owning_packs`."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.sources = {"shared": f"{name}_module:SOURCE"}
+
+
+def test_ambiguous_source_refuses_and_does_not_authenticate(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Two registered packs claiming the same bare source name must fail closed.
+
+    This is reachable for real: `execute()` only ever sees the Source object's
+    own bare name ("shared"), not the qualified reference ("beta.shared") the
+    operator used to resolve it -- see the comment on `_owning_pack`. Picking
+    either pack's state here risks the exact outcome this control exists to
+    prevent: a DISABLED pack's connector judged against an unrelated ENABLED
+    one, and allowed to run.
+    """
+
+    class _Shared(_Source):
+        name = "shared"
+
+    source = _Shared()
+    started: list[str] = []
+    _stub_db(monkeypatch, started)
+    monkeypatch.setattr(
+        run_mod, "_discover_packs",
+        lambda: {"alpha": _FakePack("alpha"), "beta": _FakePack("beta")},
+    )
+
+    with caplog.at_level(logging.ERROR):
+        result = run_mod.execute(source)
+
+    assert result.status == "AMBIGUOUS"
+    assert source.fetched is False
+    assert source.authenticated is False
+    assert started == [], "a run that could not even be judged must not appear in run history"
+    assert "shared" in caplog.text
+    assert "alpha" in caplog.text and "beta" in caplog.text
+
+
+def test_pack_state_lookup_error_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A real lookup failure must not be swallowed into a proceed.
+
+    `packs.state.get_state` only ever catches `UndefinedTable`; anything else
+    -- e.g. a permissions error against a read-only role -- must escape
+    `_pack_state_of` uncaught, so the CLI's `except Exception` sees it, exits
+    non-zero, and writes nothing. Treating it as "no state, proceed" would be
+    exactly the silent failure this whole check exists to avoid.
+    """
+    source = _Source()  # owned by the real builtin pack
+    started: list[str] = []
+    _stub_db(monkeypatch, started)
+
+    class _PermissionDenied(RuntimeError):
+        pass
+
+    def _boom(conn: object, name: str) -> None:
+        raise _PermissionDenied("permission denied for table pack")
+
+    monkeypatch.setattr("secops_ingest.packs.state.get_state", _boom)
+
+    with pytest.raises(_PermissionDenied):
+        run_mod.execute(source)
+
+    assert source.fetched is False
+    assert started == []
