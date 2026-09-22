@@ -1,9 +1,14 @@
 """python -m secops_ingest.packs {list,enable,disable,drop}
 
-`list` reports what this environment can see. Enabled/disabled state lives in
-the warehouse and is not read here, so `list` needs no database and no
-optional dependency -- it is the command you reach for when the install is
-broken, so it must not need the thing that might be broken.
+`list` reports what this environment can see, and -- when it can -- what the
+warehouse thinks. Its core report never needs a database or `psycopg`: it is
+the command you reach for when the install is broken, so it must not need the
+thing that might be broken. Without `SECOPS_DB_DSN`, or without `psycopg`
+installed, it prints exactly what it always has, plus one line saying state
+is unknown. With both, it also prints each registered pack's enabled/disabled
+state, and separately flags any `control.pack` row belonging to a pack that
+is not currently registered -- the "enabled but not installed" shape of a
+half-finished upgrade.
 
 `enable`/`disable` record a pack's state in `control.pack` and, for `enable`,
 create the pack's schema. Both need a database and the `postgres` extra, so
@@ -42,6 +47,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, keeps the import lazy
     from psycopg import sql
 
     from ..transform.base import Target
+    from .state import PackState
 
 log = logging.getLogger(__name__)
 
@@ -133,6 +139,52 @@ def _require_dsn() -> str | None:
     return dsn
 
 
+def _load_pack_states(
+    packs: dict[str, Pack],
+) -> tuple[dict[str, PackState], str | None, set[str]]:
+    """What the warehouse thinks, or why it cannot say.
+
+    Returns (states, unknown_reason, extra). `unknown_reason` is None only
+    when a real, queried `control.pack` is behind `states` -- callers use its
+    presence to decide whether per-pack state lines mean anything at all.
+    `extra` is every name in `states` that is not a currently registered
+    pack: a row with no pack behind it, the "enabled but not installed" case.
+
+    No `SECOPS_DB_DSN`, no `psycopg`, and a connection failure are all
+    reported the same way -- as "no database" for the caller's message --
+    because in every one of those cases `list` has no state to report and
+    must say so without failing the command that exists for exactly this
+    situation.
+    """
+    dsn = os.environ.get("SECOPS_DB_DSN")
+    if not dsn:
+        return {}, "no database", set()
+
+    try:
+        import psycopg
+    except ImportError:
+        return {}, "no database", set()
+
+    from . import state as pack_state
+
+    try:
+        with psycopg.connect(dsn) as conn:
+            states = pack_state.all_states(conn)
+    except psycopg.Error as exc:
+        return {}, f"could not connect: {exc}", set()
+
+    return states, None, set(states) - set(packs)
+
+
+def _state_marker(state: PackState | None) -> str:
+    """One glanceable token per state -- not just a word, a shape too."""
+    if state is None:
+        return "[ ] not enabled"
+    if state.state == "ENABLED":
+        return "[+] ENABLED"
+    return "[-] DISABLED"
+
+
 def _cmd_list() -> int:
     packs = _discover_packs()
     if packs is None:
@@ -140,6 +192,8 @@ def _cmd_list() -> int:
     targets = _discover_targets(packs)
     if targets is None:
         return 1
+
+    states, unknown_reason, extra = _load_pack_states(packs)
 
     for name in sorted(packs):
         pack = packs[name]
@@ -149,6 +203,17 @@ def _cmd_list() -> int:
         print(f"{name}  {pack.version}  (core {pack.requires_core})")
         print(f"    sources: {', '.join(sorted(pack.sources)) or '-'}")
         print(f"    targets: {', '.join(owned) or '-'}")
+        if unknown_reason is None:
+            print(f"    state: {_state_marker(states.get(name))}")
+
+    if unknown_reason is not None:
+        print(f"state: unknown ({unknown_reason})")
+    elif extra:
+        print()
+        print("control.pack rows with no matching installed pack (enabled but not installed):")
+        for name in sorted(extra):
+            row = states[name]
+            print(f"    [!] {name}  {row.version}  {row.state}  -- not installed")
     return 0
 
 

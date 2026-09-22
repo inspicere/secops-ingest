@@ -543,3 +543,68 @@ def test_drop_refuses_on_a_target_name_collision_and_leaves_tables_in_place(  # 
         # same lesson as the fixture above this one.
         monkeypatch.setattr(main_mod, "discover", original_discover)
         assert main(["drop", "builtin", "--yes-destroy-data"]) == 0
+
+
+def test_list_shows_enabled_state(conn, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    from secops_ingest.packs.__main__ import main
+
+    monkeypatch.setenv("SECOPS_DB_DSN", os.environ["SECOPS_TEST_DSN"])
+    try:
+        main(["enable", "builtin"])
+        capsys.readouterr()
+        assert main(["list"]) == 0
+        assert "ENABLED" in capsys.readouterr().out
+    finally:
+        main(["drop", "builtin", "--yes-destroy-data"])
+
+
+def test_list_names_a_row_whose_pack_is_not_installed(conn, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    # "Enabled but not installed" -- what a half-finished upgrade looks like
+    # from the outside, and what the DefectDojo incident actually was.
+    from secops_ingest.packs.__main__ import main
+
+    monkeypatch.setenv("SECOPS_DB_DSN", os.environ["SECOPS_TEST_DSN"])
+    pack_state.apply_ddl(conn, control_sql())
+    pack_state.set_state(conn, "knowbe4", "0.1.0", "ENABLED")
+    conn.commit()
+    try:
+        capsys.readouterr()
+        assert main(["list"]) == 0
+        out = capsys.readouterr().out
+        assert "knowbe4" in out
+        assert "not installed" in out.lower()
+    finally:
+        # Not a registered pack, so `drop`/`disable` cannot resolve it by
+        # name -- clean up the row directly so it cannot outlive this test
+        # and trip the live-database guard on a later run.
+        pack_state.delete_state(conn, "knowbe4")
+
+
+def test_list_marks_a_registered_pack_with_no_row(conn, monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    from secops_ingest.packs.__main__ import main
+
+    monkeypatch.setenv("SECOPS_DB_DSN", os.environ["SECOPS_TEST_DSN"])
+    pack_state.apply_ddl(conn, control_sql())
+    capsys.readouterr()
+    assert main(["list"]) == 0
+    assert "not enabled" in capsys.readouterr().out.lower()
+
+
+def test_list_survives_a_warehouse_with_no_control_pack_table_at_all(  # type: ignore[no-untyped-def]
+    conn, monkeypatch, capsys
+) -> None:
+    """A warehouse from before this feature has no `control.pack` at all.
+
+    The `conn` fixture already leaves things this way -- it drops `control`
+    entirely and nothing here re-creates it. A `list` that crashed on this
+    would be the worst possible regression: this is exactly the broken-install
+    case the command exists for, worse here because the "break" is simply
+    "the feature is new", not any misconfiguration.
+    """
+    from secops_ingest.packs.__main__ import main
+
+    monkeypatch.setenv("SECOPS_DB_DSN", os.environ["SECOPS_TEST_DSN"])
+    assert main(["list"]) == 0
+    out = capsys.readouterr().out
+    assert "builtin" in out
+    assert "not enabled" in out.lower()

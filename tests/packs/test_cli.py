@@ -64,6 +64,19 @@ def test_list_builtin_structure(capsys: pytest.CaptureFixture[str]) -> None:
     assert targets_line.strip() != "targets: -", "targets should not be empty"
 
 
+def test_list_says_state_is_unknown_without_a_database(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The property this task is most likely to break. `list` is the command
+    # you reach for when the install is broken; it must not need the thing
+    # that might be broken.
+    monkeypatch.delenv("SECOPS_DB_DSN", raising=False)
+    assert main(["list"]) == 0
+    out = capsys.readouterr().out
+    assert "builtin" in out
+    assert "unknown" in out.lower()
+
+
 def test_collision_duplicate_pack_exits_with_code_1(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
