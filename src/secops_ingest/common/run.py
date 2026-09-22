@@ -16,6 +16,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from ..packs.registry import discover as _discover_packs
 from ..redaction import scrub
 from . import db
 from .watermark import newer as _newer
@@ -57,9 +58,51 @@ class Result:
     error: str | None = None
 
 
+def _owning_pack(source_name: str) -> str | None:
+    """Name of the pack that registers `source_name`, or None if none does."""
+    for pack in _discover_packs().values():
+        if source_name in pack.sources:
+            return pack.name
+    return None
+
+
+def _pack_state_of(conn: Any, source_name: str) -> str | None:
+    """Return the disabling state of the pack that owns `source_name`.
+
+    None covers every case in which the run must PROCEED: no pack claims this
+    source (not this check's business -- something running outside a pack must
+    not be broken by this), `control.pack` does not exist at all (every
+    warehouse provisioned before packs had state), the pack has no stored row,
+    or the row says ENABLED. Only a stored DISABLED row returns anything, so a
+    caller only ever needs to compare the result to that one string.
+    """
+    owner = _owning_pack(source_name)
+    if owner is None:
+        return None
+
+    from ..packs import state as pack_state  # lazy: needs the 'postgres' extra
+
+    stored = pack_state.get_state(conn, owner)
+    if stored is None or stored.state != "DISABLED":
+        return None
+    return stored.state
+
+
 def execute(source: Source, *, dry_run: bool = False, batch_size: int = DEFAULT_BATCH) -> Result:
     """Run one ingest cycle. Never returns silently on failure."""
     with db.connect() as conn:
+        if _pack_state_of(conn, source.name) == "DISABLED":
+            # Deliberately before start_run: a disabled source must leave no
+            # trace in control.ingest_run, not a RUNNING row that never
+            # completes. The operator disabled this on purpose, so this exits
+            # 0 rather than failing -- a timer that fails every interval
+            # trains people to ignore alerts.
+            log.warning(
+                "pack=%s source=%s is disabled; refusing to run (writes nothing)",
+                _owning_pack(source.name), source.name,
+            )
+            return Result("DISABLED", 0, 0)
+
         run_id = 0 if dry_run else db.start_run(conn, source.name)
         read = written = 0
         high_watermark: Any = None

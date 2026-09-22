@@ -287,3 +287,26 @@ def test_disable_without_a_prior_enable_succeeds(conn, monkeypatch) -> None:  # 
         "SELECT count(*) FROM information_schema.tables WHERE table_schema LIKE 'raw_%'"
     ).fetchone()[0]
     assert raw_tables_after == raw_tables_before
+
+
+def test_worker_pack_state_of_reflects_disable_and_enable(  # type: ignore[no-untyped-def]
+    conn, monkeypatch
+) -> None:
+    """The worker's own gate (`run._pack_state_of`), against a real warehouse.
+
+    Everything above proves `control.pack` itself round-trips correctly; this
+    proves the OTHER end of the feature -- the function `execute()` actually
+    calls before every run -- agrees with it. "wazuh" is a real builtin
+    connector, so `discover()` resolves it to the "builtin" pack without any
+    mocking.
+    """
+    from secops_ingest.common.run import _pack_state_of
+    from secops_ingest.packs.__main__ import main
+
+    monkeypatch.setenv("SECOPS_DB_DSN", os.environ["SECOPS_TEST_DSN"])
+
+    assert main(["disable", "builtin"]) == 0
+    assert _pack_state_of(conn, "wazuh") == "DISABLED"
+
+    assert main(["enable", "builtin"]) == 0
+    assert _pack_state_of(conn, "wazuh") is None
