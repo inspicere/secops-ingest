@@ -683,6 +683,18 @@ INCIDENT_LIFECYCLE = Target(
     raw_table="raw_xsoar.incidents",
     fact_table="mart_fact_incident_lifecycle",
     fact_date_expr="created_at",
+    # The watermark cannot see this target's second input.
+    #
+    # raw_table is raw_xsoar.incidents, so the runner's staleness guard asks only
+    # whether XSOAR raw has moved. mart_fact_xdr_incidents changes independently:
+    # an incident whose XDR counterpart lands later, or which resolves on the XDR
+    # side after its last XSOAR modification, needs re-deriving while XSOAR raw
+    # sits untouched. The guard skips the upsert entirely in that state, so no
+    # predicate inside the upsert can recover it -- verified against PostgreSQL
+    # 16: the run recorded rows_upserted=0 and the SQL never executed.
+    #
+    # ~48k rows, sub-second. Cheap enough that correctness wins.
+    full_refresh=True,
     upsert_sql="""
         INSERT INTO mart_fact_incident_lifecycle
             (xsoar_incident_id, created_at, xdr_incident_id, xdr_created_at,
