@@ -19,7 +19,7 @@ from typing import Any
 from psycopg import sql
 
 from ..common import db
-from .base import Target
+from .base import Target, effective_since, should_skip
 
 log = logging.getLogger(__name__)
 
@@ -98,10 +98,12 @@ def execute(target: Target) -> TransformResult:
                     )
                 new_mark = row[0]
 
-            if new_mark is None or (since is not None and new_mark <= since):
+            if should_skip(target, since, new_mark):
                 log.info("target=%s nothing new since %s", target.name, since)
                 _finish(conn, run_id, "SUCCESS", 0, 0, None)
                 return TransformResult("SUCCESS")
+
+            since = effective_since(target, since)
 
             with conn.cursor() as cur:
                 cur.execute(target.upsert_sql, {"since": since})
