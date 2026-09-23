@@ -91,7 +91,12 @@ def execute(target: Target) -> TransformResult:
             )
             with conn.cursor() as cur:
                 cur.execute(raw)
-                new_mark = cur.fetchone()[0]
+                row = cur.fetchone()
+                if row is None:
+                    raise RuntimeError(
+                        f"target={target.name}: SELECT max(_ingested_at) produced no row"
+                    )
+                new_mark = row[0]
 
             if should_skip(target, since, new_mark):
                 log.info("target=%s nothing new since %s", target.name, since)
@@ -157,6 +162,10 @@ def _rebuild_rollups(conn: Any, target: Target, days: list[date]) -> None:
     one transaction so a dashboard never sees it briefly absent, and stale
     dimension combinations that no longer have rows disappear.
     """
+    # Target.__post_init__ requires rollup_table and rollup_sql to be set
+    # together, and the only caller guards on rollup_sql -- so rollup_table
+    # is guaranteed non-None here.
+    assert target.rollup_table is not None
     delete = sql.SQL("DELETE FROM {} WHERE day = ANY(%(days)s)").format(
         sql.Identifier(target.rollup_table)
     )

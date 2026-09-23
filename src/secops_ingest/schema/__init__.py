@@ -17,10 +17,14 @@ database driver.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
+
+from ..transform.base import Target
 
 __all__ = [
     "InvalidIdentifier",
     "control_sql",
+    "ddl_for_targets",
     "grants_sql",
     "mart_partition_sql",
     "partitions_sql",
@@ -108,6 +112,28 @@ CREATE TABLE IF NOT EXISTS control.transform_coverage (
     fact_rows    bigint NOT NULL,
     completed_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (target, period)
+);
+
+-- Which packs are installed and whether they may run.
+--
+-- The row outlives the distribution deliberately. `pip uninstall` of a pack
+-- leaves this row behind, and `pack list` reports the result as "enabled but
+-- not installed" -- a real state, and the one the DefectDojo incident looked
+-- like from the outside: a host pinned to a ref while running a copy that
+-- predated the connector, failing as "unknown source" and blaming the
+-- connector rather than the install.
+--
+-- `version` is what makes a silent no-op upgrade visible. The package version
+-- stays 0.1.0 across refs, so `pip install --upgrade` can resolve to nothing,
+-- exit 0, and report success; comparing this column to the installed pack's
+-- version is how that is caught.
+CREATE TABLE IF NOT EXISTS control.pack (
+    name        text PRIMARY KEY,
+    version     text        NOT NULL,
+    state       text        NOT NULL
+                CHECK (state IN ('ENABLED','DISABLED')),
+    enabled_at  timestamptz,
+    disabled_at timestamptz
 );
 """
 
@@ -237,6 +263,52 @@ def mart_partition_sql(table: str, *, behind: int = 1, ahead: int = 3) -> str:
     if ahead < 1:
         raise ValueError("ahead must be >= 1, or the current month is the last one created")
     return _partition_do_block(table, table, behind, ahead)
+
+
+def ddl_for_targets(
+    targets: Sequence[Target],
+    *,
+    behind: int = 1,
+    ahead: int = 3,
+    gin_index: bool = False,
+) -> str:
+    """DDL for a set of transform targets: raw table, partitions, facts, rollup.
+
+    This is the one place that decides what a target's DDL looks like. The
+    emitter (`schema/__main__.py`) and `pack enable` both call it, so they
+    cannot drift into applying different DDL for the same target -- a drift
+    that would only surface as a table present in one's output and absent from
+    the other's.
+
+    Raises:
+        ValueError: a target's raw_table is not schema-qualified.
+    """
+    out: list[str] = []
+    for t in targets:
+        schema, _, table = t.raw_table.partition(".")
+        if not table:
+            raise ValueError(f"target {t.name}: raw_table {t.raw_table!r} is not schema-qualified")
+
+        out.append(f"-- raw landing table\n{raw_table_sql(schema, table, gin_index=gin_index)}")
+        out.append(
+            f"-- monthly partitions for {t.raw_table}\n"
+            + partitions_sql(schema, table, behind=behind, ahead=ahead)
+        )
+
+        if t.fact_ddl:
+            out.append(f"-- reporting facts\n{t.fact_ddl.strip()}\n")
+            # Only partition what declares itself partitioned; a DO block against
+            # an unpartitioned table fails, and would fail on every deploy.
+            if "PARTITION BY RANGE" in t.fact_ddl:
+                out.append(
+                    f"-- monthly partitions for {t.fact_table}\n"
+                    + mart_partition_sql(t.fact_table, behind=behind, ahead=ahead)
+                )
+
+        if t.rollup_ddl:
+            out.append(f"-- daily rollup\n{t.rollup_ddl.strip()}\n")
+
+    return "\n".join(out)
 
 
 def grants_sql(

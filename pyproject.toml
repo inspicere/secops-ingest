@@ -40,13 +40,20 @@ pythonpath = ["src"]
 line-length = 100
 target-version = "py311"
 
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
 [tool.mypy]
 python_version = "3.11"
 strict = true
 
 # Optional backends and drivers. They are deliberately absent from the default
 # dev environment: the package must type-check without them for the same reason
-# it must import without them.
+# it must import without them. Absent, mypy treats them as untyped (Any), which
+# hides real errors against their actual stubs -- e.g. a fetchone() result used
+# without a None check. CI therefore also runs mypy with every extra installed
+# (see .github/workflows/ci.yml); that run is the one that catches those, so
+# this override must stay narrow enough not to swallow them there too.
 [[tool.mypy.overrides]]
 module = ["psycopg.*", "httpx", "hvac", "delinea.*"]
 ignore_missing_imports = true

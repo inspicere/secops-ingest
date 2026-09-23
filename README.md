@@ -225,7 +225,28 @@ distribution that installs and versions independently. Register one with:
     [project.entry-points."secops_ingest.packs"]
     knowbe4 = "secops_pack_knowbe4:PACK"
 
-`python -m secops_ingest.packs list` shows what the current environment can see.
+`python -m secops_ingest.packs list` shows what the current environment can see. It needs
+neither `psycopg` nor `SECOPS_DB_DSN` -- with either missing it just reports state as unknown --
+which is deliberate: it is the command you reach for when the install might be broken.
+
+The other verbs manage a pack's lifecycle in the warehouse, and all three need `SECOPS_DB_DSN`
+and the `postgres` extra:
+
+    python -m secops_ingest.packs enable knowbe4    # create its tables, mark it ENABLED
+    python -m secops_ingest.packs disable knowbe4   # stop its connectors; tables are untouched
+    python -m secops_ingest.packs drop knowbe4 --yes-destroy-data   # destroy its tables and history
+
+`enable` and `disable` are both safe to re-run: `enable` is idempotent DDL, and `disable` just
+converges the pack's stored state to `DISABLED`, whether or not it was ever enabled.
+
+`drop` is the one irreversible verb -- "disable, never drop" is the rule everywhere else. It
+requires the pack to already be `disable`d: a still-`ENABLED` pack has a timer that could fire at
+any moment, and dropping its tables out from under a running connector is exactly the failure
+mode `disable` exists to prevent. It also refuses without `--yes-destroy-data`, printing what it
+*would* destroy -- table names and row counts -- so a converge log always shows how much was on
+the line, and a script that ignores the exit code cannot mistake that refusal for a completed
+drop. The pack's row in the warehouse is left behind afterwards, still `DISABLED`, rather than
+deleted -- deleting it would make a surviving timer stop refusing to run.
 
 The module exposing `PACK` must import cheaply -- connector dependencies are
 imported only when a source runs, which is why `Pack.sources` holds

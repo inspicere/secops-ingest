@@ -131,6 +131,25 @@ def test_control_is_idempotent() -> None:
     assert "CREATE TABLE control." not in control_sql()
 
 
+def test_control_sql_creates_the_pack_table() -> None:
+    sql = control_sql()
+    assert "CREATE TABLE IF NOT EXISTS control.pack" in sql
+
+
+def test_pack_state_is_constrained_to_two_values() -> None:
+    # A free-text state column drifts: 'disabled', 'DISABLED' and 'off' all
+    # arrive eventually, and the worker's refusal check then silently misses.
+    sql = control_sql()
+    assert "CHECK (state IN ('ENABLED','DISABLED'))" in sql
+
+
+def test_pack_table_is_idempotent_like_the_rest_of_control() -> None:
+    sql = control_sql()
+    assert "CREATE TABLE IF NOT EXISTS control.pack" in sql
+    pack_block = sql[sql.index("CREATE TABLE IF NOT EXISTS control.pack") :]
+    assert "DROP" not in pack_block
+
+
 # -- targets carry their own DDL ----------------------------------------------
 
 
@@ -206,7 +225,9 @@ def test_mart_partitions_emitted_only_for_partitioned_facts(
 
 
 def g(**kw: object) -> str:
-    return grants_sql(["raw_wazuh"], ["mart_fact_wazuh_alerts", "mart_rollup_wazuh_daily"], **kw)  # type: ignore[arg-type]
+    return grants_sql(  # type: ignore[arg-type]
+        ["raw_wazuh"], ["mart_fact_wazuh_alerts", "mart_rollup_wazuh_daily"], **kw
+    )
 
 
 def test_no_roles_means_no_grants() -> None:

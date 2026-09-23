@@ -82,7 +82,11 @@ def main(argv: list[str] | None = None) -> int:
         "done status=%s read=%s written=%s",
         result.status, result.rows_read, result.rows_written,
     )
-    return 0
+    # DISABLED is a deliberate operator choice and exits 0, same as SUCCESS, so
+    # a timer firing against it never trains anyone to ignore alerts. AMBIGUOUS
+    # is a misconfiguration nobody chose -- two packs collide on a bare source
+    # name -- so it exits non-zero and stays noisy until someone fixes it.
+    return 1 if result.status == "AMBIGUOUS" else 0
 
 
 if __name__ == "__main__":
