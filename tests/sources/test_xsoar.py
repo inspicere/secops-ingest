@@ -9,6 +9,7 @@ synthetic.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -160,3 +161,38 @@ def test_authenticate_resolves_the_secret_and_returns_standard_headers(
     # Advanced auth 401s on these tenants; sending its fields is a regression.
     assert "x-xdr-nonce" not in headers
     assert "x-xdr-timestamp" not in headers
+
+
+FROZEN = datetime(2026, 10, 8, 12, 0, 0, tzinfo=UTC)
+
+
+def test_an_empty_watermark_starts_at_the_bounded_horizon_not_the_beginning(
+    source: XsoarSource,
+) -> None:
+    """The live tenant holds incidents back to 2022-04-11.
+
+    Without a floor, the first run asked for the whole collection and died
+    landing its first row: CheckViolation, no partition of relation "incidents"
+    for _event_time 2022-04-11. The warehouse partitions a five-month window on
+    purpose, so "no watermark" must not mean "everything ever".
+    """
+    source._now = lambda: FROZEN  # type: ignore[method-assign]
+    rec = Recorder([[]])
+    source._post = rec  # type: ignore[method-assign]
+    list(source.fetch({}, None))
+    expected = (FROZEN - timedelta(days=xsoar_mod.DEFAULT_BACKFILL_DAYS)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    assert rec.bodies[0]["filter"]["fromDate"] == expected
+
+
+def test_an_explicit_cursor_is_used_verbatim_and_not_floored(
+    source: XsoarSource,
+) -> None:
+    """The floor applies to the FIRST run only. Flooring a real watermark would
+    re-read the whole horizon every run, and on a feed this size that is the
+    difference between a 30-second run and a quarter of history."""
+    source._now = lambda: FROZEN  # type: ignore[method-assign]
+    rec = Recorder([[]])
+    source._post = rec  # type: ignore[method-assign]
+    list(source.fetch({}, "2026-10-01T00:00:00Z"))
+    assert rec.bodies[0]["filter"]["fromDate"] == "2026-10-01T00:00:00Z"

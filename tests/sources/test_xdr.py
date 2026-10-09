@@ -102,14 +102,34 @@ def test_the_window_is_bounded_at_both_ends(source: XdrSource) -> None:
     assert set(bounds(rec.bodies[0])) == {"gte", "lte"}
 
 
-def test_only_the_upper_bound_is_sent_without_a_cursor(source: XdrSource) -> None:
-    """A first run is unbounded below on purpose -- it is a backfill -- but it
-    is the longest scan there is, so it needs the upper bound most."""
+def test_a_first_run_is_bounded_at_both_ends(source: XdrSource) -> None:
+    """REVERSES an earlier deliberate choice, so the reason is recorded here.
+
+    This test used to assert the opposite -- that a first run sends only the
+    upper bound, "unbounded below on purpose -- it is a backfill". That reading
+    is defensible in isolation and incompatible with the warehouse, which
+    partitions a five-month window just as deliberately. The sibling XSOAR
+    connector proved which way the conflict falls: against a live tenant holding
+    incidents back to 2022-04-11, an unbounded first run authenticated, paged
+    happily, and then died landing its first row with
+
+        CheckViolation: no partition of relation "incidents" found for row
+        DETAIL: ... (_event_time) = (2022-04-11 20:40:28.713+00)
+
+    So the floor is not a preference, it is what makes a first run land at all.
+    xdr_alerts already bounded itself this way; incidents inherited the
+    watermark but not the horizon.
+
+    The upper bound still matters most on a first run, and is still asserted.
+    """
     rec = Recorder([[]], total=0)
     source._post = rec  # type: ignore[method-assign]
     source._now_ms = lambda: 1_789_999_999_999  # type: ignore[method-assign]
     list(source.fetch({}, None))
-    assert bounds(rec.bodies[0]) == {"lte": 1_789_999_999_999}
+    assert bounds(rec.bodies[0]) == {
+        "gte": 1_789_999_999_999 - xdr_mod.DEFAULT_BACKFILL_DAYS * 86_400_000,
+        "lte": 1_789_999_999_999,
+    }
 
 
 def test_the_upper_bound_is_pinned_once_for_the_whole_run(source: XdrSource) -> None:
@@ -192,3 +212,34 @@ def test_authenticate_resolves_the_secret_and_returns_standard_headers(
     # Ensure no nonce or timestamp headers
     assert "x-xdr-nonce" not in headers
     assert "x-xdr-timestamp" not in headers
+
+
+FROZEN_MS = 1_791_547_200_000
+
+
+def test_an_empty_watermark_starts_at_the_bounded_horizon_not_the_beginning(
+    source: XdrSource,
+) -> None:
+    """Same failure mode as xsoar: no floor meant the first run asked for the
+    whole collection, and the warehouse partitions a five-month window."""
+    source._now_ms = lambda: FROZEN_MS  # type: ignore[method-assign]
+    rec = Recorder([[]], 0)
+    source._post = rec  # type: ignore[method-assign]
+    list(source.fetch({}, None))
+    filters = rec.bodies[0]["request_data"]["filters"]
+    gte = [f for f in filters if f.get("operator") == "gte"]
+    expected = FROZEN_MS - xdr_mod.DEFAULT_BACKFILL_DAYS * 86_400_000
+    assert gte == [{"field": "modification_time", "operator": "gte",
+                    "value": expected}]
+
+
+def test_an_explicit_cursor_is_used_verbatim_and_not_floored(
+    source: XdrSource,
+) -> None:
+    source._now_ms = lambda: FROZEN_MS  # type: ignore[method-assign]
+    rec = Recorder([[]], 0)
+    source._post = rec  # type: ignore[method-assign]
+    list(source.fetch({}, "1791000000000"))
+    gte = [f for f in rec.bodies[0]["request_data"]["filters"]
+           if f.get("operator") == "gte"]
+    assert gte[0]["value"] == 1_791_000_000_000

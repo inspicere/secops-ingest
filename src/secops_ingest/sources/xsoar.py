@@ -29,6 +29,7 @@ Configuration:
 
     SECOPS_XSOAR_SECRET      secret name to resolve (default xsoar)
     SECOPS_XSOAR_PAGE_SIZE   incidents per request  (default 100)
+    SECOPS_XSOAR_BACKFILL_DAYS  horizon on first run (default 90)
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ import logging
 import os
 import time
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from functools import partial
 from typing import Any
 
@@ -49,6 +50,16 @@ log = logging.getLogger(__name__)
 
 API_PATH = "/xsoar/public/v1"
 SEARCH = "/incidents/search"
+
+# How far back the FIRST run reaches. After that the watermark governs, so this
+# bounds one run, not every run.
+#
+# It exists because the live tenant holds incidents back to 2022-04-11 while the
+# warehouse partitions a five-month window: the first real run asked for the
+# whole collection and died landing its first row with "no partition of relation
+# incidents found for row ... 2022-04-11". Matching xdr_alerts' default of 90
+# keeps the three Cortex connectors answering the same question the same way.
+DEFAULT_BACKFILL_DAYS = 90
 
 #: Deliberately far below the maximum the API accepts. Measured page timings on
 #: this tenant: 100 rows 5.3s, 500 rows 9.6s, 1000 rows 16.5s. The failure mode
@@ -65,6 +76,8 @@ class XsoarSource:
     def __init__(self) -> None:
         self.secret = os.environ.get("SECOPS_XSOAR_SECRET", "xsoar")
         self.page_size = env_int("SECOPS_XSOAR_PAGE_SIZE", DEFAULT_PAGE_SIZE)
+        self.backfill_days = env_int("SECOPS_XSOAR_BACKFILL_DAYS",
+                                     DEFAULT_BACKFILL_DAYS)
 
     # -- credentials --------------------------------------------------------
 
@@ -84,7 +97,9 @@ class XsoarSource:
         upsert -- and skipping is data loss, so the bound exists to make the
         error fall on the harmless side.
         """
-        to_date = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now = self._now()
+        to_date = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        from_date = str(cursor) if cursor else self._horizon(now)
         page = 0
         while True:
             body: dict[str, Any] = {
@@ -97,8 +112,9 @@ class XsoarSource:
                     "toDate": to_date,
                 }
             }
-            if cursor:
-                body["filter"]["fromDate"] = str(cursor)
+            # Always set, now. Omitting it on a first run means "the whole
+            # collection", which is the bug this floor fixes.
+            body["filter"]["fromDate"] = from_date
 
             started = time.monotonic()
             # partial, not a lambda: a lambda would close over the loop variable.
@@ -112,6 +128,17 @@ class XsoarSource:
             if len(rows) < self.page_size:
                 return
             page += 1
+
+    def _now(self) -> datetime:
+        """Separated so tests can freeze the clock, as xdr_alerts does."""
+        return datetime.now(UTC)
+
+    def _horizon(self, now: datetime) -> str:
+        """The bounded start for a run with no watermark."""
+        floor = now - timedelta(days=self.backfill_days)
+        log.info("no watermark: starting at the bounded horizon of %d day(s), "
+                 "not at the beginning of the collection", self.backfill_days)
+        return floor.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def _post(self, creds: Any, body: dict[str, Any]) -> dict[str, Any]:
         """One search call. Separated so tests can drive fetch() offline."""
