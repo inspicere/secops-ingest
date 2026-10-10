@@ -334,7 +334,11 @@ XSOAR_INCIDENTS = Target(
             -- Integers, not strings: status 2 is closed. The original runbook
             -- read these as text and would have rendered "2" on a dashboard.
             (payload->>'status')::int,
-            (payload->>'severity')::int,
+            -- numeric, not int. XSOAR severity is a FRACTIONAL scale:
+            -- 0 unknown, 0.5 informational, 1 low, 2 medium, 3 high,
+            -- 4 critical. ::int raises InvalidTextRepresentation on the first
+            -- informational incident.
+            (payload->>'severity')::numeric,
             payload->>'owner',
             payload->>'type',
             payload->>'sourceBrand',
@@ -371,7 +375,7 @@ XSOAR_INCIDENTS = Target(
             modified_at     timestamptz,
             closed_at       timestamptz,
             status          integer,
-            severity        integer,
+            severity        numeric,
             owner           text,
             incident_type   text,
             source_brand    text,
@@ -708,7 +712,11 @@ INCIDENT_LIFECYCLE = Target(
             d.resolved_at,
             NULLIF(NULLIF(x.payload->>'closed', ''), '0001-01-01T00:00:00Z')::timestamptz,
             (x.payload->>'status')::int,
-            (x.payload->>'severity')::int,
+            -- numeric, not int. XSOAR severity is a FRACTIONAL scale:
+            -- 0 unknown, 0.5 informational, 1 low, 2 medium, 3 high,
+            -- 4 critical. ::int raises InvalidTextRepresentation on the first
+            -- informational incident.
+            (x.payload->>'severity')::numeric,
             x.payload->>'sourceBrand',
             x.payload->>'type',
             d.alert_count,
@@ -764,7 +772,7 @@ INCIDENT_LIFECYCLE = Target(
             xdr_resolved_at   timestamptz,
             closed_at         timestamptz,
             status            integer,
-            severity          integer,
+            severity          numeric,
             source_brand      text,
             incident_type     text,
             alert_count       integer,

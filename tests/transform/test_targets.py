@@ -373,11 +373,21 @@ def test_xsoar_target_guards_the_open_incident_sentinel() -> None:
     assert "'0001-01-01T00:00:00Z'" in sql  # Go zero time guard
 
 
-def test_xsoar_target_reads_status_and_severity_as_integers() -> None:
-    """Measured: status and severity are ints (status=2 for closed), not the
-    strings the original runbook assumed."""
+def test_xsoar_target_reads_status_as_int_and_severity_as_numeric() -> None:
+    """status IS an int (2 for closed), and severity is NOT.
+
+    This test previously asserted both were ints, from a measurement that was
+    right about status and incomplete about severity: the sample it was taken
+    from evidently contained no informational incident. XSOAR severity is a
+    fractional scale -- 0 unknown, 0.5 informational, 1 low, 2 medium, 3 high,
+    4 critical -- so ::int raises InvalidTextRepresentation on the first 0.5,
+    which is what the live tenant produced once the connector could land rows.
+
+    The string assumption the original runbook made was still wrong; that half
+    of the finding stands.
+    """
     assert "(payload->>'status')::int" in XSOAR_INCIDENTS.upsert_sql
-    assert "(payload->>'severity')::int" in XSOAR_INCIDENTS.upsert_sql
+    assert "(payload->>'severity')::numeric" in XSOAR_INCIDENTS.upsert_sql
 
 
 def test_xsoar_upsert_refreshes_the_join_key_it_is_indexed_on() -> None:
@@ -601,3 +611,30 @@ def test_lifecycle_filters_on_the_anchor_tables_ingested_at() -> None:
     """
     assert INCIDENT_LIFECYCLE.raw_table == "raw_xsoar.incidents"
     assert "x._ingested_at > %(since)s::timestamptz" in INCIDENT_LIFECYCLE.upsert_sql
+
+
+def test_xsoar_severity_is_not_cast_to_an_integer() -> None:
+    """XSOAR severity is a FRACTIONAL scale, not an ordinal one.
+
+    0 unknown, 0.5 informational, 1 low, 2 medium, 3 high, 4 critical. Casting
+    it to int therefore fails on the first informational incident -- which is
+    exactly how this was found, against the live tenant, after the connector had
+    already landed 5,750 rows:
+
+        psycopg.errors.InvalidTextRepresentation:
+          invalid input syntax for type integer: "0.5"
+
+    Both targets are checked because incident_lifecycle reads the same field out
+    of the same raw payload, and it failed identically. The transform had never
+    run against real data, so a type that is wrong for a documented vendor scale
+    survived every review of the SQL.
+    """
+    for name in ("xsoar_incidents", "incident_lifecycle"):
+        t = TARGETS[name]
+        assert not re.search(r"severity'\)::int\b", t.upsert_sql), (
+            f"{name} casts XSOAR severity to int; 0.5 is a valid severity")
+        if t.fact_ddl:
+            assert not re.search(r"\bseverity\s+integer\b", t.fact_ddl), (
+                f"{name} declares severity as integer; 0.5 does not fit")
+            assert re.search(r"\bseverity\s+numeric\b", t.fact_ddl), (
+                f"{name} should declare severity numeric")
