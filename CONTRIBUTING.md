@@ -20,10 +20,22 @@ mypy src
 pytest -q
 ```
 
-CI runs exactly these, plus a check that core still imports with **no** optional dependency
-installed. That last one is the one people trip over: if you add a top-level import of an
-optional package anywhere in the core path, a default install stops working and the project's
-central claim stops being true.
+CI runs exactly these, plus four more jobs:
+
+- **Core imports with no third-party dependency installed.** This is the one people trip over:
+  if you add a top-level import of an optional package anywhere in the core path, a default
+  install stops working and the project's central claim stops being true.
+- **`mypy` again with every extra installed** (`dev,http,postgres,vault,delinea`). The run
+  above types `psycopg`, `hvac` and the Delinea SDK as `Any` — see the override comment in
+  `pyproject.toml` — so it reports nothing at all about database code. This job is the one
+  that does. It exists because a clean `mypy src` turned out to be clean only because no
+  driver was installed; installing one produced three errors.
+- **Two integration jobs** the local commands skip: the Vault provider against a live
+  OpenBao, and pack state against a real PostgreSQL. Both skip locally unless their env var
+  is set.
+
+`ruff` selects `E,F,W,I`, which is what makes `line-length = 100` enforced. Until those rules
+were selected nothing ran `E501` and the setting was decorative.
 
 ## Tests
 
