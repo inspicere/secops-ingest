@@ -145,7 +145,7 @@ class XsoarSource:
         import httpx
 
         resp = httpx.post(f"{self._creds.base}{SEARCH}", json=body,
-                          headers=creds, timeout=90.0)
+                          headers=headers(self._creds), timeout=90.0)
         resp.raise_for_status()
         return dict(resp.json())
 

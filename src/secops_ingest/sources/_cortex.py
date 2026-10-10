@@ -14,8 +14,25 @@ tenants on 2026-09-14:
 
     401  standard  without x-xdr-auth-id
     401  advanced  without x-xdr-auth-id
-    200  standard  WITH x-xdr-auth-id      <- both tenants
-    401  advanced  WITH x-xdr-auth-id      <- these tenants issue Standard keys
+    200  standard  WITH x-xdr-auth-id      <- both tenants, at that time
+    401  advanced  WITH x-xdr-auth-id      <- see the correction below
+
+BOTH MODES ARE SUPPORTED, selected per vendor by SECOPS_<VENDOR>_AUTH_MODE.
+
+The fourth line above was read as "these tenants issue Standard keys". That
+inference does not follow: sending Advanced headers with a STANDARD key returns
+401 too, so the experiment could not tell a tenant refusing Advanced from a key
+that was simply not an Advanced one. It was also overtaken -- on 2026-10-08 the
+XDR tenant returned 401 to Standard auth on all three of its connectors while
+XSOAR kept working, because that key had become an Advanced key.
+
+An Advanced key is never sent. Authorization carries
+
+    sha256(api_key + nonce + timestamp)
+
+with the nonce and the millisecond timestamp alongside it, and `x-xdr-auth-id`
+is required in both modes -- which is the one thing the original measurement
+established beyond doubt.
 
 The id is not handed over when the key is copied; it is the ID column of the
 console's API Keys table, which is why it can appear not to exist at all.
@@ -28,7 +45,10 @@ with an old id.
 
 from __future__ import annotations
 
+import hashlib
 import os
+import secrets
+import time
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -56,6 +76,10 @@ class CortexCreds:
     key: str
     key_id: str
     base: str
+    # "standard" or "advanced". Carried on the credential rather than read from
+    # the environment inside headers(), so the mode is resolved once, validated
+    # once, and travels with the key it describes.
+    auth_mode: str = "standard"
 
 
 def resolve(secret: str, path: str) -> CortexCreds:
@@ -92,16 +116,52 @@ def resolve(secret: str, path: str) -> CortexCreds:
     # verbatim into any traceback that happens to carry the dataclass.
     register_secret(host)
 
+    # Keyed on the SECRET name, not the connector name, so the three XDR
+    # connectors -- which all resolve the "xdr" secret -- inherit one setting.
+    # A key is Standard or Advanced as a property of the key itself; having to
+    # set it per connector would let them disagree about the same credential.
+    var = f"SECOPS_{secret.upper().replace('-', '_').replace('.', '_')}_AUTH_MODE"
+    mode = (os.environ.get(var) or "standard").strip()
+    if mode not in ("standard", "advanced"):
+        # Refused rather than defaulted. Falling back to Standard on a typo
+        # 401s against an Advanced tenant and is indistinguishable from a bad
+        # credential, which is a long way to travel for a misspelling.
+        raise ValueError(
+            f"{var} must be 'standard' or 'advanced', got {mode!r}")
+
     return CortexCreds(key=key, key_id=key_id,
-                       base=f"{parts.scheme or 'https'}://{host}{path}")
+                       base=f"{parts.scheme or 'https'}://{host}{path}",
+                       auth_mode=mode)
 
 
 def headers(creds: CortexCreds) -> dict[str, str]:
-    """Standard-key headers. Regenerating per request is unnecessary here.
+    """Build the auth headers for one request.
 
-    Unlike Advanced auth there is no nonce or timestamp, so these are constant
-    for the life of a run and safe to build once.
+    CALL THIS PER REQUEST, not once per run. In Standard mode the result is
+    constant and the call is free, but an Advanced signature carries a nonce and
+    a timestamp: one nonce reused across a run is a replay, and one timestamp
+    goes stale. A 90-day alerts backfill is thousands of requests over a long
+    run, so "build it once in authenticate()" is correct for Standard and wrong
+    for Advanced.
     """
+    if creds.auth_mode == "advanced":
+        # 64 characters, which is what the console's own examples use.
+        nonce = secrets.token_hex(32)
+        # MILLISECONDS. Seconds is ~1000x too small, reads as wildly stale, and
+        # is rejected as a replay rather than as a bad key -- so the symptom
+        # points at the credential instead of at the clock.
+        timestamp = str(int(time.time() * 1000))
+        signature = hashlib.sha256(
+            f"{creds.key}{nonce}{timestamp}".encode()).hexdigest()
+        return {
+            # The key itself never goes on the wire in this mode.
+            "Authorization": signature,
+            "x-xdr-auth-id": creds.key_id,
+            "x-xdr-nonce": nonce,
+            "x-xdr-timestamp": timestamp,
+            "Content-Type": "application/json",
+        }
+
     return {
         "Authorization": creds.key,
         "x-xdr-auth-id": creds.key_id,
