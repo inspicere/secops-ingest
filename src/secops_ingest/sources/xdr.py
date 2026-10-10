@@ -20,6 +20,7 @@ Configuration:
 
     SECOPS_XDR_SECRET      secret name to resolve (default xdr)
     SECOPS_XDR_PAGE_SIZE   incidents per request  (default 100, hard cap 100)
+    SECOPS_XDR_BACKFILL_DAYS  horizon on first run (default 90)
 """
 
 from __future__ import annotations
@@ -46,6 +47,15 @@ INCIDENTS = "/incidents/get_incidents/"
 #: not fail gracefully by truncating, it fails the request.
 PAGE_CAP = 100
 
+# How far back the FIRST run reaches; the watermark governs every run after it.
+#
+# Without it a first run asked for the whole collection, and the sibling XSOAR
+# connector proved what that costs: the live tenant holds incidents back to
+# 2022-04-11 while the warehouse partitions a five-month window, so landing died
+# on "no partition of relation incidents found for row". Same default as
+# xdr_alerts so the Cortex connectors all answer this the same way.
+DEFAULT_BACKFILL_DAYS = 90
+
 
 class XdrSource:
     name = "xdr"
@@ -57,6 +67,8 @@ class XdrSource:
         # throughput, and failing their deploy over it helps nobody. The cap is
         # the API's, not a preference.
         self.page_size = min(env_int("SECOPS_XDR_PAGE_SIZE", PAGE_CAP), PAGE_CAP)
+        self.backfill_days = env_int("SECOPS_XDR_BACKFILL_DAYS",
+                                     DEFAULT_BACKFILL_DAYS)
 
     # -- credentials --------------------------------------------------------
 
@@ -95,11 +107,23 @@ class XdrSource:
         tenant on 2026-09-14.
         """
         filters: list[dict[str, Any]] = []
+        now_ms = self._now_ms()
         if cursor:
             filters.append({"field": "modification_time", "operator": "gte",
                             "value": int(cursor)})
+        else:
+            # A first run is bounded, not unlimited. "No watermark" previously
+            # meant "every incident the tenant has ever held".
+            floor = now_ms - self.backfill_days * 86_400_000
+            log.info("no watermark: starting at the bounded horizon of %d "
+                     "day(s), not at the beginning of the collection",
+                     self.backfill_days)
+            filters.append({"field": "modification_time", "operator": "gte",
+                            "value": floor})
+        # The same instant as the floor above, so a first run's window is
+        # exactly backfill_days wide rather than a hair more.
         filters.append({"field": "modification_time", "operator": "lte",
-                        "value": self._now_ms()})
+                        "value": now_ms})
 
         frm = 0
         while True:
