@@ -334,7 +334,7 @@ XSOAR_INCIDENTS = Target(
             -- Integers, not strings: status 2 is closed. The original runbook
             -- read these as text and would have rendered "2" on a dashboard.
             (payload->>'status')::int,
-            (payload->>'severity')::int,
+            (payload->>'severity')::numeric,
             payload->>'owner',
             payload->>'type',
             payload->>'sourceBrand',
@@ -371,7 +371,15 @@ XSOAR_INCIDENTS = Target(
             modified_at     timestamptz,
             closed_at       timestamptz,
             status          integer,
-            severity        integer,
+            -- numeric, NOT integer. XSOAR severity is FRACTIONAL: measured
+            -- domain on a live instance over 5,766 incidents is
+            -- 0, 0.5, 1, 2, 3, 4 -- where 0.5 is Informational, 131 of them.
+            -- An integer cast aborts the whole upsert with
+            -- "invalid input syntax for type integer: 0.5", which fails this
+            -- target AND incident_lifecycle, leaving both marts empty.
+            -- Unconstrained on purpose: a numeric(2,1) would reintroduce the
+            -- same class of failure the first time XSOAR emits something wider.
+            severity        numeric,
             owner           text,
             incident_type   text,
             source_brand    text,
@@ -708,7 +716,7 @@ INCIDENT_LIFECYCLE = Target(
             d.resolved_at,
             NULLIF(NULLIF(x.payload->>'closed', ''), '0001-01-01T00:00:00Z')::timestamptz,
             (x.payload->>'status')::int,
-            (x.payload->>'severity')::int,
+            (x.payload->>'severity')::numeric,
             x.payload->>'sourceBrand',
             x.payload->>'type',
             d.alert_count,
@@ -764,7 +772,9 @@ INCIDENT_LIFECYCLE = Target(
             xdr_resolved_at   timestamptz,
             closed_at         timestamptz,
             status            integer,
-            severity          integer,
+            -- numeric, not integer -- see mart_fact_xsoar_incidents above.
+            -- XSOAR severity includes 0.5 (Informational).
+            severity          numeric,
             source_brand      text,
             incident_type     text,
             alert_count       integer,
