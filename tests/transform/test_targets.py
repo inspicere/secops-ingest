@@ -377,7 +377,8 @@ def test_xsoar_target_reads_status_and_severity_as_integers() -> None:
     """Measured: status and severity are ints (status=2 for closed), not the
     strings the original runbook assumed."""
     assert "(payload->>'status')::int" in XSOAR_INCIDENTS.upsert_sql
-    assert "(payload->>'severity')::int" in XSOAR_INCIDENTS.upsert_sql
+    # severity is NOT an int: see test_xsoar_severity_is_cast_as_numeric.
+    assert "(payload->>'severity')::numeric" in XSOAR_INCIDENTS.upsert_sql
 
 
 def test_xsoar_upsert_refreshes_the_join_key_it_is_indexed_on() -> None:
@@ -601,3 +602,47 @@ def test_lifecycle_filters_on_the_anchor_tables_ingested_at() -> None:
     """
     assert INCIDENT_LIFECYCLE.raw_table == "raw_xsoar.incidents"
     assert "x._ingested_at > %(since)s::timestamptz" in INCIDENT_LIFECYCLE.upsert_sql
+
+
+# -- XSOAR severity is fractional --------------------------------------------
+#
+# Found in production, not here: both XSOAR-sourced transforms failed every run
+# with `invalid input syntax for type integer: "0.5"`, leaving
+# mart_fact_xsoar_incidents and mart_fact_incident_lifecycle empty while the
+# connector ingested 5,766 rows perfectly well.
+#
+# The offline suite could not have caught it. Its fixtures use severity 3,
+# because the recon that informed them sampled three incidents and saw 2 and 3.
+# The measured domain over the full 5,766 is 0, 0.5, 1, 2, 3, 4 -- 131 of them
+# at 0.5, which XSOAR calls Informational.
+
+
+def test_xsoar_severity_is_cast_as_numeric_not_integer() -> None:
+    """0.5 is a real XSOAR severity. ::int on it aborts the whole statement."""
+    assert "(payload->>'severity')::numeric" in XSOAR_INCIDENTS.upsert_sql
+    assert "(payload->>'severity')::int" not in XSOAR_INCIDENTS.upsert_sql
+
+
+def test_lifecycle_severity_is_cast_as_numeric_not_integer() -> None:
+    """The lifecycle target reads the same payload field, so it fails the same
+    way -- and did, taking the flagship mart table down with it."""
+    assert "(x.payload->>'severity')::numeric" in INCIDENT_LIFECYCLE.upsert_sql
+    assert "(x.payload->>'severity')::int" not in INCIDENT_LIFECYCLE.upsert_sql
+
+
+def test_xsoar_severity_columns_are_numeric() -> None:
+    """A numeric cast into an integer column fails just as hard, one layer down."""
+    for target in (XSOAR_INCIDENTS, INCIDENT_LIFECYCLE):
+        ddl = target.fact_ddl or ""
+        assert "severity" in ddl
+        severity_line = next(line for line in ddl.splitlines()
+                             if line.strip().startswith("severity"))
+        assert "numeric" in severity_line, (
+            f"{target.name}: severity column is {severity_line.strip()!r}, "
+            "but XSOAR emits 0.5")
+
+
+def test_xsoar_status_stays_integer() -> None:
+    """status is genuinely integral -- measured domain is 1 and 2 -- so this is
+    not a blanket 'cast everything to numeric' change."""
+    assert "(payload->>'status')::int" in XSOAR_INCIDENTS.upsert_sql
