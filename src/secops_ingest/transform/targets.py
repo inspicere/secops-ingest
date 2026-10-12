@@ -643,8 +643,11 @@ XDR_ENDPOINTS = Target(
 #: and the loss would look like a smaller, tidier dataset rather than an error.
 #:
 #: UNMATCHED ROWS ARE EXPECTED AND ARE TWO DIFFERENT THINGS. Roughly 10.5% of
-#: XSOAR incidents did not come from XDR at all (other feeds, and a manual
-#: source); separately, XDR-sourced incidents whose XDR record has aged out
+#: XSOAR incidents did not come from XDR at all -- measured on the live
+#: warehouse, that is ZeroFox (187, brand protection) and a manual source (15),
+#: identified by `sourceBrand` and NOT by whether `dbotMirrorId` is set, which
+#: every mirroring integration populates; separately, XDR-sourced incidents
+#: whose XDR record has aged out
 #: carry an id that no longer resolves. Collapsing those into one "unmatched"
 #: bucket turns a data-availability gap into an apparent business fact, so
 #: join_status keeps them apart on the dashboard. A third unmatched population,
@@ -720,9 +723,35 @@ INCIDENT_LIFECYCLE = Target(
             x.payload->>'sourceBrand',
             x.payload->>'type',
             d.alert_count,
+            -- CLASSIFY ON sourceBrand, NOT ON WHETHER dbotMirrorId IS SET.
+            --
+            -- This test used to be `dbotMirrorId = ''`, which encodes "has a
+            -- mirror id" as "came from XDR". XSOAR sets dbotMirrorId for ANY
+            -- mirroring integration, so every ZeroFox incident -- a different
+            -- product, with its own nine-digit id space -- fell through to
+            -- 'pending_xdr' and sat there as an apparent backlog of XDR rows
+            -- that were never coming. Measured on the live warehouse:
+            --
+            --     Cortex XDR - IR  matched         5608
+            --     ZeroFox          pending_xdr      187   <- wrong
+            --     Manual           non_xdr_source    15   <- right, by luck:
+            --                                              it has no mirror id
+            --
+            -- The id widths prove they are different objects: XDR incident ids
+            -- are 5 digits (39605-45220), XDR alert ids 8, and those ZeroFox
+            -- ids 9 (561641488-594146910).
+            --
+            -- LIKE rather than =, and the asymmetry is deliberate. Palo Alto
+            -- ships several Cortex XDR integration brands and the string has
+            -- changed across versions. Under-matching is SILENT: real XDR
+            -- incidents would be relabelled 'non_xdr_source' and quietly leave
+            -- the MTTR population. Over-matching is LOUD: a non-XDR brand shows
+            -- up as a growing 'pending_xdr' bucket, which is exactly how this
+            -- bug was found. Prefer the failure that announces itself.
             CASE
                 WHEN d.incident_id IS NOT NULL                     THEN 'matched'
-                WHEN COALESCE(x.payload->>'dbotMirrorId', '') = '' THEN 'non_xdr_source'
+                WHEN COALESCE(x.payload->>'sourceBrand', '')
+                     NOT LIKE 'Cortex XDR%%'                       THEN 'non_xdr_source'
                 WHEN (x.payload->>'created')::timestamptz
                      > now() - interval '325 days'                 THEN 'pending_xdr'
                 ELSE                                                   'xdr_aged_out'
@@ -739,6 +768,12 @@ INCIDENT_LIFECYCLE = Target(
         ) d ON true
         WHERE %(since)s::timestamptz IS NULL
            OR x._ingested_at > %(since)s::timestamptz
+           -- UNREACHABLE WHILE full_refresh IS SET, and kept on purpose.
+           -- full_refresh pins %(since)s to NULL, so the first branch already
+           -- matches every row and this one is never evaluated. It is the
+           -- safety net for the incremental mode: clear full_refresh and the
+           -- pending_xdr retry is what stops a late XDR arrival from being
+           -- stranded forever. Deleting it would couple two unrelated choices.
            OR EXISTS (
                 SELECT 1 FROM mart_fact_incident_lifecycle l
                 WHERE l.xsoar_incident_id = x.source_id

@@ -646,3 +646,20 @@ def test_xsoar_status_stays_integer() -> None:
     """status is genuinely integral -- measured domain is 1 and 2 -- so this is
     not a blanket 'cast everything to numeric' change."""
     assert "(payload->>'status')::int" in XSOAR_INCIDENTS.upsert_sql
+
+
+def test_lifecycle_classifies_on_source_brand_not_mirror_id() -> None:
+    """join_status keys on sourceBrand.
+
+    dbotMirrorId is set by EVERY mirroring integration, so testing it for
+    emptiness read "has a mirror id" as "came from XDR" and put 187 ZeroFox
+    incidents in pending_xdr. Behaviour is covered in
+    tests/transform/test_transform_integration.py, which executes the SQL --
+    this only pins the discriminator, because a string assertion is exactly
+    what agreed with the bug last time.
+    """
+    sql = INCIDENT_LIFECYCLE.upsert_sql
+    assert "NOT LIKE 'Cortex XDR%%'" in sql
+    assert "COALESCE(x.payload->>'dbotMirrorId', '') = ''" not in sql
+    # Still read for the id itself -- just no longer used to decide provenance.
+    assert "NULLIF(x.payload->>'dbotMirrorId', '')" in sql
