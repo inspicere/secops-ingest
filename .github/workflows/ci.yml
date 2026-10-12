@@ -182,3 +182,19 @@ jobs:
         env:
           SECOPS_TEST_DSN: postgresql://postgres:pw@127.0.0.1:5432/secops
         run: pytest tests/packs/test_state_integration.py -v
+
+      # The offline suite asserts transform SQL as TEXT, which agreed with two
+      # production bugs rather than catching them: an ::int cast on a
+      # fractional severity, and join_status classified on dbotMirrorId
+      # instead of sourceBrand. Both are invisible in a string and obvious the
+      # moment real values go through real SQL, so this runs the targets and
+      # asserts on the rows.
+      #
+      # Named explicitly rather than globbed, for the same reason the step
+      # above is: SECOPS_TEST_DSN is set for the whole job, so a file that
+      # stopped being collected would skip silently and the job would still be
+      # green. A missing path fails here instead.
+      - name: Transform targets against a real PostgreSQL
+        env:
+          SECOPS_TEST_DSN: postgresql://postgres:pw@127.0.0.1:5432/secops
+        run: pytest tests/transform/test_transform_integration.py -v
