@@ -183,3 +183,31 @@ def test_provider_rejects_a_locator_without_a_secret_id():
     )
     with pytest.raises(Exception, match="requires a 'secret'"):
         provider.fetch_locator({"field": "password"})
+
+
+@pytest.mark.parametrize(
+    "url", ["http://pam.example.com", "pam.example.com", "ftp://pam.example.com", ""]
+)
+def test_a_non_https_base_url_is_rejected_before_any_request(url):
+    from secops_ingest.secrets import SecretError
+
+    def handler(request):  # pragma: no cover - must never be reached
+        raise AssertionError("no request may be made")
+
+    with pytest.raises(SecretError, match="must use https://"):
+        SecretServerClient(
+            base_url=url,
+            client_id="c",
+            client_secret=Secret("s"),
+            transport=httpx.MockTransport(handler),
+        )
+
+
+def test_an_https_base_url_is_accepted_in_any_case():
+    client = SecretServerClient(
+        base_url="HTTPS://pam.example.com/",
+        client_id="c",
+        client_secret=Secret("s"),
+        transport=httpx.MockTransport(lambda r: httpx.Response(200)),
+    )
+    client.close()

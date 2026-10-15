@@ -31,6 +31,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import urlsplit
 
 from .base import SecretError, SecretNotFound
 from .secret import Secret
@@ -39,6 +40,19 @@ from .secret import Secret
 #: upstream. 300s is comfortably more than any single request takes.
 DRIFT_SECONDS = 300.0
 _TIMEOUT = 30.0
+
+
+def _require_https(base_url: str) -> None:
+    """Refuse a non-https base_url: the client_secret is POSTed to it.
+
+    There is deliberately no override. This is the one path where a credential
+    leaves the host, and a flag that can be set by mistake defeats the check.
+    """
+    if urlsplit(base_url).scheme.lower() != "https":
+        raise SecretError(
+            "delinea base_url must use https:// (the client secret is sent to it); "
+            f"got {base_url!r}"
+        )
 
 
 class SecretServerClient:
@@ -62,6 +76,7 @@ class SecretServerClient:
             ) from exc
         if not isinstance(client_secret, Secret):
             raise SecretError("client_secret must be a Secret, not a bare string")
+        _require_https(base_url)
         self._client = httpx.Client(
             transport=transport, base_url=base_url.rstrip("/"), timeout=_TIMEOUT
         )
