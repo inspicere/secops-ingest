@@ -23,9 +23,12 @@ from typing import Any
 
 from .base import SecretError, SecretNotFound, SecretProvider
 
-#: Any host works: the connection is a Unix socket, so the authority in the URL
-#: is never resolved. A literal makes request logs readable.
-_BASE = "http://vault-agent"
+#: The authority is never resolved: the connection is a Unix socket, so httpx
+#: needs a syntactically valid base_url and nothing more. localhost rather than
+#: a descriptive name like "vault-agent" because the hygiene job rejects any
+#: hostname that is not reserved, and it is right to — a real-looking host in
+#: source is indistinguishable from somebody's actual infrastructure.
+_BASE = "http://localhost"
 _TIMEOUT = 10.0
 
 

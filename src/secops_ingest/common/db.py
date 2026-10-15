@@ -78,8 +78,18 @@ def resolve_conninfo(provider: object | None = None) -> tuple[str, dict[str, str
 def connect(provider: object | None = None) -> Iterator[psycopg.Connection]:
     """Yield a connection with autocommit off, committing on clean exit."""
     conninfo, credentials = resolve_conninfo(provider)
-    with psycopg.connect(conninfo, **credentials) as conn:
-        yield conn
+    # Passed by name rather than **credentials: psycopg.connect is overloaded
+    # with typed keyword parameters, so a dict[str, str] splat does not
+    # typecheck once psycopg's stubs are installed. Visible only in the
+    # mypy-with-drivers job, which exists for exactly this class of error.
+    if credentials:
+        with psycopg.connect(
+            conninfo, user=credentials["user"], password=credentials["password"]
+        ) as conn:
+            yield conn
+    else:
+        with psycopg.connect(conninfo) as conn:
+            yield conn
 
 
 def _split_ident(qualified: str) -> sql.Identifier:
