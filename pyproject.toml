@@ -14,7 +14,7 @@ license = "Apache-2.0"
 dependencies = []
 
 [project.optional-dependencies]
-delinea = ["python-tss-sdk>=1.2"]
+delinea = ["httpx>=0.27"]
 vault = ["hvac>=2.0"]
 postgres = ["psycopg[binary]>=3.1"]
 http = ["httpx>=0.27", "tenacity>=8.2"]
@@ -56,5 +56,5 @@ strict = true
 # (see .github/workflows/ci.yml); that run is the one that catches those, so
 # this override must stay narrow enough not to swallow them there too.
 [[tool.mypy.overrides]]
-module = ["psycopg.*", "httpx", "hvac", "delinea.*"]
+module = ["psycopg.*", "httpx", "hvac"]
 ignore_missing_imports = true
