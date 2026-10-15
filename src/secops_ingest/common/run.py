@@ -122,7 +122,7 @@ def execute(
     provider: object | None = None,
 ) -> Result:
     """Run one ingest cycle. Never returns silently on failure."""
-    with db.connect() as conn:
+    with db.connect(provider) as conn:
         state = _pack_state_of(conn, source.name)
         if state == "AMBIGUOUS":
             # Same collision registry.resolve_source calls AmbiguousSource for,

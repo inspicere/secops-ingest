@@ -51,7 +51,7 @@ def test_an_ingest_run_is_started_with_the_provider_posture(
         recorded["posture"] = posture
         return 1
 
-    monkeypatch.setattr(run_mod.db, "connect", lambda: _FakeConn())
+    monkeypatch.setattr(run_mod.db, "connect", lambda provider=None: _FakeConn())
     monkeypatch.setattr(run_mod, "_pack_state_of", lambda conn, name: None)
     monkeypatch.setattr(run_mod.db, "start_run", start_run)
     monkeypatch.setattr(run_mod.db, "get_watermark", lambda conn, name: None)
@@ -60,3 +60,26 @@ def test_an_ingest_run_is_started_with_the_provider_posture(
     run_mod.execute(_EmptySource(), provider=_Provider())
 
     assert recorded["posture"] == "assured"
+
+
+def test_the_provider_given_to_execute_reaches_the_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The provider must reach the connection, which is where the credential is
+    # resolved. Without it, a provider-backed run could never lease.
+    seen: dict[str, Any] = {}
+
+    def connect(provider: object | None = None) -> _FakeConn:
+        seen["connect"] = provider
+        return _FakeConn()
+
+    monkeypatch.setattr(run_mod.db, "connect", connect)
+    monkeypatch.setattr(run_mod, "_pack_state_of", lambda conn, name: None)
+    monkeypatch.setattr(run_mod.db, "start_run", lambda *a, **k: 1)
+    monkeypatch.setattr(run_mod.db, "get_watermark", lambda conn, name: None)
+    monkeypatch.setattr(run_mod.db, "finish_run", lambda *a, **k: None)
+
+    provider = _Provider()
+    run_mod.execute(_EmptySource(), provider=provider)
+
+    assert seen["connect"] is provider

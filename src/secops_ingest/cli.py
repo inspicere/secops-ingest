@@ -16,6 +16,7 @@ from typing import Any
 
 from .packs.registry import AmbiguousSource, DuplicatePack, UnknownSource, resolve_source
 from .redaction import RedactingFilter
+from .secrets import SecretError, get_provider
 
 
 def _load_source(name: str) -> Any:
@@ -67,12 +68,18 @@ def main(argv: list[str] | None = None) -> int:
 
     from .common import run as run_mod
 
+    log = logging.getLogger(__name__)
     source = _load_source(args.source)
-    kwargs = {"dry_run": args.dry_run}
+    kwargs: dict[str, Any] = {"dry_run": args.dry_run}
     if args.batch_size is not None:
         kwargs["batch_size"] = args.batch_size
-
-    log = logging.getLogger(__name__)
+    try:
+        kwargs["provider"] = get_provider()
+    except SecretError as exc:
+        # A backend that cannot be built must not stop the run. Without a
+        # provider the run takes the static SECOPS_DB_DSN path, as it always did.
+        log.warning("secrets provider unavailable (%s); using SECOPS_DB_DSN", exc)
+        kwargs["provider"] = None
     try:
         result = run_mod.execute(source, **kwargs)
     except Exception:

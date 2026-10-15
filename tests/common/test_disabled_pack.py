@@ -19,7 +19,7 @@ from secops_ingest.packs.state import PackState  # noqa: E402
 
 
 @contextmanager
-def _fake_connect() -> Iterator[object]:
+def _fake_connect(provider: object | None = None) -> Iterator[object]:
     """A trivial stand-in for `db.connect()`. Never touches a real database."""
     yield object()
 
