@@ -78,29 +78,47 @@ def test_the_date_range_is_nested_inside_filter(source: XsoarSource) -> None:
     source._post = rec  # type: ignore[method-assign]
     list(source.fetch({}, "2026-09-07T00:00:00.000Z"))
     body = rec.bodies[0]
-    assert body["filter"]["fromDate"] == "2026-09-07T00:00:00.000Z"
+    # The window now rides in filter.query (the date keys filter on `created` --
+    # see the module docstring), but the NESTING finding is unchanged and is
+    # what this test exists to protect: top level is accepted and ignored.
+    assert "2026-09-07T00:00:00" in body["filter"]["query"]
+    assert "query" not in body
     assert "fromDate" not in body
 
 
-def test_no_filter_query_is_ever_sent(source: XsoarSource) -> None:
-    """filter.query did not break paging when measured, but the hazard it is
-    warned about is silent under-ingestion, and filter.fromDate costs nothing.
+def test_filter_query_is_what_carries_the_window(source: XsoarSource) -> None:
+    """REVERSES an earlier decision, so the reason is recorded here.
+
+    This test used to assert the opposite -- that filter.query is never sent --
+    on the grounds that "filter.query did not break paging when measured, but
+    the hazard it is warned about is silent under-ingestion, and
+    filter.fromDate costs nothing."
+
+    The first half still holds: paging with query was re-measured on 2026-10-15
+    and works (4 pages of 10, 40 distinct ids, no duplicates). The second half
+    is false. filter.fromDate costs every update to an incident created before
+    the window -- measured silent under-ingestion, which is the exact hazard the
+    old reasoning was trying to avoid. The trade therefore inverts: query is now
+    the safe option and fromDate is the dangerous one.
     """
     rec = Recorder([[]])
     source._post = rec  # type: ignore[method-assign]
     list(source.fetch({}, "2026-09-07T00:00:00.000Z"))
-    assert "query" not in rec.bodies[0]["filter"]
+    assert "query" in rec.bodies[0]["filter"]
 
 
-def test_todate_is_pinned_once_for_the_whole_run(source: XsoarSource) -> None:
+def test_the_upper_bound_is_pinned_once_for_the_whole_run(source: XsoarSource) -> None:
     """Without a pinned upper bound, records arriving mid-run shift the result
-    set under the paging cursor and rows are skipped."""
+    set under the paging cursor and rows are skipped.
+
+    The bound moved from filter.toDate into filter.query when the window moved
+    onto the `modified` axis; the hazard and the guarantee are unchanged."""
     rec = Recorder([[incident("1", "2026-09-01T00:00:00.000Z"),
                      incident("2", "2026-09-02T00:00:00.000Z")],
                     [incident("3", "2026-09-03T00:00:00.000Z")]])
     source._post = rec  # type: ignore[method-assign]
     list(source.fetch({}, None))
-    tos = {b["filter"]["toDate"] for b in rec.bodies}
+    tos = {b["filter"]["query"].split("modified:<=")[1] for b in rec.bodies}
     assert len(tos) == 1
 
 
@@ -182,17 +200,73 @@ def test_an_empty_watermark_starts_at_the_bounded_horizon_not_the_beginning(
     list(source.fetch({}, None))
     expected = (FROZEN - timedelta(days=xsoar_mod.DEFAULT_BACKFILL_DAYS)).strftime(
         "%Y-%m-%dT%H:%M:%SZ")
-    assert rec.bodies[0]["filter"]["fromDate"] == expected
+    # Now the lower bound of the query range rather than filter.fromDate.
+    assert f'modified:>="{expected}"' in rec.bodies[0]["filter"]["query"]
 
 
-def test_an_explicit_cursor_is_used_verbatim_and_not_floored(
+def test_the_backfill_horizon_is_not_reapplied_to_a_real_cursor(
     source: XsoarSource,
 ) -> None:
-    """The floor applies to the FIRST run only. Flooring a real watermark would
-    re-read the whole horizon every run, and on a feed this size that is the
-    difference between a 30-second run and a quarter of history."""
+    """RENAMED. It used to say "used verbatim and not floored", which is no
+    longer accurate: a cursor IS floored, to the second resolution the query
+    comparison understands.
+
+    The guarantee it was actually protecting is untouched and is what is
+    asserted here -- the backfill HORIZON applies to a first run only. Re-applying
+    it to a real watermark would re-read the whole horizon every run, which on
+    this feed is the difference between a 30-second run and a quarter of
+    history. Sub-second truncation is a separate, much smaller thing, and it
+    floors; see test_a_subsecond_cursor_is_floored_not_rejected.
+    """
     source._now = lambda: FROZEN  # type: ignore[method-assign]
     rec = Recorder([[]])
     source._post = rec  # type: ignore[method-assign]
     list(source.fetch({}, "2026-10-01T00:00:00Z"))
-    assert rec.bodies[0]["filter"]["fromDate"] == "2026-10-01T00:00:00Z"
+    assert 'modified:>="2026-10-01T00:00:00Z"' in rec.bodies[0]["filter"]["query"]
+
+
+def test_the_window_is_bounded_on_modified_not_created(source: XsoarSource) -> None:
+    """fromDate/toDate filter on CREATED. The connector watermarks on MODIFIED.
+
+    Those two axes diverge permanently, and the consequence is silent data loss:
+    an incident created before the cursor and modified after it is never
+    returned, so its update is never ingested. Measured against the live tenant
+    on 2026-10-15 -- of 200 incidents in a 90-day window, 3 were created over a
+    day ago and modified within the last day, and `fromDate = now - 1d` returned
+    none of them. This is the same failure xdr.py documents and fixes for XDR.
+
+    The fix bounds the window on the axis the connector actually tracks, via
+    filter.query. Verified against the tenant before implementing: the bounded
+    form returns 260 incidents with ascending sort honoured, includes an
+    incident created before the window, and pages correctly -- 4 pages of 10,
+    40 distinct ids, no duplicates. (`fromDateModified` was also tried and is
+    silently ignored: it returned the entire 50,754-incident collection.)
+    """
+    rec = Recorder([[]])
+    source._post = rec  # type: ignore[method-assign]
+    source._now = lambda: FROZEN  # type: ignore[method-assign]
+    list(source.fetch({}, "2026-10-01T00:00:00.000Z"))
+
+    flt = rec.bodies[0]["filter"]
+    # Both created-axis keys must be gone. Leaving either re-imposes the bug on
+    # whichever bound still carries it.
+    assert "fromDate" not in flt, "fromDate filters on created and must not be sent"
+    assert "toDate" not in flt, "toDate filters on created and must not be sent"
+
+    q = flt["query"]
+    assert "modified:>=" in q
+    assert "modified:<=" in q
+    assert "2026-10-01T00:00:00" in q
+
+
+def test_a_subsecond_cursor_is_floored_not_rejected(source: XsoarSource) -> None:
+    """XSOAR stamps `modified` with sub-second precision; the query comparison
+    is second-resolution. Truncating FLOORS the lower bound, so the boundary
+    second is re-read and the upsert absorbs it. Rounding up would skip."""
+    rec = Recorder([[]])
+    source._post = rec  # type: ignore[method-assign]
+    source._now = lambda: FROZEN  # type: ignore[method-assign]
+    list(source.fetch({}, "2026-10-01T12:34:56.789456123Z"))
+    q = rec.bodies[0]["filter"]["query"]
+    assert "2026-10-01T12:34:56Z" in q, q
+    assert "789" not in q

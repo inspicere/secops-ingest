@@ -8,6 +8,27 @@ end-to-end join. Build this connector before the XDR one.
 
 THE DATE RANGE GOES INSIDE `filter`.
 
+THE WINDOW IS BOUNDED ON `modified`, VIA `filter.query`, AND MUST STAY THAT WAY.
+
+`filter.fromDate` and `filter.toDate` filter on **created**. This connector sorts
+and watermarks on **modified**. Those axes diverge permanently, and the result is
+silent data loss: an incident created before the cursor and modified after it is
+never returned, so its update is never ingested. Measured on 2026-10-15 against
+the live tenant -- of 200 incidents in a 90-day window, 3 were created over a day
+ago and modified within the last day, and `fromDate = now - 1d` returned none of
+them. It is the same failure xdr.py documents and fixes for XDR; XSOAR never
+received the same treatment.
+
+`filter.fromDateModified` is NOT the answer: it is accepted and silently ignored,
+returning the entire 50,754-incident collection.
+
+`filter.query` IS. Measured in the same session: a bounded
+`modified:>=X and modified:<=Y` returns 260 incidents, honours the ascending
+sort, includes an incident created before the window, and pages correctly --
+4 pages of 10, 40 distinct ids, no duplicates. Public guidance claims setting
+`filter.query` makes page, size and sort be ignored; that does not reproduce
+here, and the paging check above is what establishes it.
+
 A `fromDate` at the top level of the request body -- alongside `filter`, where
 the vendor documentation appears to put it -- is accepted and silently
 discarded. Measured against this tenant:
@@ -50,6 +71,22 @@ log = logging.getLogger(__name__)
 
 API_PATH = "/xsoar/public/v1"
 SEARCH = "/incidents/search"
+
+# The query comparison is second-resolution, but XSOAR stamps `modified` with
+# sub-second precision.
+QUERY_TIME_FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _floor_to_second(stamp: str) -> str:
+    """Truncate a watermark to the resolution the query understands.
+
+    FLOORS, deliberately. Truncation moves the lower bound backwards, so the
+    boundary second is re-read and the upsert absorbs it. Rounding up would step
+    over every incident modified in that same second -- the cheap error and the
+    expensive one, and this picks the cheap one.
+    """
+    head = stamp[:19]
+    return f"{head}Z" if len(head) == 19 else stamp
 
 # How far back the FIRST run reaches. After that the watermark governs, so this
 # bounds one run, not every run.
@@ -98,8 +135,8 @@ class XsoarSource:
         error fall on the harmless side.
         """
         now = self._now()
-        to_date = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        from_date = str(cursor) if cursor else self._horizon(now)
+        to_date = now.strftime(QUERY_TIME_FMT)
+        from_date = _floor_to_second(str(cursor)) if cursor else self._horizon(now)
         page = 0
         while True:
             body: dict[str, Any] = {
@@ -107,14 +144,18 @@ class XsoarSource:
                     "size": self.page_size,
                     "page": page,
                     "sort": [{"field": "modified", "asc": True}],
-                    # INSIDE filter. See the module docstring: at the top level
-                    # this is accepted and ignored.
-                    "toDate": to_date,
+                    # Bounded on `modified`, NOT via fromDate/toDate -- those
+                    # filter on `created` and lose every update to an older
+                    # incident. See the module docstring.
+                    #
+                    # The ceiling is still pinned once per run, for the reason
+                    # it always was: an incident modified mid-scan would
+                    # otherwise enter the result set and shift every later row
+                    # forward, so a page boundary skips a record instead of
+                    # repeating one. Repeating is free; skipping is loss.
+                    "query": f'modified:>="{from_date}" and modified:<="{to_date}"',
                 }
             }
-            # Always set, now. Omitting it on a first run means "the whole
-            # collection", which is the bug this floor fixes.
-            body["filter"]["fromDate"] = from_date
 
             started = time.monotonic()
             # partial, not a lambda: a lambda would close over the loop variable.
@@ -138,7 +179,7 @@ class XsoarSource:
         floor = now - timedelta(days=self.backfill_days)
         log.info("no watermark: starting at the bounded horizon of %d day(s), "
                  "not at the beginning of the collection", self.backfill_days)
-        return floor.strftime("%Y-%m-%dT%H:%M:%SZ")
+        return floor.strftime(QUERY_TIME_FMT)
 
     def _post(self, creds: Any, body: dict[str, Any]) -> dict[str, Any]:
         """One search call. Separated so tests can drive fetch() offline."""
