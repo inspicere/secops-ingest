@@ -64,7 +64,8 @@ class MappedSecretProvider(SecretProvider):
                 doc = json.loads(raw)
             except json.JSONDecodeError as exc:
                 raise SecretError(f"secret map {self._map_name!r} is not valid JSON") from exc
-            self._map = load_map(doc)
+            # An injected factory owns its own vocabulary of kinds.
+            self._map = load_map(doc, check_kinds=self._factory is _default_factory)
         return self._map
 
     @property

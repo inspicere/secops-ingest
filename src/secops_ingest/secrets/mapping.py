@@ -19,11 +19,22 @@ from dataclasses import dataclass, field
 
 from .base import InvalidSecretName, SecretError, validate_name
 
-#: Provider kinds that read from a local filesystem or process environment.
-#: Permitted only under the dev posture. Keeping this list explicit -- rather
-#: than inferring from a provider capability flag -- means a third-party
-#: provider cannot opt itself into an assured deployment.
-_LOCAL_KINDS = frozenset({"file", "env"})
+
+def available_backends() -> list[str]:
+    """Registered backend names (imported late: the package imports this module)."""
+    from . import available_backends as _available
+
+    return _available()
+
+#: The only provider kinds an assured deployment accepts: Vault and
+#: privileged-access managers. This is an ALLOWLIST, so any kind not named
+#: here -- a third-party plugin that happens to read a file, or a misspelling --
+#: is refused rather than waved through. Compared lowercased. Adding a PAM
+#: backend means adding it here deliberately.
+_PAM_KINDS = frozenset({"vault", "vault_agent", "delinea"})
+
+_TOP_LEVEL_KEYS = frozenset({"posture", "providers", "entries"})
+_PROVIDER_KEYS = frozenset({"kind", "config", "credential"})
 
 
 class InvalidMap(SecretError):
@@ -99,13 +110,26 @@ def _require_mapping(value: object, what: str) -> dict[str, object]:
     return value
 
 
-def load_map(doc: object) -> SecretMap:
+def load_map(doc: object, *, check_kinds: bool = True) -> SecretMap:
     """Parse and validate a mapping document.
+
+    Args:
+        check_kinds: require every provider kind to be a registered backend.
+            Disable only when the caller supplies its own provider factory and
+            so owns the vocabulary of kinds.
 
     Raises:
         InvalidMap: for any structural problem, naming a specific cause.
     """
     body = _require_mapping(doc, "mapping document")
+
+    unknown_top = sorted(set(body) - _TOP_LEVEL_KEYS)
+    if unknown_top:
+        raise InvalidMap(
+            f"unknown top-level key(s) {', '.join(map(repr, unknown_top))}; "
+            f"expected only {', '.join(sorted(_TOP_LEVEL_KEYS))}"
+        )
+    registered = frozenset(available_backends()) if check_kinds else frozenset()
 
     if "posture" not in body:
         raise InvalidMap("posture is required; use 'assured' in production or 'dev' locally")
@@ -122,10 +146,22 @@ def load_map(doc: object) -> SecretMap:
         kind = spec_body.get("kind")
         if not isinstance(kind, str) or not kind:
             raise InvalidMap(f"provider {name!r} needs a 'kind'")
-        if posture is Posture.ASSURED and kind in _LOCAL_KINDS:
+        unknown_keys = sorted(set(spec_body) - _PROVIDER_KEYS)
+        if unknown_keys:
             raise InvalidMap(
-                f"posture 'assured' forbids provider kind {kind!r}: it reads from "
-                "the local filesystem or environment. Use 'dev' only outside production."
+                f"provider {name!r} has unknown key(s) {', '.join(map(repr, unknown_keys))}; "
+                f"expected only {', '.join(sorted(_PROVIDER_KEYS))}"
+            )
+        if posture is Posture.ASSURED and kind.lower() not in _PAM_KINDS:
+            raise InvalidMap(
+                f"posture 'assured' forbids provider kind {kind!r}: only "
+                f"{', '.join(sorted(_PAM_KINDS))} are accepted. "
+                "Use 'dev' only outside production."
+            )
+        if check_kinds and kind not in registered:
+            raise InvalidMap(
+                f"provider {name!r} has unregistered kind {kind!r}; "
+                f"registered: {', '.join(sorted(registered))}"
             )
         credential = spec_body.get("credential")
         if credential is not None and not isinstance(credential, str):

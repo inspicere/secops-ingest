@@ -12,8 +12,8 @@ from secops_ingest.secrets.mapping import Posture
 MAP = {
     "posture": "assured",
     "providers": {
-        "root": {"kind": "fake_root", "config": {"tag": "R"}},
-        "child": {"kind": "fake_child", "config": {"tag": "C"}, "credential": "child.bootstrap"},
+        "root": {"kind": "vault_agent", "config": {"tag": "R"}},
+        "child": {"kind": "delinea", "config": {"tag": "C"}, "credential": "child.bootstrap"},
     },
     "entries": {
         "child.bootstrap": {"provider": "root", "path": "boot", "field": "f"},
@@ -70,13 +70,13 @@ def built():
 def test_resolves_through_the_owning_provider(built):
     provider, _holder, made = built
     assert provider.get("alpha.key") == "R:k"
-    assert made["fake_root"].calls == [{"path": "a", "field": "k"}]
+    assert made["vault_agent"].calls == [{"path": "a", "field": "k"}]
 
 
 def test_a_brokered_provider_receives_its_credential_as_a_secret(built):
     provider, _holder, made = built
     assert provider.get("beta.token") == "C:password"
-    cred = made["fake_child"].credential
+    cred = made["delinea"].credential
     assert isinstance(cred, Secret)
     assert cred.reveal() == "R:f"
 
@@ -97,17 +97,17 @@ def test_an_unmapped_name_raises_secret_not_found(built):
 def test_posture_and_kinds_are_exposed_for_the_run_ledger(built):
     provider, _holder, _made = built
     assert provider.posture is Posture.ASSURED
-    assert provider.provider_kinds() == {"root": "fake_root", "child": "fake_child"}
+    assert provider.provider_kinds() == {"root": "vault_agent", "child": "delinea"}
 
 
 def test_a_provider_is_built_once_and_reused(built):
     provider, _holder, made = built
     provider.get("beta.token")
-    first = made["fake_child"]
+    first = made["delinea"]
     provider.get("beta.token")
     provider.clear_cache()
     provider.get("beta.token")
-    assert made["fake_child"] is first
+    assert made["delinea"] is first
 
 
 def test_a_malformed_map_fails_on_first_use_not_on_construction():

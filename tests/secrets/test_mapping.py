@@ -129,3 +129,59 @@ def test_missing_posture_is_rejected_rather_than_defaulted():
     doc = {k: v for k, v in GOOD.items() if k != "posture"}
     with pytest.raises(InvalidMap, match="posture is required"):
         load_map(doc)
+
+
+def _one_provider(posture, kind):
+    return {
+        "posture": posture,
+        "providers": {"p": {"kind": kind, "config": {}}},
+        "entries": {"a.b": {"provider": "p", "name": "a.b"}},
+    }
+
+
+def test_assured_posture_rejects_a_registered_non_pam_kind():
+    # "env" is registered, and is not a PAM kind. An allowlist refuses it, and
+    # would equally refuse any third-party file-reading plugin.
+    with pytest.raises(InvalidMap, match="posture 'assured' forbids provider kind 'env'"):
+        load_map(_one_provider("assured", "env"))
+
+
+def test_assured_posture_compares_kinds_lowercased():
+    with pytest.raises(InvalidMap, match="posture 'assured' forbids provider kind 'File'"):
+        load_map(_one_provider("assured", "File"))
+    # A mixed-case PAM kind passes the allowlist but is not a registered
+    # backend name, so it is still refused -- at load, not at resolution.
+    with pytest.raises(InvalidMap, match="unregistered kind 'Vault_Agent'"):
+        load_map(_one_provider("assured", "Vault_Agent"))
+
+
+def test_an_unregistered_kind_is_rejected_at_load():
+    with pytest.raises(InvalidMap, match="unregistered kind 'vualt_agent'"):
+        load_map(_one_provider("dev", "vualt_agent"))
+
+
+def test_kind_checking_can_be_left_to_an_injected_factory():
+    assert load_map(_one_provider("dev", "anything"), check_kinds=False).posture is Posture.DEV
+
+
+def test_a_typod_top_level_key_is_rejected_not_loaded_empty():
+    doc = {"posture": "assured", "provider": GOOD["providers"], "entry": GOOD["entries"]}
+    with pytest.raises(InvalidMap, match="unknown top-level key.*'entry'.*'provider'"):
+        load_map(doc)
+
+
+def test_a_typod_provider_spec_key_is_rejected():
+    doc = {**GOOD, "providers": {"vault": {"kind": "vault_agent", "credentail": "x"}}}
+    with pytest.raises(InvalidMap, match="provider 'vault' has unknown key.*'credentail'"):
+        load_map(doc)
+
+
+def test_entry_locators_still_accept_arbitrary_keys():
+    doc = {
+        **GOOD,
+        "entries": {
+            **GOOD["entries"],
+            "a.b": {"provider": "vault", "path": "p", "field": "f", "anything": "goes"},
+        },
+    }
+    assert load_map(doc).entries["a.b"].locator["anything"] == "goes"
