@@ -143,13 +143,22 @@ jobs:
           curl -sf http://127.0.0.1:8200/v1/sys/health
 
       - name: Install with the vault extra
-        run: pip install -e ".[vault,dev]"
+        run: pip install -e ".[vault,http,dev]"
 
       - name: Vault provider resolves secrets from OpenBao
         env:
           VAULT_ADDR: http://127.0.0.1:8200
           VAULT_TOKEN: root
         run: pytest tests/secrets/test_vault_backend_integration.py -v
+
+      # Named explicitly rather than globbed, matching the step above: VAULT_ADDR
+      # is set for the whole job, so a file that stopped being collected would
+      # skip rather than fail and the job would stay green.
+      - name: The secretless chain resolves against OpenBao
+        env:
+          VAULT_ADDR: http://127.0.0.1:8200
+          VAULT_TOKEN: root
+        run: pytest tests/secrets/test_secretless_integration.py -v
 
       - name: OpenBao logs
         if: failure()
