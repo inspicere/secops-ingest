@@ -22,11 +22,13 @@ from .base import (
 )
 from .env import EnvSecretProvider
 from .file import FileSecretProvider
+from .secret import Secret
 
 __all__ = [
     "EnvSecretProvider",
     "FileSecretProvider",
     "InvalidSecretName",
+    "Secret",
     "SecretError",
     "SecretNotFound",
     "SecretProvider",

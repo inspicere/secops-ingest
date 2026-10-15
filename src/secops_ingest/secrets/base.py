@@ -14,6 +14,12 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # For annotations only. get_secret() imports Secret at runtime, function-
+    # local, to avoid a cycle; this keeps mypy and ruff aware of the name.
+    from .secret import Secret
 
 #: Secret names are logical identifiers, not paths. Restricting the character
 #: set here is what makes path-based providers safe (see FileSecretProvider).
@@ -77,6 +83,17 @@ class SecretProvider(ABC):
         if self._cache is not None:
             self._cache[name] = value
         return value
+
+    def get_secret(self, name: str) -> "Secret":
+        """Return the secret value for ``name``, wrapped.
+
+        Prefer this over get(). The wrapper registers the value for redaction
+        and keeps it out of reprs and format strings. get() remains for
+        callers that need a bare str at an API boundary.
+        """
+        from .secret import Secret
+
+        return Secret(self.get(name))
 
     @abstractmethod
     def _fetch(self, name: str) -> str:
