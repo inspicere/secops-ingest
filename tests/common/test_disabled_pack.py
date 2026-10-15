@@ -50,7 +50,9 @@ class _Source:
 def _stub_db(monkeypatch: pytest.MonkeyPatch, started: list[str]) -> None:
     """Wire up db.* so a full `execute()` run never needs a real database."""
     monkeypatch.setattr(run_mod.db, "connect", _fake_connect)
-    monkeypatch.setattr(run_mod.db, "start_run", lambda conn, name: started.append(name) or 1)
+    monkeypatch.setattr(
+        run_mod.db, "start_run", lambda conn, name, **kw: started.append(name) or 1
+    )
     monkeypatch.setattr(run_mod.db, "get_watermark", lambda conn, name: None)
     monkeypatch.setattr(run_mod.db, "finish_run", lambda *a, **k: None)
 
@@ -61,7 +63,9 @@ def test_disabled_pack_does_not_fetch_or_record_a_run(
     source = _Source()
     started: list[str] = []
 
-    monkeypatch.setattr(run_mod.db, "start_run", lambda conn, name: started.append(name) or 1)
+    monkeypatch.setattr(
+        run_mod.db, "start_run", lambda conn, name, **kw: started.append(name) or 1
+    )
     monkeypatch.setattr(run_mod, "_pack_state_of", lambda conn, name: "DISABLED")
     monkeypatch.setattr(run_mod.db, "connect", _fake_connect)
 

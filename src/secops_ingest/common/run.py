@@ -113,7 +113,30 @@ def _pack_state_of(conn: Any, source_name: str) -> str | None:
     return stored.state
 
 
-def execute(source: Source, *, dry_run: bool = False, batch_size: int = DEFAULT_BATCH) -> Result:
+def current_posture(provider: object | None) -> str | None:
+    """Return the provider's declared posture, or None.
+
+    Never raises. The posture is a diagnostic written alongside a run; a run
+    that ingested correctly must not be recorded as FAILED because reading a
+    label failed. A provider with no posture -- env, file, vault -- yields
+    None, which reads as "not declared" rather than as a claim.
+    """
+    try:
+        posture = getattr(provider, "posture", None)
+        if posture is None:
+            return None
+        return str(getattr(posture, "value", posture))
+    except Exception:  # noqa: BLE001 - a diagnostic must not fail the run
+        return None
+
+
+def execute(
+    source: Source,
+    *,
+    dry_run: bool = False,
+    batch_size: int = DEFAULT_BATCH,
+    provider: object | None = None,
+) -> Result:
     """Run one ingest cycle. Never returns silently on failure."""
     with db.connect() as conn:
         state = _pack_state_of(conn, source.name)
@@ -141,7 +164,10 @@ def execute(source: Source, *, dry_run: bool = False, batch_size: int = DEFAULT_
             )
             return Result("DISABLED", 0, 0)
 
-        run_id = 0 if dry_run else db.start_run(conn, source.name)
+        run_id = (
+            0 if dry_run
+            else db.start_run(conn, source.name, posture=current_posture(provider))
+        )
         read = written = 0
         high_watermark: Any = None
         try:

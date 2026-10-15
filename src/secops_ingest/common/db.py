@@ -51,12 +51,12 @@ def _split_ident(qualified: str) -> sql.Identifier:
 
 # --- run bookkeeping -------------------------------------------------------
 
-def start_run(conn: psycopg.Connection, source: str) -> int:
+def start_run(conn: psycopg.Connection, source: str, *, posture: str | None = None) -> int:
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO control.ingest_run (source, status) "
-            "VALUES (%s, 'RUNNING') RETURNING run_id",
-            (source,),
+            "INSERT INTO control.ingest_run (source, status, posture) "
+            "VALUES (%s, 'RUNNING', %s) RETURNING run_id",
+            (source, posture),
         )
         row = cur.fetchone()
         if row is None:

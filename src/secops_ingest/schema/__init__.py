@@ -61,6 +61,10 @@ CREATE TABLE IF NOT EXISTS control.ingest_run (
     ended_at      timestamptz,
     status        text        NOT NULL DEFAULT 'RUNNING'
                   CHECK (status IN ('RUNNING','SUCCESS','FAILED')),
+    -- Which secret posture produced this row. Nullable: rows predating the
+    -- column are not retroactively 'assured', and claiming they were would be
+    -- the opposite of what this column is for.
+    posture       text,
     rows_read     integer,
     rows_written  integer,
     error_summary text
@@ -84,6 +88,10 @@ CREATE TABLE IF NOT EXISTS control.transform_run (
     ended_at      timestamptz,
     status        text        NOT NULL DEFAULT 'RUNNING'
                   CHECK (status IN ('RUNNING','SUCCESS','FAILED')),
+    -- Which secret posture produced this row. Nullable: rows predating the
+    -- column are not retroactively 'assured', and claiming they were would be
+    -- the opposite of what this column is for.
+    posture       text,
     rows_upserted integer,
     days_touched  integer,
     error_summary text
