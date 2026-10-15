@@ -73,7 +73,9 @@ def test_format_spec_pads_the_mask_and_never_the_value():
 def test_pickling_refuses_and_never_produces_bytes_containing_the_value():
     s = Secret("hunter2-correct-horse")
     for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
-        with pytest.raises(TypeError, match="Secret is not picklable") as excinfo:
+        with pytest.raises(
+            TypeError, match="written to disk or sent to another process"
+        ) as excinfo:
             pickle.dumps(s, protocol=protocol)
         assert "hunter2" not in str(excinfo.value)
 
@@ -82,6 +84,15 @@ def test_copy_still_works_in_memory():
     # Copying stays in-process, so it is allowed. Pickling is refused above.
     s = Secret("hunter2-correct-horse")
     assert copy.copy(s).reveal() == "hunter2-correct-horse"
+
+
+def test_deepcopy_still_works_in_memory_and_returns_a_distinct_object():
+    # Pickling is refused, but a deep copy never leaves the process, so it is
+    # allowed. The refusal must not be widened to block it.
+    s = Secret("hunter2-correct-horse")
+    c = copy.deepcopy(s)
+    assert c.reveal() == s.reveal()
+    assert c is not s
 
 
 def test_len_is_the_value_length():

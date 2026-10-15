@@ -62,13 +62,21 @@ class Secret:
 
     def __reduce__(self) -> NoReturn:
         # pickle serialises __slots__ state, which would write the plaintext to
-        # whatever receives the bytes: a multiprocessing hand-off, an on-disk
-        # cache. Refuse instead. The message names the type, never the value.
-        raise TypeError("Secret is not picklable")
+        # whatever receives the bytes. Refuse instead. The message names the
+        # reason, never the value.
+        raise TypeError(
+            "Secret cannot be pickled: a pickle is written to disk or sent to "
+            "another process, and either would expose the value"
+        )
 
     def __copy__(self) -> Secret:
         # copy.copy would otherwise fall back to __reduce__ and hit the refusal
         # above. Copying stays in-process, so it is safe to allow.
+        return Secret(self._value)
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Secret:
+        # Same reasoning as __copy__: deepcopy falls back to __reduce__ too.
+        # The value is a str, so there is nothing further to copy.
         return Secret(self._value)
 
     def __eq__(self, other: object) -> bool:
