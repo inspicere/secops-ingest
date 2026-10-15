@@ -27,25 +27,16 @@ except ImportError as exc:  # pragma: no cover - depends on extra
     ) from exc
 
 
-def _quote(value: str) -> str:
-    """Quote a libpq connection-string value.
+def resolve_conninfo(provider: object | None = None) -> tuple[str, dict[str, str]]:
+    """Return (conninfo, credential kwargs), leasing a credential if configured.
 
-    A leased password is generated and can contain spaces, quotes and
-    backslashes. libpq's keyword/value format needs those escaped inside
-    single quotes, and an unescaped one would silently truncate the value --
-    which presents as an authentication failure against a credential that is
-    in fact correct.
-    """
-    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
-    return f"'{escaped}'"
-
-
-def resolve_dsn(provider: object | None = None) -> str:
-    """Return a DSN, leasing a credential if one is configured.
-
-    THE LEASED CREDENTIAL IS NEVER WRITTEN ANYWHERE. It is assembled into a
-    connection string in memory and handed to psycopg. This is what replaces
-    the PGPASSFILE: there is no longer a password to put in a file.
+    THE LEASED CREDENTIAL IS NEVER WRITTEN ANYWHERE, AND NEVER SPLICED INTO A
+    STRING. It is returned as separate user/password arguments for
+    psycopg.connect(), whose conninfo merge handles both keyword/value and URI
+    bases and escapes correctly. Concatenating onto the base broke for a URI
+    base, and libpq's error for that quotes the escaped password, which is not
+    a substring of the registered raw value and so escapes redaction.
+    This is what replaces the PGPASSFILE.
 
     Environment:
         SECOPS_DB_LEASE     Vault path, e.g. database/creds/ingest
@@ -57,7 +48,7 @@ def resolve_dsn(provider: object | None = None) -> str:
         dsn = os.environ.get("SECOPS_DB_DSN")
         if not dsn:
             raise RuntimeError("SECOPS_DB_DSN is not set")
-        return dsn
+        return dsn, {}
 
     base = os.environ.get("SECOPS_DB_BASE_DSN")
     if not base:
@@ -80,13 +71,14 @@ def resolve_dsn(provider: object | None = None) -> str:
     from ..redaction import register_secret
 
     register_secret(password)
-    return f"{base} user={_quote(username)} password={_quote(password)}"
+    return base, {"user": str(username), "password": str(password)}
 
 
 @contextmanager
 def connect(provider: object | None = None) -> Iterator[psycopg.Connection]:
     """Yield a connection with autocommit off, committing on clean exit."""
-    with psycopg.connect(resolve_dsn(provider)) as conn:
+    conninfo, credentials = resolve_conninfo(provider)
+    with psycopg.connect(conninfo, **credentials) as conn:
         yield conn
 
 
