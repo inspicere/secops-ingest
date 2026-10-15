@@ -20,3 +20,11 @@ def test_posture_is_nullable_so_existing_rows_remain_valid():
     # row with a value that was never true of it.
     for declaration in _DECLARATION.findall(control_sql()):
         assert "NOT NULL" not in declaration
+
+
+def test_control_sql_migrates_existing_tables():
+    # CREATE TABLE IF NOT EXISTS does nothing to a table that already exists,
+    # so without these the upgrade fails every run with an undefined column.
+    sql = control_sql()
+    assert "ALTER TABLE control.ingest_run ADD COLUMN IF NOT EXISTS posture text;" in sql
+    assert "ALTER TABLE control.transform_run ADD COLUMN IF NOT EXISTS posture text;" in sql

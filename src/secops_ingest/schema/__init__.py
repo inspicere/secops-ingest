@@ -143,6 +143,13 @@ CREATE TABLE IF NOT EXISTS control.pack (
     enabled_at  timestamptz,
     disabled_at timestamptz
 );
+
+-- Migrations for tables created by an earlier version. CREATE TABLE IF NOT
+-- EXISTS leaves an existing table untouched, so without these an upgraded
+-- host fails every ingest and transform run with an undefined column until
+-- someone remembers to apply the change by hand.
+ALTER TABLE control.ingest_run ADD COLUMN IF NOT EXISTS posture text;
+ALTER TABLE control.transform_run ADD COLUMN IF NOT EXISTS posture text;
 """
 
 
