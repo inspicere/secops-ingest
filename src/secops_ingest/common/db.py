@@ -27,17 +27,66 @@ except ImportError as exc:  # pragma: no cover - depends on extra
     ) from exc
 
 
-def _dsn() -> str:
-    dsn = os.environ.get("SECOPS_DB_DSN")
-    if not dsn:
-        raise RuntimeError("SECOPS_DB_DSN is not set")
-    return dsn
+def _quote(value: str) -> str:
+    """Quote a libpq connection-string value.
+
+    A leased password is generated and can contain spaces, quotes and
+    backslashes. libpq's keyword/value format needs those escaped inside
+    single quotes, and an unescaped one would silently truncate the value --
+    which presents as an authentication failure against a credential that is
+    in fact correct.
+    """
+    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{escaped}'"
+
+
+def resolve_dsn(provider: object | None = None) -> str:
+    """Return a DSN, leasing a credential if one is configured.
+
+    THE LEASED CREDENTIAL IS NEVER WRITTEN ANYWHERE. It is assembled into a
+    connection string in memory and handed to psycopg. This is what replaces
+    the PGPASSFILE: there is no longer a password to put in a file.
+
+    Environment:
+        SECOPS_DB_LEASE     Vault path, e.g. database/creds/ingest
+        SECOPS_DB_BASE_DSN  everything but the credential: host, dbname, sslmode
+        SECOPS_DB_DSN       a complete static DSN, for dev and for Metabase
+    """
+    lease_path = os.environ.get("SECOPS_DB_LEASE")
+    if not lease_path:
+        dsn = os.environ.get("SECOPS_DB_DSN")
+        if not dsn:
+            raise RuntimeError("SECOPS_DB_DSN is not set")
+        return dsn
+
+    base = os.environ.get("SECOPS_DB_BASE_DSN")
+    if not base:
+        raise RuntimeError(
+            "SECOPS_DB_LEASE is set but SECOPS_DB_BASE_DSN is not; it must carry "
+            "host, dbname and sslmode, which a lease does not provide"
+        )
+    leaser = getattr(provider, "lease", None)
+    if not callable(leaser):
+        raise RuntimeError(
+            "SECOPS_DB_LEASE is set but no provider can issue leases; the mapped "
+            "provider's root must be vault_agent"
+        )
+    data = leaser(lease_path)
+    username = data.get("username")
+    password = data.get("password")
+    if not username or not password:
+        raise RuntimeError(f"lease {lease_path} returned no username and password pair")
+
+    from ..redaction import register_secret
+
+    register_secret(password)
+    return f"{base} user={_quote(username)} password={_quote(password)}"
 
 
 @contextmanager
-def connect() -> Iterator[psycopg.Connection]:
+def connect(provider: object | None = None) -> Iterator[psycopg.Connection]:
     """Yield a connection with autocommit off, committing on clean exit."""
-    with psycopg.connect(_dsn()) as conn:
+    with psycopg.connect(resolve_dsn(provider)) as conn:
         yield conn
 
 
