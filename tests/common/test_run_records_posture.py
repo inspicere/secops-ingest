@@ -4,43 +4,10 @@ from typing import Any
 
 import pytest
 
-from secops_ingest.common import run as run_mod
-from secops_ingest.common.run import current_posture
+# Needs the 'postgres' extra: common.run reaches psycopg through common.db.
+pytest.importorskip("psycopg", reason="needs the 'postgres' extra")
 
-
-class WithPosture:
-    class _P:
-        value = "assured"
-
-    posture = _P()
-
-
-class WithoutPosture:
-    pass
-
-
-class Raising:
-    @property
-    def posture(self) -> str:
-        raise RuntimeError("backend unreachable")
-
-
-def test_reads_the_posture_from_a_mapped_provider():
-    assert current_posture(WithPosture()) == "assured"
-
-
-def test_a_provider_without_a_posture_records_none():
-    assert current_posture(WithoutPosture()) is None
-
-
-def test_a_failure_to_read_posture_does_not_fail_the_run():
-    # The posture is a diagnostic. A run that ingested correctly must not be
-    # recorded as FAILED because a label could not be determined.
-    assert current_posture(Raising()) is None
-
-
-def test_none_provider_records_none():
-    assert current_posture(None) is None
+from secops_ingest.common import run as run_mod  # noqa: E402
 
 
 class _EmptySource:
@@ -68,6 +35,13 @@ class _FakeConn:
         return None
 
 
+class _Provider:
+    class _P:
+        value = "assured"
+
+    posture = _P()
+
+
 def test_an_ingest_run_is_started_with_the_provider_posture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -83,6 +57,6 @@ def test_an_ingest_run_is_started_with_the_provider_posture(
     monkeypatch.setattr(run_mod.db, "get_watermark", lambda conn, name: None)
     monkeypatch.setattr(run_mod.db, "finish_run", lambda *a, **k: None)
 
-    run_mod.execute(_EmptySource(), provider=WithPosture())
+    run_mod.execute(_EmptySource(), provider=_Provider())
 
     assert recorded["posture"] == "assured"

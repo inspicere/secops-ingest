@@ -19,7 +19,7 @@ from typing import Any
 from psycopg import sql
 
 from ..common import db
-from ..common.run import current_posture
+from ..common.posture import current_posture
 from .base import Target, effective_since, should_skip
 
 log = logging.getLogger(__name__)

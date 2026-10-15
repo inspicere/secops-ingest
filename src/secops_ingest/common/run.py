@@ -19,6 +19,7 @@ from typing import Any, Protocol
 from ..packs.registry import discover as _discover_packs
 from ..redaction import scrub
 from . import db
+from .posture import current_posture
 from .watermark import newer as _newer
 
 log = logging.getLogger(__name__)
@@ -111,23 +112,6 @@ def _pack_state_of(conn: Any, source_name: str) -> str | None:
     if stored is None or stored.state != "DISABLED":
         return None
     return stored.state
-
-
-def current_posture(provider: object | None) -> str | None:
-    """Return the provider's declared posture, or None.
-
-    Never raises. The posture is a diagnostic written alongside a run; a run
-    that ingested correctly must not be recorded as FAILED because reading a
-    label failed. A provider with no posture -- env, file, vault -- yields
-    None, which reads as "not declared" rather than as a claim.
-    """
-    try:
-        posture = getattr(provider, "posture", None)
-        if posture is None:
-            return None
-        return str(getattr(posture, "value", posture))
-    except Exception:  # noqa: BLE001 - a diagnostic must not fail the run
-        return None
 
 
 def execute(
