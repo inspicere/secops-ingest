@@ -14,6 +14,8 @@ the boundary where a value is resolved, not at each of its call sites.
 
 from __future__ import annotations
 
+from typing import NoReturn
+
 from ..redaction import register_secret
 
 #: Shown instead of the value. Deliberately not the redaction placeholder:
@@ -53,9 +55,21 @@ class Secret:
         return f"Secret({MASK}, len={len(self._value)})"
 
     def __format__(self, format_spec: str) -> str:
-        # Without this, f"{s:>20}" would fall through to object.__format__ and
-        # could expose the value on some Python versions.
+        # Without this, f"{s:>20}" would raise TypeError from object.__format__
+        # (it accepts only an empty spec there). With it, the spec applies to
+        # the mask, so the padding works and the value stays hidden.
         return format(MASK, format_spec)
+
+    def __reduce__(self) -> NoReturn:
+        # pickle serialises __slots__ state, which would write the plaintext to
+        # whatever receives the bytes: a multiprocessing hand-off, an on-disk
+        # cache. Refuse instead. The message names the type, never the value.
+        raise TypeError("Secret is not picklable")
+
+    def __copy__(self) -> Secret:
+        # copy.copy would otherwise fall back to __reduce__ and hit the refusal
+        # above. Copying stays in-process, so it is safe to allow.
+        return Secret(self._value)
 
     def __eq__(self, other: object) -> bool:
         # Only against another Secret. Comparing to a bare str is almost
