@@ -18,6 +18,7 @@ while the agent is proved, and nothing switches until it is.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from .base import SecretError, SecretNotFound, SecretProvider
@@ -48,6 +49,7 @@ class VaultAgentSecretProvider(SecretProvider):
                 "pip install secops-ingest[http]"
             ) from exc
         if transport is None:
+            socket = socket or os.environ.get("SECOPS_VAULT_AGENT_SOCKET")
             if not socket:
                 raise SecretError("VaultAgentSecretProvider requires a socket path")
             transport = httpx.HTTPTransport(uds=socket)

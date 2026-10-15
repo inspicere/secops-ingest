@@ -5,7 +5,7 @@ import pytest
 
 httpx = pytest.importorskip("httpx", reason="needs the 'http' extra")
 
-from secops_ingest.secrets import SecretNotFound  # noqa: E402
+from secops_ingest.secrets import SecretError, SecretNotFound  # noqa: E402
 from secops_ingest.secrets.vault_agent import VaultAgentSecretProvider  # noqa: E402
 
 
@@ -90,3 +90,35 @@ def test_a_locator_without_a_path_is_rejected():
 
     with pytest.raises(Exception, match="requires a 'path'"):
         _provider(handler).fetch_locator({"field": "f"})
+
+
+def _recording_transport(monkeypatch):
+    seen: list[object] = []
+
+    class Recorder(httpx.HTTPTransport):
+        def __init__(self, uds=None, **kwargs):
+            seen.append(uds)
+            super().__init__(uds=uds, **kwargs)
+
+    monkeypatch.setattr(httpx, "HTTPTransport", Recorder)
+    return seen
+
+
+def test_the_socket_comes_from_the_environment_when_not_passed(monkeypatch):
+    monkeypatch.setenv("SECOPS_VAULT_AGENT_SOCKET", "/env/agent.sock")
+    seen = _recording_transport(monkeypatch)
+    VaultAgentSecretProvider()
+    assert seen == ["/env/agent.sock"]
+
+
+def test_an_explicit_socket_wins_over_the_environment(monkeypatch):
+    monkeypatch.setenv("SECOPS_VAULT_AGENT_SOCKET", "/env/agent.sock")
+    seen = _recording_transport(monkeypatch)
+    VaultAgentSecretProvider(socket="/explicit/agent.sock")
+    assert seen == ["/explicit/agent.sock"]
+
+
+def test_no_socket_from_either_source_is_still_an_error(monkeypatch):
+    monkeypatch.delenv("SECOPS_VAULT_AGENT_SOCKET", raising=False)
+    with pytest.raises(SecretError, match="requires a socket path"):
+        VaultAgentSecretProvider()
