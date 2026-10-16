@@ -22,11 +22,15 @@ from .base import (
 )
 from .env import EnvSecretProvider
 from .file import FileSecretProvider
+from .mapped import MappedSecretProvider
+from .secret import Secret
 
 __all__ = [
     "EnvSecretProvider",
     "FileSecretProvider",
     "InvalidSecretName",
+    "MappedSecretProvider",
+    "Secret",
     "SecretError",
     "SecretNotFound",
     "SecretProvider",
@@ -40,6 +44,8 @@ ENTRY_POINT_GROUP = "secops_ingest.secret_providers"
 _BUILTIN: dict[str, type[SecretProvider]] = {
     "env": EnvSecretProvider,
     "file": FileSecretProvider,
+    # Composite: dispatches per name via a map served by a root provider.
+    "mapped": MappedSecretProvider,
 }
 
 

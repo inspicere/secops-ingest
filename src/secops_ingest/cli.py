@@ -11,11 +11,13 @@ from __future__ import annotations
 import argparse
 import importlib
 import logging
+import os
 import sys
 from typing import Any
 
 from .packs.registry import AmbiguousSource, DuplicatePack, UnknownSource, resolve_source
 from .redaction import RedactingFilter
+from .secrets import get_provider
 
 
 def _load_source(name: str) -> Any:
@@ -67,13 +69,19 @@ def main(argv: list[str] | None = None) -> int:
 
     from .common import run as run_mod
 
+    log = logging.getLogger(__name__)
     source = _load_source(args.source)
-    kwargs = {"dry_run": args.dry_run}
+    kwargs: dict[str, Any] = {"dry_run": args.dry_run}
     if args.batch_size is not None:
         kwargs["batch_size"] = args.batch_size
-
-    log = logging.getLogger(__name__)
     try:
+        # No backend named is the ordinary static-DSN case: no provider at all.
+        # A backend named but unbuildable is a misconfiguration, so get_provider's
+        # failure propagates and fails the run. Falling back there would run the
+        # job on whatever SECOPS_DB_DSN holds, with only a warning to show for it.
+        kwargs["provider"] = (
+            get_provider() if os.environ.get("SECOPS_SECRETS_BACKEND") else None
+        )
         result = run_mod.execute(source, **kwargs)
     except Exception:
         log.exception("source=%s failed", args.source)

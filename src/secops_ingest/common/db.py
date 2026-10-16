@@ -27,18 +27,69 @@ except ImportError as exc:  # pragma: no cover - depends on extra
     ) from exc
 
 
-def _dsn() -> str:
-    dsn = os.environ.get("SECOPS_DB_DSN")
-    if not dsn:
-        raise RuntimeError("SECOPS_DB_DSN is not set")
-    return dsn
+def resolve_conninfo(provider: object | None = None) -> tuple[str, dict[str, str]]:
+    """Return (conninfo, credential kwargs), leasing a credential if configured.
+
+    THE LEASED CREDENTIAL IS NEVER WRITTEN ANYWHERE, AND NEVER SPLICED INTO A
+    STRING. It is returned as separate user/password arguments for
+    psycopg.connect(), whose conninfo merge handles both keyword/value and URI
+    bases and escapes correctly. Concatenating onto the base broke for a URI
+    base, and libpq's error for that quotes the escaped password, which is not
+    a substring of the registered raw value and so escapes redaction.
+    This is what replaces the PGPASSFILE.
+
+    Environment:
+        SECOPS_DB_LEASE     Vault path, e.g. database/creds/ingest
+        SECOPS_DB_BASE_DSN  everything but the credential: host, dbname, sslmode
+        SECOPS_DB_DSN       a complete static DSN, for dev and for Metabase
+    """
+    lease_path = os.environ.get("SECOPS_DB_LEASE")
+    if not lease_path:
+        dsn = os.environ.get("SECOPS_DB_DSN")
+        if not dsn:
+            raise RuntimeError("SECOPS_DB_DSN is not set")
+        return dsn, {}
+
+    base = os.environ.get("SECOPS_DB_BASE_DSN")
+    if not base:
+        raise RuntimeError(
+            "SECOPS_DB_LEASE is set but SECOPS_DB_BASE_DSN is not; it must carry "
+            "host, dbname and sslmode, which a lease does not provide"
+        )
+    leaser = getattr(provider, "lease", None)
+    if not callable(leaser):
+        raise RuntimeError(
+            "SECOPS_DB_LEASE is set but no provider can issue leases; the mapped "
+            "provider's root must be vault_agent"
+        )
+    data = leaser(lease_path)
+    username = data.get("username")
+    password = data.get("password")
+    if not username or not password:
+        raise RuntimeError(f"lease {lease_path} returned no username and password pair")
+
+    from ..redaction import register_secret
+
+    register_secret(password)
+    return base, {"user": str(username), "password": str(password)}
 
 
 @contextmanager
-def connect() -> Iterator[psycopg.Connection]:
+def connect(provider: object | None = None) -> Iterator[psycopg.Connection]:
     """Yield a connection with autocommit off, committing on clean exit."""
-    with psycopg.connect(_dsn()) as conn:
-        yield conn
+    conninfo, credentials = resolve_conninfo(provider)
+    # Passed by name rather than **credentials: psycopg.connect is overloaded
+    # with typed keyword parameters, so a dict[str, str] splat does not
+    # typecheck once psycopg's stubs are installed. Visible only in the
+    # mypy-with-drivers job, which exists for exactly this class of error.
+    if credentials:
+        with psycopg.connect(
+            conninfo, user=credentials["user"], password=credentials["password"]
+        ) as conn:
+            yield conn
+    else:
+        with psycopg.connect(conninfo) as conn:
+            yield conn
 
 
 def _split_ident(qualified: str) -> sql.Identifier:
@@ -51,12 +102,12 @@ def _split_ident(qualified: str) -> sql.Identifier:
 
 # --- run bookkeeping -------------------------------------------------------
 
-def start_run(conn: psycopg.Connection, source: str) -> int:
+def start_run(conn: psycopg.Connection, source: str, *, posture: str | None = None) -> int:
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO control.ingest_run (source, status) "
-            "VALUES (%s, 'RUNNING') RETURNING run_id",
-            (source,),
+            "INSERT INTO control.ingest_run (source, status, posture) "
+            "VALUES (%s, 'RUNNING', %s) RETURNING run_id",
+            (source, posture),
         )
         row = cur.fetchone()
         if row is None:

@@ -19,6 +19,7 @@ from typing import Any, Protocol
 from ..packs.registry import discover as _discover_packs
 from ..redaction import scrub
 from . import db
+from .posture import current_posture
 from .watermark import newer as _newer
 
 log = logging.getLogger(__name__)
@@ -113,9 +114,15 @@ def _pack_state_of(conn: Any, source_name: str) -> str | None:
     return stored.state
 
 
-def execute(source: Source, *, dry_run: bool = False, batch_size: int = DEFAULT_BATCH) -> Result:
+def execute(
+    source: Source,
+    *,
+    dry_run: bool = False,
+    batch_size: int = DEFAULT_BATCH,
+    provider: object | None = None,
+) -> Result:
     """Run one ingest cycle. Never returns silently on failure."""
-    with db.connect() as conn:
+    with db.connect(provider) as conn:
         state = _pack_state_of(conn, source.name)
         if state == "AMBIGUOUS":
             # Same collision registry.resolve_source calls AmbiguousSource for,
@@ -141,7 +148,10 @@ def execute(source: Source, *, dry_run: bool = False, batch_size: int = DEFAULT_
             )
             return Result("DISABLED", 0, 0)
 
-        run_id = 0 if dry_run else db.start_run(conn, source.name)
+        run_id = (
+            0 if dry_run
+            else db.start_run(conn, source.name, posture=current_posture(provider))
+        )
         read = written = 0
         high_watermark: Any = None
         try:

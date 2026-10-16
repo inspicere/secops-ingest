@@ -19,6 +19,7 @@ from typing import Any
 from psycopg import sql
 
 from ..common import db
+from ..common.posture import current_posture
 from .base import Target, effective_since, should_skip
 
 log = logging.getLogger(__name__)
@@ -32,12 +33,12 @@ class TransformResult:
     error: str | None = None
 
 
-def _start(conn: Any, target: str) -> int:
+def _start(conn: Any, target: str, posture: str | None) -> int:
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO control.transform_run (target, status) "
-            "VALUES (%s, 'RUNNING') RETURNING run_id",
-            (target,),
+            "INSERT INTO control.transform_run (target, status, posture) "
+            "VALUES (%s, 'RUNNING', %s) RETURNING run_id",
+            (target, posture),
         )
         run_id = cur.fetchone()[0]
     conn.commit()
@@ -79,7 +80,9 @@ def _advance(conn: Any, target: str, value: Any) -> None:
 
 def execute(target: Target) -> TransformResult:
     with db.connect() as conn:
-        run_id = _start(conn, target.name)
+        # No secret provider reaches the transform runner yet, so this records
+        # None until a provider is threaded through.
+        run_id = _start(conn, target.name, current_posture(None))
         try:
             since = _watermark(conn, target.name)
 
