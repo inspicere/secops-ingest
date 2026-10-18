@@ -16,9 +16,11 @@ import pytest
 
 pytest.importorskip("httpx", reason="needs the 'http' extra")
 
+from secops_ingest.common.http import RetryBudgetExhausted
 from secops_ingest.sources.defectdojo import (
     DEFAULT_PAGE_SIZE,
     DEFAULT_TIMEOUT_SEC,
+    MIN_PAGE_SIZE,
     DefectDojoSource,
 )
 
@@ -257,6 +259,123 @@ def test_the_watermark_comes_from_the_highest_mark_yielded(
     got = drive(source, rec, cursor="2026-09-01T00:00:00-05:00")
     marks = [source.watermark_of(f) for f in got]
     assert max(marks) == "2026-09-09T00:00:00-05:00"
+
+
+# -- surviving a server that cannot keep up -----------------------------------
+#
+# MEASURED 2026-10-18 against a DefectDojo at load 48 with its memory
+# exhausted: adjacent offsets returned 0.26 MB in 32s, then nothing in 150s,
+# then 0.64 MB in 60s. The payloads were ordinary -- 100 findings totalling
+# 1.2 MB, median 7.1 KB -- so the timeouts were the server, not the data.
+#
+# `with_retries` retries the IDENTICAL request, so a timed-out page times out
+# again five times over. At a 120s timeout that is ten minutes of silence
+# followed by a failed run, which is how a transient server problem became a
+# fourteen-minute livelocked run. A timeout means "that was too much to ask
+# for", so the answer is to ask for less, at the same offset.
+
+
+class _TimeoutThenOk:
+    """Times out while the page is larger than `ok_at`, then succeeds."""
+
+    def __init__(self, ok_at: int, pages: list[dict[str, Any]]) -> None:
+        self.ok_at = ok_at
+        self.pages = pages
+        self.params: list[dict[str, Any]] = []
+
+    def __call__(self, creds: Any, params: dict[str, Any]) -> dict[str, Any]:
+        import httpx
+
+        self.params.append(dict(params))
+        if params["limit"] > self.ok_at:
+            raise httpx.ReadTimeout("too much to ask for")
+        return self.pages.pop(0) if self.pages else page([])
+
+
+def test_a_timed_out_page_is_retried_smaller_at_the_same_offset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "https://dojo.example.com")
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_PAGE_SIZE", "1000")
+    src = DefectDojoSource()
+    rec = _TimeoutThenOk(250, [page([finding(1, "2026-09-09T00:00:00-05:00")])])
+    got = drive(src, rec, cursor=None)
+
+    assert [f["id"] for f in got] == [1]
+    sizes = [p["limit"] for p in rec.params]
+    assert sizes[0] == 1000, "it still tries the fast size first"
+    assert sizes[-1] <= 250, "and shrinks until the server can answer"
+    assert {p["offset"] for p in rec.params} == {0}, "never advancing past the gap"
+
+
+def test_the_smaller_page_size_sticks_for_the_rest_of_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server that refused 1000 once should not be asked for 1000 again.
+
+    Recovering optimistically would re-pay the timeout on every page of a long
+    scan. Once the server has shown what it can serve, the run keeps asking for
+    that.
+    """
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "https://dojo.example.com")
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_PAGE_SIZE", "1000")
+    src = DefectDojoSource()
+    rec = _TimeoutThenOk(250, [
+        page([finding(1, "2026-09-09T00:00:00-05:00")], more=True),
+        page([finding(2, "2026-09-09T00:00:00-05:00")]),
+    ])
+    drive(src, rec, cursor=None)
+
+    after_first_success = [p["limit"] for p in rec.params if p["offset"] > 0]
+    assert after_first_success, "a second page was fetched"
+    assert all(n <= 250 for n in after_first_success), "it did not go back to 1000"
+
+
+def test_shrinking_stops_at_the_floor_and_the_run_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Below the floor, failing loudly beats shrinking to nothing.
+
+    A page of one record that still times out is a broken server, not a large
+    page, and pretending otherwise would walk the whole collection one timeout
+    at a time.
+    """
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "https://dojo.example.com")
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_PAGE_SIZE", "1000")
+    src = DefectDojoSource()
+    rec = _TimeoutThenOk(0, [])  # never succeeds at any size
+
+    with pytest.raises(RetryBudgetExhausted):
+        drive(src, rec, cursor=None)
+
+    # The LADDER is asserted, not `min(...) >= MIN_PAGE_SIZE` -- that compares
+    # the sizes tried against the very constant under test, so it holds for any
+    # floor and cannot fail. Pinning the concrete sequence fixes both the
+    # divisor and the floor, and fails if either moves.
+    assert sorted({p["limit"] for p in rec.params}, reverse=True) == [1000, 250, 62, 25]
+    assert MIN_PAGE_SIZE == 25
+
+
+def test_a_non_timeout_failure_is_not_shrunk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shrinking a 500 would just ask a broken endpoint the same thing slower."""
+    import httpx
+
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "https://dojo.example.com")
+    src = DefectDojoSource()
+
+    calls: list[int] = []
+
+    def boom(creds: Any, params: dict[str, Any]) -> dict[str, Any]:
+        calls.append(params["limit"])
+        raise httpx.HTTPStatusError(
+            "bad request",
+            request=httpx.Request("GET", "https://dojo.example.com"),
+            response=httpx.Response(400),
+        )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        drive(src, boom, cursor=None)
+    assert len(set(calls)) == 1, "one page size was tried, not a ladder"
 
 
 # -- pagination ---------------------------------------------------------------

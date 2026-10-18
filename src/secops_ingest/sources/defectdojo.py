@@ -74,7 +74,7 @@ from collections.abc import Iterator
 from functools import partial
 from typing import Any
 
-from ..common.http import with_retries
+from ..common.http import RetryBudgetExhausted, with_retries
 from ..common.payload import to_json
 from ..common.watermark import comparable
 from ..secrets import get_provider
@@ -101,6 +101,23 @@ DEFAULT_PAGE_SIZE = 1000
 #: unbounded (see above), so a deployment with heavier findings needs room
 #: without editing the package.
 DEFAULT_TIMEOUT_SEC = 120
+
+#: Floor for shrink-on-timeout. Below this a timeout is a broken server rather
+#: than a large page, and walking ~52k findings 25 at a time through a server
+#: that cannot answer would take longer than any unit timeout allows. Failing
+#: loudly at the floor is the honest outcome.
+MIN_PAGE_SIZE = 25
+
+#: Divisor for each shrink step: 1000 -> 250 -> 62 -> 25 (floor). Four sizes
+#: rather than a gentle ramp, because each attempt costs a full timeout and the
+#: point is to find a size that works quickly, not to probe politely.
+SHRINK_FACTOR = 4
+
+#: Attempts per page size. Two, not the helper's default of five: a timeout
+#: means the request was too large, and asking the same question again is the
+#: behaviour this exists to replace. One retry still absorbs a genuinely
+#: transient blip before the size is reduced.
+PAGE_ATTEMPTS = 2
 
 #: The only ordering. `id` is indexed; `last_status_update` is not, so ordering
 #: on it makes PostgreSQL sort the whole collection for EVERY request. Measured
@@ -195,6 +212,10 @@ class DefectDojoSource:
         precisely because it stopped early; a full scan does not.
         """
         offset = 0
+        # Run-local, because a timeout reduces it for the REST of the run: a
+        # server that refused 1000 once should not be asked for 1000 again, or
+        # a long scan re-pays the timeout on every page.
+        page_size = self.page_size
         floor = comparable(cursor) if cursor else None
         if floor is None:
             log.info("no watermark: first run reads the whole collection")
@@ -202,14 +223,15 @@ class DefectDojoSource:
         scanned = kept = 0
         while True:
             params = {
-                "limit": self.page_size,
+                "limit": page_size,
                 "offset": offset,
                 # `o`, not `ordering`. See the module docstring: the
                 # conventional name is accepted and silently ignored.
                 "o": ORDER_BY,
             }
             started = time.monotonic()
-            payload = with_retries(partial(self._get, creds, params))
+            payload, page_size = self._get_page(creds, offset, page_size)
+            params["limit"] = page_size
             elapsed = time.monotonic() - started
             results = payload.get("results") or []
             scanned += len(results)
@@ -242,7 +264,60 @@ class DefectDojoSource:
             if not payload.get("next"):
                 log.info("scan complete: %d findings read, %d changed", scanned, kept)
                 return
-            offset += self.page_size
+            offset += page_size
+
+    def _get_page(
+        self, creds: Any, offset: int, page_size: int
+    ) -> tuple[dict[str, Any], int]:
+        """Fetch one page, shrinking it rather than repeating it on a timeout.
+
+        `with_retries` retries the IDENTICAL request. For a 5xx or a dropped
+        connection that is right; for a timeout it is not, because the same
+        request will time out again. Measured against a DefectDojo at load 48,
+        five attempts at a 120s timeout produced ten minutes of silence and then
+        a failed run -- which is how a transient server problem turned into a
+        livelocked one, since the run committed rows but never its watermark.
+
+        A timeout means the request was too large to answer, so this asks for
+        less AT THE SAME OFFSET. Nothing is skipped: the offset only advances
+        once a page has actually been returned.
+
+        Returns the payload and the size that worked, so the caller can keep
+        using it.
+        """
+        import httpx
+
+        size = page_size
+        while True:
+            params = {"limit": size, "offset": offset, "o": ORDER_BY}
+            try:
+                payload = with_retries(
+                    partial(self._get, creds, params), attempts=PAGE_ATTEMPTS
+                )
+            except RetryBudgetExhausted as exc:
+                # Only a timeout means "too large". A 5xx or a transport error
+                # has already been retried, and a smaller page would just ask a
+                # broken endpoint the same thing more slowly.
+                if not isinstance(exc.__cause__, httpx.TimeoutException):
+                    raise
+                if size <= MIN_PAGE_SIZE:
+                    log.error(
+                        "offset=%d still timing out at limit=%d, the floor; "
+                        "the server cannot serve this collection right now",
+                        offset, size,
+                    )
+                    raise
+                smaller = max(MIN_PAGE_SIZE, size // SHRINK_FACTOR)
+                log.warning(
+                    "offset=%d timed out at limit=%d; retrying at limit=%d "
+                    "(kept for the rest of the run)",
+                    offset, size, smaller,
+                )
+                size = smaller
+                continue
+            if size != page_size:
+                log.info("page size is now %d for the remainder of the run", size)
+            return payload, size
 
     def _get(self, creds: Any, params: dict[str, Any]) -> dict[str, Any]:
         """One API call. Separated so tests can drive fetch() offline."""
