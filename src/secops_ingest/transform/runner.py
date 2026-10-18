@@ -20,6 +20,7 @@ from psycopg import sql
 
 from ..common import db
 from ..common.posture import current_posture
+from ..common.schema_check import verify_control_schema
 from .base import Target, effective_since, should_skip
 
 log = logging.getLogger(__name__)
@@ -80,6 +81,10 @@ def _advance(conn: Any, target: str, value: Any) -> None:
 
 def execute(target: Target) -> TransformResult:
     with db.connect() as conn:
+        # Before the run-ledger INSERT below: a schema behind the package
+        # turns it into a driver traceback, and a refused run must not leave
+        # a RUNNING row behind.
+        verify_control_schema(conn)
         # No secret provider reaches the transform runner yet, so this records
         # None until a provider is threaded through.
         run_id = _start(conn, target.name, current_posture(None))

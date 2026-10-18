@@ -53,6 +53,9 @@ def test_an_ingest_run_is_started_with_the_provider_posture(
 
     monkeypatch.setattr(run_mod.db, "connect", lambda provider=None: _FakeConn())
     monkeypatch.setattr(run_mod, "_pack_state_of", lambda conn, name: None)
+    # This file stubs the database, so the startup schema-drift check -- which
+    # needs a real information_schema answer -- is parked, not exercised.
+    monkeypatch.setattr(run_mod.schema_check, "verify_control_schema", lambda conn: None)
     monkeypatch.setattr(run_mod.db, "start_run", start_run)
     monkeypatch.setattr(run_mod.db, "get_watermark", lambda conn, name: None)
     monkeypatch.setattr(run_mod.db, "finish_run", lambda *a, **k: None)
@@ -75,6 +78,7 @@ def test_the_provider_given_to_execute_reaches_the_connection(
 
     monkeypatch.setattr(run_mod.db, "connect", connect)
     monkeypatch.setattr(run_mod, "_pack_state_of", lambda conn, name: None)
+    monkeypatch.setattr(run_mod.schema_check, "verify_control_schema", lambda conn: None)
     monkeypatch.setattr(run_mod.db, "start_run", lambda *a, **k: 1)
     monkeypatch.setattr(run_mod.db, "get_watermark", lambda conn, name: None)
     monkeypatch.setattr(run_mod.db, "finish_run", lambda *a, **k: None)

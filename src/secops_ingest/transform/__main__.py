@@ -44,10 +44,17 @@ def main(argv: list[str] | None = None) -> int:
     # postgres -- and the error handling below was never exercised anywhere.
     # Argument parsing and registry failures need no driver; only running a
     # transform does.
+    from ..common.schema_check import ControlSchemaDrift
     from . import runner
 
     try:
         result = runner.execute(targets[args.target])
+    except ControlSchemaDrift as exc:
+        # The warehouse is older than the package: a configuration state, not
+        # a crash, so one line on stderr and a non-zero exit -- never the
+        # traceback the generic handler below would log.
+        print(str(exc), file=sys.stderr)
+        return 1
     except Exception:
         # Log here as well as in the runner: a bare `return 1` produced an exit
         # code with no output at all, which is indistinguishable from a crash.
