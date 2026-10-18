@@ -50,19 +50,17 @@ finding discovered two years ago and modified yesterday, and the warehouse keeps
 seven years of history for year-over-year reporting.
 
 So this connector cannot ask for "what changed" the way the Wazuh one does. It
-sorts by modification time descending and stops as soon as it reaches records
-older than the watermark, reading only the changed head of the collection.
+scans the whole collection by id -- the only indexed ordering -- and filters in
+process, because a full scan on an indexed column is several times cheaper than
+a partial scan on an unindexed one. See `fetch` for the measurements.
 
 Configuration:
 
     SECOPS_DEFECTDOJO_URL        base URL, e.g. https://dojo.example.com
     SECOPS_DEFECTDOJO_SECRET     secret name (default defectdojo_api_token)
-    SECOPS_DEFECTDOJO_PAGE_SIZE  results per request on an INCREMENTAL run
-                                 (default 25 -- see below)
-    SECOPS_DEFECTDOJO_BACKFILL_PAGE_SIZE
-                                 results per request on a BACKFILL (default
-                                 1000; the backfill sorts on an indexed column
-                                 and 25 cannot finish inside the unit timeout)
+    SECOPS_DEFECTDOJO_PAGE_SIZE  results per request (default 1000)
+    SECOPS_DEFECTDOJO_TIMEOUT_SEC
+                                 per-request timeout in seconds (default 120)
     SECOPS_DEFECTDOJO_CA_BUNDLE  CA bundle for the API's certificate
     SECOPS_DEFECTDOJO_INSECURE   set to 1 to skip TLS verification (logged)
 """
@@ -83,77 +81,45 @@ from ..secrets import get_provider
 
 log = logging.getLogger(__name__)
 
-#: Deliberately small. Finding payloads vary enormously -- a typical one is ~3KB,
-#: but a finding carrying a scan dump in its description can be 100x that -- so
-#: page size is not a reliable throttle on response size. Measured against a live
-#: instance holding ~50k findings:
+#: One page size, because there is now one ordering. 1000, chosen from the worst
+#: page measured rather than from caution.
 #:
-#:     limit=25    0.4s     76 KB
-#:     limit=50   29.0s    5.9 MB      <- one large finding lands in the page
-#:     limit=100  did not return within 120s
+#: Sampled across the id range at limit=200, from the host the connector runs
+#: on, pages run 0.4-1.9 MB -- the heaviest region is the oldest ids. A
+#: 1000-record page there is 4.9 MB and 13.2s, which is 22% of
+#: DEFAULT_TIMEOUT_SEC. The whole collection (~52k findings, ~176 MB) is ~52
+#: requests and about five minutes.
 #:
-#: The failure mode is asymmetric. A small page costs extra round trips; a large
-#: page exceeds the HTTP timeout, and with_retries then retries it five times,
-#: turning a slow endpoint into several minutes of silence. Err small.
-DEFAULT_PAGE_SIZE = 25
+#: PAGE SIZE CANNOT BOUND RESPONSE SIZE and never could: a finding carrying a
+#: scan dump in its description is 100x a typical one, and such findings cluster
+#: by id because one import writes many at once. So the real guard is the
+#: timeout below, and this number only trades request count against page weight.
+DEFAULT_PAGE_SIZE = 1000
 
-#: Backfill page size, forty times the incremental one, and the asymmetry is the
-#: whole point: THE TWO PATHS DO NOT COST THE SAME, because they do not sort on
-#: the same column.
-#:
-#: The note above is about `-last_status_update`, which has no index. This is
-#: about `-id`, which does. Re-measured 2026-10-17 against a 48,845-finding
-#: instance, one page at offset=20000:
-#:
-#:     o=-id                   limit=25      3.24s     69 KB
-#:     o=-id                   limit=100     3.51s    275 KB
-#:     o=-id                   limit=500     5.16s    1.4 MB
-#:     o=-id                   limit=1000    7.44s    2.7 MB
-#:     o=-last_status_update   limit=25      2.06s    110 KB
-#:     o=-last_status_update   limit=100    90.31s   17.4 MB
-#:     o=-last_status_update   limit=500    TIMED OUT at 180s
-#:
-#: A 40x larger page costs 2.3x the time on the indexed ordering, because a
-#: fixed ~1.7s per request dominates. So the arithmetic that matters:
-#:
-#:     limit=25     1,954 requests   ~105 min   exceeds the 1800s unit timeout
-#:     limit=1000      49 requests     ~6 min   comfortable
-#:
-#: THIS IS WHY THE BACKFILL COULD NEVER FINISH. It was not the byte rate. One
-#: page size was shared by a path that must stay small and a path that must not,
-#: and 25 is correct for the first and unusable for the second. The unit was
-#: killed at its timeout, having committed rows but not its watermark, so the
-#: next run restarted the same backfill -- progress-free, indefinitely.
-#:
-#: Do NOT raise the incremental size to match. The table above is why: at
-#: limit=100 that ordering takes 90s and returns 17.4 MB, and at 500 it does not
-#: return at all.
-DEFAULT_BACKFILL_PAGE_SIZE = 1000
+#: Was hardcoded at 60.0, two seconds above the 58-59s pages that were killing
+#: incremental runs. Raised and made configurable because bytes per page are
+#: unbounded (see above), so a deployment with heavier findings needs room
+#: without editing the package.
+DEFAULT_TIMEOUT_SEC = 120
 
-#: Incremental ordering. Descending, so the newest modification is the first
-#: record returned — see `fetch` for why that is load-bearing.
-ORDER_BY = "-last_status_update"
-
-#: Backfill ordering, and the reason is performance rather than taste.
+#: The only ordering. `id` is indexed; `last_status_update` is not, so ordering
+#: on it makes PostgreSQL sort the whole collection for EVERY request. Measured
+#: from the connector's own host:
 #:
-#: last_status_update carries no index in DefectDojo, so ordering on it makes
-#: PostgreSQL sort the entire collection for EVERY page. Measured against a
-#: ~51k-finding instance:
+#:     limit=25    o=-last_status_update    51.3s   10.5 MB    206 KB/s
+#:     limit=100   o=-last_status_update    TIMED OUT at 200s
+#:     limit=1000  o=-id                     5.4s    8.4 MB   1.56 MB/s
 #:
-#:     limit=25                          0.5s
-#:     limit=25&o=-id                    0.7s
-#:     limit=25&o=-last_status_update   43.4s
-#:     limit=25&o=-id&offset=40000       0.4s   (offset itself is free)
-#:
-#: An incremental run reads a handful of pages and can afford it. A backfill
-#: reads ~2,000, which is 24 hours against 20 minutes.
-#:
-#: Ordering by id is safe for a backfill precisely because a backfill has no
-#: early stop to support: it reads everything, so the order records arrive in
-#: does not affect what is collected. The watermark is still correct because the
-#: framework keeps the MAXIMUM watermark it observes, not the last one.
-ORDER_BY_BACKFILL = "-id"
-
+#: DESCENDING, not ascending, and it matters for one reason only: offset
+#: pagination over a mutable collection. A finding modified mid-scan does not
+#: move under `-id` -- ids do not change -- so unlike the old modification-time
+#: ordering, a page boundary neither re-reads nor skips because of an update. A
+#: finding CREATED mid-scan gets the highest id and lands at the front,
+#: shifting later records one place back, so a boundary re-reads a record rather
+#: than skipping one, which the upsert absorbs. Ascending would put new findings
+#: at the END, past the last page the scan computed, so they would be missed
+#: until the next run -- harmless but needlessly late.
+ORDER_BY = "-id"
 
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
@@ -176,9 +142,7 @@ class DefectDojoSource:
         self.url = (os.environ.get("SECOPS_DEFECTDOJO_URL") or "").rstrip("/")
         self.secret_name = os.environ.get("SECOPS_DEFECTDOJO_SECRET", "defectdojo_api_token")
         self.page_size = _env_int("SECOPS_DEFECTDOJO_PAGE_SIZE", DEFAULT_PAGE_SIZE)
-        self.backfill_page_size = _env_int(
-            "SECOPS_DEFECTDOJO_BACKFILL_PAGE_SIZE", DEFAULT_BACKFILL_PAGE_SIZE
-        )
+        self.timeout_sec = _env_int("SECOPS_DEFECTDOJO_TIMEOUT_SEC", DEFAULT_TIMEOUT_SEC)
 
     # -- credentials --------------------------------------------------------
 
@@ -194,92 +158,91 @@ class DefectDojoSource:
     # -- fetching -----------------------------------------------------------
 
     def fetch(self, creds: Any, cursor: str | None) -> Iterator[dict[str, Any]]:
-        """Yield findings modified at or after `cursor`, newest first.
+        """Scan the whole collection by id, yielding only what changed.
 
-        The API cannot filter by time, so this walks the collection sorted by
-        modification time descending and stops at the first record older than
-        the cursor. Only the changed head is read; the other ~50k findings are
-        never fetched.
+        WHY A FULL SCAN IS CHEAPER THAN A PARTIAL ONE. The API has no filter on
+        the modification axis -- `last_status_update` takes an exact match and
+        has no range variant, and an unknown parameter is silently ignored
+        rather than rejected, so no spelling of it works. The previous design
+        therefore sorted by modification time descending and stopped at the
+        first record older than the cursor, reading only the changed head.
 
-        WHY DESCENDING IS LOAD-BEARING. The first record returned carries the
-        highest modification time in the collection, so the watermark the run
-        records is the high-water mark *as of the moment the scan started*.
-        Anything modified while the scan is in progress is necessarily newer
-        than that, so it is picked up by the next run rather than missed. The
-        framework already keeps the maximum watermark it sees, so this needs no
-        special handling here — but it is the reason ascending order would be
-        wrong, and the reason this is not simply a stylistic choice.
+        Measured 2026-10-18, that head is not reliably small and the ordering is
+        not indexed. A live run paged at 58-59s against a 60s request timeout
+        and reached 200 records in 11.5 minutes before the unit timeout killed
+        it -- having committed those rows but not its watermark, so the next run
+        repeated the same work. Walking 500 changed records that way costs ~17
+        minutes; reading all ~52k by id costs about five.
 
-        THE STOP IS STRICT. Records exactly at the cursor are re-read every
-        run, because the cursor's own timestamp is shared by however many
-        findings were written in that same instant — around 50 of them, in a
-        bulk scan import. Stopping at `<= cursor` would drop every tie except
-        the one that set the watermark. Re-reading them costs nothing: landing
-        is an upsert keyed on (source_id, _event_time).
+        So the scan reads everything and filters here. Its cost is a function of
+        the collection size rather than of how much changed, which makes a run's
+        duration predictable -- the property the old design lacked, because the
+        head's byte weight swings 100x as scan imports land.
 
-        OFFSET PAGINATION OVER MUTABLE DATA. A finding modified mid-scan jumps
-        to the front of the ordering, shifting later records one place back —
-        so a page boundary re-reads a record rather than skipping one, which
-        the upsert absorbs. A finding *deleted* mid-scan shifts the other way
-        and can hide one record until its next modification. That is accepted:
-        DefectDojo deletions are rare and administrative, and the alternative
-        is keyset pagination, which this API cannot express because it has no
-        time filter to key on.
+        WHAT THIS GIVES UP. Cost now scales with the collection: ~5 minutes at
+        52k findings, ~18 at 200k, and past roughly 300k it no longer fits
+        TimeoutStartSec=1800 and the cap has to rise. `discovered_after` and
+        `mitigated_after` DO exist server-side (the convention is _after /
+        _before, not __gte) and would scale with changes instead -- but they
+        cover only discovery and mitigation, while the mart derives its status
+        column from six boolean flags including false_p, duplicate,
+        out_of_scope, risk_accepted and active. Filtering on those two axes
+        would silently miss most triage activity, so they are not used.
+
+        STRICTLY NEWER, AND NO TIES ARE DROPPED. The run that set the watermark
+        to M yielded every record at M, because all of them were newer than the
+        cursor it started from. The old design needed a `<` stop to re-read ties
+        precisely because it stopped early; a full scan does not.
         """
         offset = 0
         floor = comparable(cursor) if cursor else None
-        # No cursor means a backfill: read everything, so the expensive ordering
-        # that exists only to enable an early stop buys nothing. See
-        # ORDER_BY_BACKFILL.
-        # Ordering and page size are chosen TOGETHER, from one condition, because
-        # the size is only safe for the ordering it accompanies. Deriving them
-        # separately is how a large page would reach the unindexed sort.
-        if floor is not None:
-            order, page_size = ORDER_BY, self.page_size
-        else:
-            order, page_size = ORDER_BY_BACKFILL, self.backfill_page_size
         if floor is None:
-            log.info(
-                "no watermark: backfilling the whole collection ordered by %s, "
-                "page size %d", order, page_size,
-            )
+            log.info("no watermark: first run reads the whole collection")
 
+        scanned = kept = 0
         while True:
             params = {
-                "limit": page_size,
+                "limit": self.page_size,
                 "offset": offset,
                 # `o`, not `ordering`. See the module docstring: the
                 # conventional name is accepted and silently ignored.
-                "o": order,
+                "o": ORDER_BY,
             }
             started = time.monotonic()
             payload = with_retries(partial(self._get, creds, params))
             elapsed = time.monotonic() - started
             results = payload.get("results") or []
-            # Per-page progress. This endpoint gets slow as the collection grows
-            # -- ordering 50k findings server-side is not cheap -- and without a
-            # line per page a long run looks identical to a hang.
-            log.info(
-                "page offset=%d records=%d in %.1fs (total=%s)",
-                offset, len(results), elapsed, payload.get("count", "?"),
-            )
+            scanned += len(results)
+
+            # An empty page ends the scan even when `next` is still set.
+            # Restored deliberately: offset past `count` returns an empty list,
+            # and trusting `next` alone makes that a loop rather than a stop.
             if not results:
+                log.info("empty page at offset=%d; scan complete", offset)
                 return
 
             for record in results:
                 mark = self.watermark_of(record)
-                if floor is not None and mark is not None and comparable(mark) < floor:
-                    # Descending order: everything after this is older still.
-                    log.info("reached the watermark at offset=%d; stopping", offset)
-                    return
+                # No early return. Ordered by id, an old modification can sit
+                # anywhere, so a stop here would truncate the scan at an
+                # arbitrary point rather than at the end of the changed set.
+                if floor is not None and mark is not None and comparable(mark) <= floor:
+                    continue
+                kept += 1
                 yield record
 
+            # Per-page progress. A full scan is minutes long by design, and
+            # without a line per page that is indistinguishable from a hang.
+            log.info(
+                "page offset=%d records=%d in %.1fs (scanned=%d kept=%d total=%s)",
+                offset, len(results), elapsed, scanned, kept,
+                payload.get("count", "?"),
+            )
+
             if not payload.get("next"):
+                log.info("scan complete: %d findings read, %d changed", scanned, kept)
                 return
-            # page_size, not self.page_size: stepping by the incremental size
-            # while requesting backfill-sized pages would re-read the same
-            # window forever.
-            offset += page_size
+            offset += self.page_size
 
     def _get(self, creds: Any, params: dict[str, Any]) -> dict[str, Any]:
         """One API call. Separated so tests can drive fetch() offline."""
@@ -290,7 +253,7 @@ class DefectDojoSource:
             params=params,
             headers=creds,
             verify=self._tls_verify(),
-            timeout=60.0,
+            timeout=float(self.timeout_sec),
         )
         resp.raise_for_status()
         return dict(resp.json())

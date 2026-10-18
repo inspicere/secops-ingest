@@ -17,8 +17,8 @@ import pytest
 pytest.importorskip("httpx", reason="needs the 'http' extra")
 
 from secops_ingest.sources.defectdojo import (
-    DEFAULT_BACKFILL_PAGE_SIZE,
     DEFAULT_PAGE_SIZE,
+    DEFAULT_TIMEOUT_SEC,
     DefectDojoSource,
 )
 
@@ -72,7 +72,6 @@ def source(monkeypatch: pytest.MonkeyPatch) -> DefectDojoSource:
     """
     monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "https://dojo.example.com")
     monkeypatch.setenv("SECOPS_DEFECTDOJO_PAGE_SIZE", "2")
-    monkeypatch.setenv("SECOPS_DEFECTDOJO_BACKFILL_PAGE_SIZE", "2")
     return DefectDojoSource()
 
 
@@ -107,154 +106,157 @@ def test_sorts_descending(source: DefectDojoSource) -> None:
     assert rec.params[0]["o"].startswith("-")
 
 
-# -- page size follows the ordering, because the two paths cost differently ---
+# -- one ordering, one page size ----------------------------------------------
+#
+# These replace the backfill/incremental page-size split added a day earlier.
+# That split was correct for a design with two orderings; this design has one,
+# so the second size has nothing left to mean.
 
 
-def test_a_backfill_asks_for_a_large_page(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The backfill sorts by id, which is indexed, so big pages are cheap.
-
-    Measured against a ~49k-finding instance, one page at offset=20000 with
-    `o=-id`:
-
-        limit=25      3.24s      69 KB
-        limit=1000    7.44s     2.7 MB
-
-    A 40x larger page costs 2.3x the time, so the fixed per-request cost (~1.7s)
-    dominates. At 25 a full backfill is 1,954 requests -- about 105 minutes,
-    against a 1800s unit timeout it cannot meet. At 1000 it is 49 requests and
-    roughly 6 minutes.
-    """
-    monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "https://dojo.example.com")
-    monkeypatch.delenv("SECOPS_DEFECTDOJO_PAGE_SIZE", raising=False)
-    monkeypatch.delenv("SECOPS_DEFECTDOJO_BACKFILL_PAGE_SIZE", raising=False)
-    src = DefectDojoSource()
-
-    rec = Recorder([page([finding(1, "2026-09-08T08:00:00-05:00")])])
-    drive(src, rec, cursor=None)
-
-    assert rec.params[0]["o"] == "-id", "precondition: this is the backfill path"
-    assert rec.params[0]["limit"] == DEFAULT_BACKFILL_PAGE_SIZE
-
-
-def test_an_incremental_run_keeps_the_small_page(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The incremental path sorts on an UNINDEXED column and must stay small.
-
-    Same instance, `o=-last_status_update`:
-
-        limit=25      2.06s     110 KB
-        limit=100    90.31s    17.4 MB   <- a huge finding lands in the page
-        limit=500    TIMED OUT at 180s
-
-    So the small default is not caution, it is the only size that returns. The
-    large backfill page must not leak onto this path.
-    """
-    monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "https://dojo.example.com")
-    monkeypatch.delenv("SECOPS_DEFECTDOJO_PAGE_SIZE", raising=False)
-    monkeypatch.delenv("SECOPS_DEFECTDOJO_BACKFILL_PAGE_SIZE", raising=False)
-    src = DefectDojoSource()
-
-    rec = Recorder([page([finding(1, "2026-09-08T08:00:00-05:00")])])
-    drive(src, rec, cursor="2026-09-01T00:00:00-05:00")
-
-    assert rec.params[0]["o"] == "-last_status_update", "precondition: incremental"
-    assert rec.params[0]["limit"] == DEFAULT_PAGE_SIZE
-
-
-def test_the_offset_step_matches_the_page_actually_requested(
+def test_always_sorts_by_id_never_by_modification_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Paging by a different step than the page size skips or repeats records.
+    """The unindexed ordering is gone, on both paths.
 
-    With two page sizes in play this stops being bookkeeping: stepping the
-    offset by the incremental size while requesting backfill-sized pages would
-    silently re-read the same window forever.
+    `-last_status_update` has no index, so DefectDojo sorts ~52k rows per
+    request: 51s for 25 records, measured from the host the connector runs on.
+    `-id` is indexed and returns 1000 records in 5-13s. The scan reads
+    everything either way, so the expensive ordering bought nothing but a
+    cursor the server could not filter on anyway.
     """
     monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "https://dojo.example.com")
-    monkeypatch.setenv("SECOPS_DEFECTDOJO_BACKFILL_PAGE_SIZE", "3")
-    monkeypatch.setenv("SECOPS_DEFECTDOJO_PAGE_SIZE", "2")
     src = DefectDojoSource()
+    for cursor in (None, "2026-09-01T00:00:00-05:00"):
+        rec = Recorder([page([finding(1, "2026-09-08T08:00:00-05:00")])])
+        drive(src, rec, cursor=cursor)
+        assert rec.params[0]["o"] == "-id", f"cursor={cursor!r}"
 
+
+def test_one_page_size_for_both_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    """1000, because the worst page measured is 4.9 MB in 13.2s.
+
+    Sampled across the id range at limit=200, pages run 0.4-1.9 MB; the heaviest
+    region is the oldest ids. A 1000-record page there is 4.9 MB and 13.2s,
+    which is 22% of the request timeout -- headroom for a heavier region
+    appearing later, which is the thing page size cannot bound (payload size
+    varies 100x per finding).
+    """
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "https://dojo.example.com")
+    monkeypatch.delenv("SECOPS_DEFECTDOJO_PAGE_SIZE", raising=False)
+    src = DefectDojoSource()
+    assert src.page_size == DEFAULT_PAGE_SIZE == 1000
+    assert not hasattr(src, "backfill_page_size"), "the second size is gone"
+
+
+def test_the_request_timeout_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """It was hardcoded at 60s, which page size cannot protect.
+
+    Bytes per page are unbounded regardless of record count, so the timeout is
+    the only real guard and it has to be adjustable per deployment.
+    """
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "https://dojo.example.com")
+    monkeypatch.delenv("SECOPS_DEFECTDOJO_TIMEOUT_SEC", raising=False)
+    assert DefectDojoSource().timeout_sec == DEFAULT_TIMEOUT_SEC == 120
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_TIMEOUT_SEC", "45")
+    assert DefectDojoSource().timeout_sec == 45
+
+
+# -- the full scan, which replaces the early stop ------------------------------
+#
+# THE SEMANTICS BELOW ARE INVERTED FROM THE PREVIOUS DESIGN, DELIBERATELY. The
+# connector used to sort by modification time descending and stop at the first
+# record older than the cursor, because that was the only way to approximate a
+# filter the API does not offer. Measured 2026-10-18, that stop was the problem:
+# it could not finish. 58s per page against a 60s request timeout, 200 records
+# in 11.5 minutes, killed by the unit timeout with its watermark unmoved -- so
+# the next run repeated the same work forever.
+#
+# A full scan on the indexed ordering is CHEAPER than a partial scan on the
+# unindexed one: ~5 minutes for all ~52k findings, against ~17 minutes to walk
+# merely 500 changed records. So the scan no longer stops early; it reads
+# everything and decides what to keep in process.
+
+
+def test_a_record_older_than_the_cursor_does_not_end_the_scan(
+    source: DefectDojoSource,
+) -> None:
+    """The inverse of the old contract, and the whole point of the change.
+
+    Ordered by id, an old modification can sit anywhere in the collection, so
+    stopping at the first one would truncate the scan at an arbitrary point.
+    """
     rec = Recorder([
-        page([finding(n, "2026-09-08T08:00:00-05:00") for n in (1, 2, 3)], more=True),
-        page([finding(4, "2026-09-07T08:00:00-05:00")]),
+        page([finding(1, "2026-08-01T00:00:00-05:00"),   # older than the cursor
+              finding(2, "2026-09-09T00:00:00-05:00")],  # newer, AFTER the old one
+             more=True),
+        page([finding(3, "2026-09-10T00:00:00-05:00")]),
     ])
-    drive(src, rec, cursor=None)
+    got = drive(source, rec, cursor="2026-09-01T00:00:00-05:00")
 
-    assert [p["limit"] for p in rec.params] == [3, 3]
-    assert [p["offset"] for p in rec.params] == [0, 3], "step must equal the page size"
-
-
-def test_the_backfill_page_size_is_independently_configurable(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "https://dojo.example.com")
-    monkeypatch.setenv("SECOPS_DEFECTDOJO_BACKFILL_PAGE_SIZE", "7")
-    src = DefectDojoSource()
-
-    rec = Recorder([page([finding(1, "2026-09-08T08:00:00-05:00")])])
-    drive(src, rec, cursor=None)
-
-    assert rec.params[0]["limit"] == 7
+    assert [f["id"] for f in got] == [2, 3], "the old record is skipped, not fatal"
+    assert len(rec.params) == 2, "and the scan continued to the next page"
 
 
-@pytest.mark.parametrize("bad", ["0", "-1", "abc"])
-def test_invalid_backfill_page_size_is_rejected(
-    monkeypatch: pytest.MonkeyPatch, bad: str
-) -> None:
-    monkeypatch.setenv("SECOPS_DEFECTDOJO_BACKFILL_PAGE_SIZE", bad)
-    with pytest.raises(ValueError, match="SECOPS_DEFECTDOJO_BACKFILL_PAGE_SIZE"):
-        DefectDojoSource()
-
-
-# -- the early stop, which replaces the time filter the API lacks -------------
-
-
-def test_stops_at_the_first_record_older_than_the_cursor(
+def test_only_records_newer_than_the_cursor_are_yielded(
     source: DefectDojoSource,
 ) -> None:
-    newer = finding(1, "2026-09-08T08:00:00-05:00")
-    older = finding(2, "2026-09-01T08:00:00-05:00")
-    rec = Recorder([page([newer, older], more=True)])
-    got = drive(source, rec, cursor="2026-09-05T00:00:00-05:00")
+    """Filtering in process is what keeps the database cost unchanged.
 
-    assert [f["id"] for f in got] == [1]
-    assert len(rec.params) == 1, "must not request another page after the stop"
-
-
-def test_ties_at_the_cursor_are_re_read_not_dropped(source: DefectDojoSource) -> None:
-    """A bulk import gives many findings the same modification time.
-
-    Stopping at `<= cursor` would drop every tie except the one that set the
-    watermark. Re-reading them is free: landing is an upsert.
+    The scan reads ~52k findings every run; landing them all would rewrite every
+    row and churn ~140 MB of dead tuples per cycle. Only changed records are
+    yielded, so Postgres still sees a handful of upserts.
     """
-    at_cursor = "2026-09-08T08:15:35-05:00"
-    rec = Recorder([page([finding(1, at_cursor), finding(2, at_cursor)])])
-    got = drive(source, rec, cursor=at_cursor)
-    assert [f["id"] for f in got] == [1, 2]
+    rec = Recorder([
+        page([finding(1, "2026-08-01T00:00:00-05:00"),
+              finding(2, "2026-09-05T00:00:00-05:00"),
+              finding(3, "2026-07-01T00:00:00-05:00")]),
+    ])
+    got = drive(source, rec, cursor="2026-09-01T00:00:00-05:00")
+    assert [f["id"] for f in got] == [2]
 
 
-def test_first_run_reads_from_the_top(source: DefectDojoSource) -> None:
-    rec = Recorder([page([finding(1, "2026-09-08T08:00:00-05:00")])])
-    got = drive(source, rec, cursor=None)
-    assert [f["id"] for f in got] == [1]
-    assert rec.params[0]["offset"] == 0
-
-
-def test_descending_order_means_the_first_record_sets_the_watermark(
+def test_a_record_exactly_at_the_cursor_is_not_re_yielded(
     source: DefectDojoSource,
 ) -> None:
-    """The run's watermark is the high-water mark as of the scan's start.
+    """Strictly newer, and unlike the old design this drops no ties.
 
-    Anything modified while the scan is running is newer than that, so it is
-    caught by the next run instead of being missed.
+    The previous version stopped at `< cursor` so that ties AT the cursor were
+    re-read, because stopping at `<=` would have dropped every tie except the
+    one that set the watermark. A full scan has no such hazard: the run that set
+    the watermark to M yielded every record at M, since all of them were newer
+    than the cursor it started from. Excluding them now re-lands nothing.
     """
-    rec = Recorder([page([
-        finding(1, "2026-09-08T08:00:00-05:00"),
-        finding(2, "2026-09-07T08:00:00-05:00"),
-    ])])
-    got = drive(source, rec)
+    rec = Recorder([page([finding(1, "2026-09-01T00:00:00-05:00")])])
+    assert drive(source, rec, cursor="2026-09-01T00:00:00-05:00") == []
+
+
+def test_a_first_run_yields_everything(source: DefectDojoSource) -> None:
+    rec = Recorder([
+        page([finding(1, "2026-01-01T00:00:00-05:00"),
+              finding(2, "2026-09-09T00:00:00-05:00")]),
+    ])
+    assert [f["id"] for f in drive(source, rec, cursor=None)] == [1, 2]
+
+
+def test_the_watermark_comes_from_the_highest_mark_yielded(
+    source: DefectDojoSource,
+) -> None:
+    """Not from the first record, which is what descending order used to give.
+
+    Ordered by id the newest modification can be anywhere, so the run's high
+    mark is the maximum over what it yielded. The framework keeps the maximum it
+    observes, so this is a property of the sequence rather than of its first
+    element -- but it is the reason the old "first record sets the watermark"
+    comment had to go.
+    """
+    rec = Recorder([
+        page([finding(1, "2026-09-02T00:00:00-05:00"),
+              finding(2, "2026-09-09T00:00:00-05:00"),
+              finding(3, "2026-09-04T00:00:00-05:00")]),
+    ])
+    got = drive(source, rec, cursor="2026-09-01T00:00:00-05:00")
     marks = [source.watermark_of(f) for f in got]
-    assert marks == sorted(marks, reverse=True)
+    assert max(marks) == "2026-09-09T00:00:00-05:00"
 
 
 # -- pagination ---------------------------------------------------------------
@@ -405,11 +407,6 @@ def test_backfill_orders_by_the_indexed_column(source: DefectDojoSource) -> None
     assert rec.params[0]["o"] == "-id"
 
 
-def test_incremental_keeps_the_modification_ordering(source: DefectDojoSource) -> None:
-    """With a cursor the descending sort is what makes the early stop possible."""
-    rec = Recorder([page([finding(1, "2026-09-08T08:00:00-05:00")])])
-    drive(source, rec, cursor="2026-09-01T00:00:00-05:00")
-    assert rec.params[0]["o"] == "-last_status_update"
 
 
 def test_backfill_still_collects_every_record(source: DefectDojoSource) -> None:
