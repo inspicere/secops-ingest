@@ -31,18 +31,38 @@ THE API HAS TWO TRAPS, BOTH SILENT
    by checking that a deliberately bogus parameter produced the same response
    as the plausible one.
 
-There is NO server-side time filter. `last_status_update__gt`, `__gte`,
-`created__gt` and `date__gt` are all ignored (verified against a live instance
-holding ~50k findings). So this connector cannot ask for "what changed" the way
-the Wazuh one does. It sorts by modification time descending and stops as soon
-as it reaches records older than the watermark, reading only the changed head
-of the collection.
+There is no server-side filter ON THE MODIFICATION AXIS, which is the one this
+connector needs. `last_status_update__gt`, `__gte`, `created__gt` and `date__gt`
+are all ignored -- but so is any invented name, per trap 1, so their silence
+proved nothing about whether a filter exists.
+
+Reading the OpenAPI schema instead of guessing (2026-10-17) shows the real
+convention is `_after` / `_before`, and two such filters DO work:
+
+    discovered_after=2026-07-20     48,845 -> 7,793
+    mitigated_after=2026-10-01      48,845 ->   616
+
+Neither is the modification axis. `last_status_update` is an exact-match filter
+with no range variant, so "what changed since X" remains unaskable and the early
+stop below is still the answer. `discovered_after` would bound a backfill by
+DISCOVERY date, which is deliberately not used: it would permanently exclude a
+finding discovered two years ago and modified yesterday, and the warehouse keeps
+seven years of history for year-over-year reporting.
+
+So this connector cannot ask for "what changed" the way the Wazuh one does. It
+sorts by modification time descending and stops as soon as it reaches records
+older than the watermark, reading only the changed head of the collection.
 
 Configuration:
 
     SECOPS_DEFECTDOJO_URL        base URL, e.g. https://dojo.example.com
     SECOPS_DEFECTDOJO_SECRET     secret name (default defectdojo_api_token)
-    SECOPS_DEFECTDOJO_PAGE_SIZE  results per request (default 25 -- see below)
+    SECOPS_DEFECTDOJO_PAGE_SIZE  results per request on an INCREMENTAL run
+                                 (default 25 -- see below)
+    SECOPS_DEFECTDOJO_BACKFILL_PAGE_SIZE
+                                 results per request on a BACKFILL (default
+                                 1000; the backfill sorts on an indexed column
+                                 and 25 cannot finish inside the unit timeout)
     SECOPS_DEFECTDOJO_CA_BUNDLE  CA bundle for the API's certificate
     SECOPS_DEFECTDOJO_INSECURE   set to 1 to skip TLS verification (logged)
 """
@@ -76,6 +96,39 @@ log = logging.getLogger(__name__)
 #: page exceeds the HTTP timeout, and with_retries then retries it five times,
 #: turning a slow endpoint into several minutes of silence. Err small.
 DEFAULT_PAGE_SIZE = 25
+
+#: Backfill page size, forty times the incremental one, and the asymmetry is the
+#: whole point: THE TWO PATHS DO NOT COST THE SAME, because they do not sort on
+#: the same column.
+#:
+#: The note above is about `-last_status_update`, which has no index. This is
+#: about `-id`, which does. Re-measured 2026-10-17 against a 48,845-finding
+#: instance, one page at offset=20000:
+#:
+#:     o=-id                   limit=25      3.24s     69 KB
+#:     o=-id                   limit=100     3.51s    275 KB
+#:     o=-id                   limit=500     5.16s    1.4 MB
+#:     o=-id                   limit=1000    7.44s    2.7 MB
+#:     o=-last_status_update   limit=25      2.06s    110 KB
+#:     o=-last_status_update   limit=100    90.31s   17.4 MB
+#:     o=-last_status_update   limit=500    TIMED OUT at 180s
+#:
+#: A 40x larger page costs 2.3x the time on the indexed ordering, because a
+#: fixed ~1.7s per request dominates. So the arithmetic that matters:
+#:
+#:     limit=25     1,954 requests   ~105 min   exceeds the 1800s unit timeout
+#:     limit=1000      49 requests     ~6 min   comfortable
+#:
+#: THIS IS WHY THE BACKFILL COULD NEVER FINISH. It was not the byte rate. One
+#: page size was shared by a path that must stay small and a path that must not,
+#: and 25 is correct for the first and unusable for the second. The unit was
+#: killed at its timeout, having committed rows but not its watermark, so the
+#: next run restarted the same backfill -- progress-free, indefinitely.
+#:
+#: Do NOT raise the incremental size to match. The table above is why: at
+#: limit=100 that ordering takes 90s and returns 17.4 MB, and at 500 it does not
+#: return at all.
+DEFAULT_BACKFILL_PAGE_SIZE = 1000
 
 #: Incremental ordering. Descending, so the newest modification is the first
 #: record returned — see `fetch` for why that is load-bearing.
@@ -123,6 +176,9 @@ class DefectDojoSource:
         self.url = (os.environ.get("SECOPS_DEFECTDOJO_URL") or "").rstrip("/")
         self.secret_name = os.environ.get("SECOPS_DEFECTDOJO_SECRET", "defectdojo_api_token")
         self.page_size = _env_int("SECOPS_DEFECTDOJO_PAGE_SIZE", DEFAULT_PAGE_SIZE)
+        self.backfill_page_size = _env_int(
+            "SECOPS_DEFECTDOJO_BACKFILL_PAGE_SIZE", DEFAULT_BACKFILL_PAGE_SIZE
+        )
 
     # -- credentials --------------------------------------------------------
 
@@ -175,13 +231,22 @@ class DefectDojoSource:
         # No cursor means a backfill: read everything, so the expensive ordering
         # that exists only to enable an early stop buys nothing. See
         # ORDER_BY_BACKFILL.
-        order = ORDER_BY if floor is not None else ORDER_BY_BACKFILL
+        # Ordering and page size are chosen TOGETHER, from one condition, because
+        # the size is only safe for the ordering it accompanies. Deriving them
+        # separately is how a large page would reach the unindexed sort.
+        if floor is not None:
+            order, page_size = ORDER_BY, self.page_size
+        else:
+            order, page_size = ORDER_BY_BACKFILL, self.backfill_page_size
         if floor is None:
-            log.info("no watermark: backfilling the whole collection ordered by %s", order)
+            log.info(
+                "no watermark: backfilling the whole collection ordered by %s, "
+                "page size %d", order, page_size,
+            )
 
         while True:
             params = {
-                "limit": self.page_size,
+                "limit": page_size,
                 "offset": offset,
                 # `o`, not `ordering`. See the module docstring: the
                 # conventional name is accepted and silently ignored.
@@ -211,7 +276,10 @@ class DefectDojoSource:
 
             if not payload.get("next"):
                 return
-            offset += self.page_size
+            # page_size, not self.page_size: stepping by the incremental size
+            # while requesting backfill-sized pages would re-read the same
+            # window forever.
+            offset += page_size
 
     def _get(self, creds: Any, params: dict[str, Any]) -> dict[str, Any]:
         """One API call. Separated so tests can drive fetch() offline."""

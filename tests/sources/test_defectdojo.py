@@ -16,7 +16,11 @@ import pytest
 
 pytest.importorskip("httpx", reason="needs the 'http' extra")
 
-from secops_ingest.sources.defectdojo import DefectDojoSource
+from secops_ingest.sources.defectdojo import (
+    DEFAULT_BACKFILL_PAGE_SIZE,
+    DEFAULT_PAGE_SIZE,
+    DefectDojoSource,
+)
 
 
 def finding(
@@ -57,8 +61,18 @@ class Recorder:
 
 @pytest.fixture
 def source(monkeypatch: pytest.MonkeyPatch) -> DefectDojoSource:
+    """A source whose pages are tiny on BOTH paths.
+
+    Both sizes are pinned, not just the incremental one. Tests here drive the
+    backfill path by passing no cursor, and leaving the backfill size at its
+    1000 default would make `offset` step by 1000 -- which says nothing about
+    pagination and buries the behaviour under a number chosen for a live
+    instance. Tests that care about the real defaults construct their own
+    source and delete these.
+    """
     monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "https://dojo.example.com")
     monkeypatch.setenv("SECOPS_DEFECTDOJO_PAGE_SIZE", "2")
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_BACKFILL_PAGE_SIZE", "2")
     return DefectDojoSource()
 
 
@@ -91,6 +105,105 @@ def test_sorts_descending(source: DefectDojoSource) -> None:
     rec = Recorder([page([finding(1, "2026-09-08T08:00:00-05:00")])])
     drive(source, rec)
     assert rec.params[0]["o"].startswith("-")
+
+
+# -- page size follows the ordering, because the two paths cost differently ---
+
+
+def test_a_backfill_asks_for_a_large_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The backfill sorts by id, which is indexed, so big pages are cheap.
+
+    Measured against a ~49k-finding instance, one page at offset=20000 with
+    `o=-id`:
+
+        limit=25      3.24s      69 KB
+        limit=1000    7.44s     2.7 MB
+
+    A 40x larger page costs 2.3x the time, so the fixed per-request cost (~1.7s)
+    dominates. At 25 a full backfill is 1,954 requests -- about 105 minutes,
+    against a 1800s unit timeout it cannot meet. At 1000 it is 49 requests and
+    roughly 6 minutes.
+    """
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "https://dojo.example.com")
+    monkeypatch.delenv("SECOPS_DEFECTDOJO_PAGE_SIZE", raising=False)
+    monkeypatch.delenv("SECOPS_DEFECTDOJO_BACKFILL_PAGE_SIZE", raising=False)
+    src = DefectDojoSource()
+
+    rec = Recorder([page([finding(1, "2026-09-08T08:00:00-05:00")])])
+    drive(src, rec, cursor=None)
+
+    assert rec.params[0]["o"] == "-id", "precondition: this is the backfill path"
+    assert rec.params[0]["limit"] == DEFAULT_BACKFILL_PAGE_SIZE
+
+
+def test_an_incremental_run_keeps_the_small_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The incremental path sorts on an UNINDEXED column and must stay small.
+
+    Same instance, `o=-last_status_update`:
+
+        limit=25      2.06s     110 KB
+        limit=100    90.31s    17.4 MB   <- a huge finding lands in the page
+        limit=500    TIMED OUT at 180s
+
+    So the small default is not caution, it is the only size that returns. The
+    large backfill page must not leak onto this path.
+    """
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "https://dojo.example.com")
+    monkeypatch.delenv("SECOPS_DEFECTDOJO_PAGE_SIZE", raising=False)
+    monkeypatch.delenv("SECOPS_DEFECTDOJO_BACKFILL_PAGE_SIZE", raising=False)
+    src = DefectDojoSource()
+
+    rec = Recorder([page([finding(1, "2026-09-08T08:00:00-05:00")])])
+    drive(src, rec, cursor="2026-09-01T00:00:00-05:00")
+
+    assert rec.params[0]["o"] == "-last_status_update", "precondition: incremental"
+    assert rec.params[0]["limit"] == DEFAULT_PAGE_SIZE
+
+
+def test_the_offset_step_matches_the_page_actually_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Paging by a different step than the page size skips or repeats records.
+
+    With two page sizes in play this stops being bookkeeping: stepping the
+    offset by the incremental size while requesting backfill-sized pages would
+    silently re-read the same window forever.
+    """
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "https://dojo.example.com")
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_BACKFILL_PAGE_SIZE", "3")
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_PAGE_SIZE", "2")
+    src = DefectDojoSource()
+
+    rec = Recorder([
+        page([finding(n, "2026-09-08T08:00:00-05:00") for n in (1, 2, 3)], more=True),
+        page([finding(4, "2026-09-07T08:00:00-05:00")]),
+    ])
+    drive(src, rec, cursor=None)
+
+    assert [p["limit"] for p in rec.params] == [3, 3]
+    assert [p["offset"] for p in rec.params] == [0, 3], "step must equal the page size"
+
+
+def test_the_backfill_page_size_is_independently_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "https://dojo.example.com")
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_BACKFILL_PAGE_SIZE", "7")
+    src = DefectDojoSource()
+
+    rec = Recorder([page([finding(1, "2026-09-08T08:00:00-05:00")])])
+    drive(src, rec, cursor=None)
+
+    assert rec.params[0]["limit"] == 7
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "abc"])
+def test_invalid_backfill_page_size_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_BACKFILL_PAGE_SIZE", bad)
+    with pytest.raises(ValueError, match="SECOPS_DEFECTDOJO_BACKFILL_PAGE_SIZE"):
+        DefectDojoSource()
 
 
 # -- the early stop, which replaces the time filter the API lacks -------------
