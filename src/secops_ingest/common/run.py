@@ -18,7 +18,7 @@ from typing import Any, Protocol
 
 from ..packs.registry import discover as _discover_packs
 from ..redaction import scrub
-from . import db
+from . import db, schema_check
 from .posture import current_posture
 from .watermark import newer as _newer
 
@@ -123,6 +123,10 @@ def execute(
 ) -> Result:
     """Run one ingest cycle. Never returns silently on failure."""
     with db.connect(provider) as conn:
+        # Before anything else, including the pack-state lookup below: a
+        # schema behind the package turns the first run-ledger INSERT into a
+        # driver traceback, and a refused run must not leave a RUNNING row.
+        schema_check.verify_control_schema(conn)
         state = _pack_state_of(conn, source.name)
         if state == "AMBIGUOUS":
             # Same collision registry.resolve_source calls AmbiguousSource for,

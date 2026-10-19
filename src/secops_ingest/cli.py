@@ -68,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     from .common import run as run_mod
+    from .common.schema_check import ControlSchemaDrift
 
     log = logging.getLogger(__name__)
     source = _load_source(args.source)
@@ -83,6 +84,12 @@ def main(argv: list[str] | None = None) -> int:
             get_provider() if os.environ.get("SECOPS_SECRETS_BACKEND") else None
         )
         result = run_mod.execute(source, **kwargs)
+    except ControlSchemaDrift as exc:
+        # The warehouse is older than the package: a configuration state, not
+        # a crash, so one line on stderr and a non-zero exit -- never the
+        # traceback the generic handler below would log.
+        print(str(exc), file=sys.stderr)
+        return 1
     except Exception:
         log.exception("source=%s failed", args.source)
         return 1

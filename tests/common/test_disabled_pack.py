@@ -50,6 +50,10 @@ class _Source:
 def _stub_db(monkeypatch: pytest.MonkeyPatch, started: list[str]) -> None:
     """Wire up db.* so a full `execute()` run never needs a real database."""
     monkeypatch.setattr(run_mod.db, "connect", _fake_connect)
+    # These tests stub everything EXCEPT the schema-drift check, which needs a
+    # real information_schema answer; they are about pack state, so the check
+    # is parked, not exercised.
+    monkeypatch.setattr(run_mod.schema_check, "verify_control_schema", lambda conn: None)
     monkeypatch.setattr(
         run_mod.db, "start_run", lambda conn, name, **kw: started.append(name) or 1
     )
@@ -68,6 +72,7 @@ def test_disabled_pack_does_not_fetch_or_record_a_run(
     )
     monkeypatch.setattr(run_mod, "_pack_state_of", lambda conn, name: "DISABLED")
     monkeypatch.setattr(run_mod.db, "connect", _fake_connect)
+    monkeypatch.setattr(run_mod.schema_check, "verify_control_schema", lambda conn: None)
 
     with caplog.at_level(logging.WARNING):
         result = run_mod.execute(source)
