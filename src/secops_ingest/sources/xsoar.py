@@ -110,6 +110,11 @@ class XsoarSource:
     name = "xsoar"
     table = "raw_xsoar.incidents"
 
+    #: sort = [{"field": "modified", "asc": True}], and `modified` is the
+    #: watermark. Same field, ascending -- true only since the window was bound
+    #: on `modified` rather than via fromDate/toDate, which filter on `created`.
+    fetch_order_is_watermark_order = True
+
     def __init__(self) -> None:
         self.secret = os.environ.get("SECOPS_XSOAR_SECRET", "xsoar")
         self.page_size = env_int("SECOPS_XSOAR_PAGE_SIZE", DEFAULT_PAGE_SIZE)

@@ -85,6 +85,17 @@ class XdrAlertsSource:
     name = "xdr_alerts"
     table = "raw_xdr.alerts"
 
+    #: NOT ordered, deliberately. It sorts and filters on `creation_time` but
+    #: watermarks `detection_timestamp` -- different fields. The lag window
+    #: above exists because they diverge, so the highest detection timestamp
+    #: seen does not mean every earlier one has been read. Advancing early
+    #: could step over a late-indexed alert.
+    #:
+    #: Moving the cursor onto the creation-time axis would make this orderable
+    #: and is the fix for its livelock, but that is a change to what the cursor
+    #: MEANS and belongs in its own change.
+    fetch_order_is_watermark_order = False
+
     def __init__(self) -> None:
         self.secret = os.environ.get("SECOPS_XDR_ALERTS_SECRET", "xdr")
         self.page_size = min(env_int("SECOPS_XDR_ALERTS_PAGE_SIZE", PAGE_CAP), PAGE_CAP)

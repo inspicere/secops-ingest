@@ -173,6 +173,12 @@ class DefectDojoSource:
     name = "defectdojo"
     table = "raw_defectdojo.findings"
 
+    #: NOT ordered, and this is the clearest case. The scan runs DESCENDING by
+    #: id, so the first page carries the highest watermark in the collection.
+    #: Advancing to the maximum seen would skip every record below it that the
+    #: run never reached -- the whole collection, on an early stop.
+    fetch_order_is_watermark_order = False
+
     def __init__(self) -> None:
         self.url = (os.environ.get("SECOPS_DEFECTDOJO_URL") or "").rstrip("/")
         self.secret_name = os.environ.get("SECOPS_DEFECTDOJO_SECRET", "defectdojo_api_token")

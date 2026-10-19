@@ -61,6 +61,10 @@ class XdrSource:
     name = "xdr"
     table = "raw_xdr.incidents"
 
+    #: sort = {"field": "modification_time", "keyword": "asc"}, and
+    #: modification_time is the watermark. Same field, ascending.
+    fetch_order_is_watermark_order = True
+
     def __init__(self) -> None:
         self.secret = os.environ.get("SECOPS_XDR_SECRET", "xdr")
         # Clamped rather than rejected: an operator raising this is reaching for
