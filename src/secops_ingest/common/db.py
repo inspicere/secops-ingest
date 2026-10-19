@@ -129,9 +129,33 @@ def finish_run(
 ) -> None:
     if status not in ("SUCCESS", "FAILED"):
         raise ValueError(f"invalid terminal status: {status}")
+    # clock_timestamp(), NOT now(). In PostgreSQL now() returns the TRANSACTION
+    # START time, and this UPDATE usually runs inside a transaction that opened
+    # when the run began.
+    #
+    # start_run commits, so the next statement -- get_watermark -- opens a fresh
+    # transaction. A run that lands rows commits again inside upsert_many, so a
+    # later transaction is current by the time this runs and now() looks
+    # approximately right. A run that lands NOTHING never commits, so that first
+    # transaction is still open and now() returns the moment it opened.
+    #
+    # Measured on a live warehouse 2026-10-19: a DefectDojo scan that read
+    # ~52,000 findings over 29 minutes and found no changes recorded
+    # ended_at one millisecond AFTER started_at, and its ended_at preceded the
+    # log line announcing the run. Four of five hourly runs read as "0 rows in
+    # 0 seconds" while the journal showed each one working for half an hour.
+    #
+    # The error hides precisely where nothing else would notice it: runs that
+    # write rows look correct, so a dashboard of run durations is wrong only for
+    # the runs that did the most work for the least visible result.
+    #
+    # started_at keeps DEFAULT now() in the DDL. Its transaction is the one
+    # opened by the schema check a moment earlier, so it is early by
+    # milliseconds rather than by the length of the run, and changing a column
+    # default would not reach tables that already exist.
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE control.ingest_run SET ended_at = now(), status = %s, "
+            "UPDATE control.ingest_run SET ended_at = clock_timestamp(), status = %s, "
             "rows_read = %s, rows_written = %s, error_summary = %s "
             "WHERE run_id = %s",
             (status, rows_read, rows_written, (error or "")[:2000] or None, run_id),
