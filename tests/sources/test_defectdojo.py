@@ -308,27 +308,160 @@ def test_a_timed_out_page_is_retried_smaller_at_the_same_offset(
     assert {p["offset"] for p in rec.params} == {0}, "never advancing past the gap"
 
 
-def test_the_smaller_page_size_sticks_for_the_rest_of_the_run(
+def test_the_page_size_recovers_after_a_run_of_successes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A server that refused 1000 once should not be asked for 1000 again.
+    """Reverses an earlier decision, on the strength of a measured run.
 
-    Recovering optimistically would re-pay the timeout on every page of a long
-    scan. Once the server has shown what it can serve, the run keeps asking for
-    that.
+    This used to assert the opposite -- that a reduced size STUCK for the rest
+    of the run -- reasoning that a server which refused 1000 should not be asked
+    again. A full scan measured 2026-10-19 showed the tail running at 0.8s per
+    25-record page: the server had recovered long before the end and was being
+    asked for 25 anyway. That cost 1.8 minutes of a 39-minute run. Small, but it
+    is pure waste and the reasoning behind it was wrong.
+
+    Recovery is CAUTIOUS, because naive recovery is worse than stickiness: the
+    slow band in that run was ~28 pages wide, and growing back after every few
+    successes would have re-paid a timeout repeatedly while crossing it. So the
+    threshold doubles each time a timeout happens, and a band that keeps
+    refusing larger pages is asked progressively less often.
     """
     monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "https://dojo.example.com")
     monkeypatch.setenv("SECOPS_DEFECTDOJO_PAGE_SIZE", "1000")
     src = DefectDojoSource()
-    rec = _TimeoutThenOk(250, [
-        page([finding(1, "2026-09-09T00:00:00-05:00")], more=True),
-        page([finding(2, "2026-09-09T00:00:00-05:00")]),
-    ])
+    # Times out above 250 for the FIRST call only, then serves anything.
+    class _OnceSlow:
+        def __init__(self) -> None:
+            self.params: list[dict[str, Any]] = []
+            self.failed = False
+        def __call__(self, creds: Any, params: dict[str, Any]) -> dict[str, Any]:
+            import httpx
+            self.params.append(dict(params))
+            if not self.failed and params["limit"] > 250:
+                self.failed = True
+                raise httpx.ReadTimeout("once")
+            more = len(self.params) < 12
+            return page([finding(len(self.params), "2026-09-09T00:00:00-05:00")], more=more)
+
+    rec = _OnceSlow()
     drive(src, rec, cursor=None)
 
-    after_first_success = [p["limit"] for p in rec.params if p["offset"] > 0]
-    assert after_first_success, "a second page was fetched"
-    assert all(n <= 250 for n in after_first_success), "it did not go back to 1000"
+    sizes = [p["limit"] for p in rec.params]
+    assert sizes[0] == 1000
+    assert 250 in sizes, "it shrank"
+    assert sizes[-1] > 250, "and climbed back once the server was serving again"
+
+
+
+def test_a_timeout_is_not_retried_at_the_same_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The single largest avoidable cost in the measured run.
+
+    Six pages of the shrink ladder consumed 13.4 minutes of a 39-minute scan,
+    because each size was attempted TWICE at a 120s timeout before shrinking.
+    The second attempt is a request already known to be too large, so it buys
+    nothing and costs a full timeout. Shrinking happens on the first timeout
+    now; non-timeout failures keep their retries, which is what retries are for.
+    """
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "https://dojo.example.com")
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_PAGE_SIZE", "1000")
+    src = DefectDojoSource()
+    rec = _TimeoutThenOk(250, [page([finding(1, "2026-09-09T00:00:00-05:00")])])
+    drive(src, rec, cursor=None)
+
+    attempts_at_1000 = [p for p in rec.params if p["limit"] == 1000]
+    assert len(attempts_at_1000) == 1, "one attempt per size, then shrink"
+
+
+def test_the_scan_covers_every_offset_with_no_gaps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Offset continuity, which the size assertions above cannot see.
+
+    This caught a real data-loss bug. When a page was served at one size and the
+    policy then GREW the size, the caller advanced the offset by the new size
+    rather than by the number of records actually served -- so a 250-record page
+    at offset 750 was followed by offset 1750, and records 1000-1749 were never
+    read. Nothing failed: the scan completed, the watermark advanced, and 750
+    findings were silently missing.
+
+    Every page's offset must equal the previous offset plus the records the
+    previous page actually returned.
+    """
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "https://dojo.example.com")
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_PAGE_SIZE", "1000")
+    src = DefectDojoSource()
+
+    class _SlowAbove250:
+        """Serves `limit` records, timing out above 250 to force size changes."""
+
+        def __init__(self) -> None:
+            self.seen: list[tuple[int, int]] = []   # (offset, records served)
+            self.served = 0
+
+        def __call__(self, creds: Any, params: dict[str, Any]) -> dict[str, Any]:
+            import httpx
+            if params["limit"] > 250:
+                raise httpx.ReadTimeout("too large")
+            n = params["limit"]
+            self.seen.append((params["offset"], n))
+            self.served += n
+            recs = [finding(self.served + i, "2026-09-09T00:00:00-05:00")
+                    for i in range(n)]
+            return page(recs, more=self.served < 3000)
+
+    rec = _SlowAbove250()
+    drive(src, rec, cursor=None)
+
+    expected = 0
+    for off, served in rec.seen:
+        assert off == expected, (
+            f"offset {off} should have been {expected}: the previous page "
+            f"served records the scan then skipped"
+        )
+        expected = off + served
+
+
+def test_repeated_timeouts_make_growing_back_progressively_rarer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The doubling is what makes recovery safe, and nothing else tested it.
+
+    Crossing a wide slow region, a fixed growth threshold retries the large page
+    every few pages and re-pays a full timeout each time -- strictly worse than
+    never growing at all. The measured band was ~28 pages wide, so a threshold
+    of 4 would have cost roughly seven extra timeouts there.
+
+    With doubling, attempts at the large size fall off geometrically. Asserted
+    as a COUNT over many pages rather than by inspecting the threshold, so the
+    test fails if the doubling is removed rather than merely restating it.
+    """
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "https://dojo.example.com")
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_PAGE_SIZE", "1000")
+    src = DefectDojoSource()
+
+    class _AlwaysSlowAbove250:
+        def __init__(self) -> None:
+            self.params: list[dict[str, Any]] = []
+        def __call__(self, creds: Any, params: dict[str, Any]) -> dict[str, Any]:
+            import httpx
+            self.params.append(dict(params))
+            if params["limit"] > 250:
+                raise httpx.ReadTimeout("wide slow region")
+            served = sum(1 for p in self.params if p["limit"] <= 250)
+            return page([finding(served, "2026-09-09T00:00:00-05:00")],
+                        more=served < 40)
+
+    rec = _AlwaysSlowAbove250()
+    drive(src, rec, cursor=None)
+
+    big = [p for p in rec.params if p["limit"] > 250]
+    assert len(big) <= 4, (
+        f"grew back {len(big)} times across 40 pages; with a doubling "
+        "threshold this should be a handful, not one every few pages"
+    )
+    assert len(big) >= 2, "but it should still try more than once"
 
 
 def test_shrinking_stops_at_the_floor_and_the_run_fails(
