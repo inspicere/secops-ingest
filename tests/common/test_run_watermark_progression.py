@@ -121,6 +121,18 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         calls["finished"].append((status, read, written))
 
     monkeypatch.setattr(run_mod.db, "connect", lambda provider=None: conn)
+    # execute() verifies the control schema immediately after connecting, which
+    # reaches for conn.cursor(). These tests are about where the CURSOR ends up,
+    # not about schema validation, and the fake connection deliberately
+    # implements only what the watermark path touches.
+    #
+    # Patched rather than satisfied: giving _FakeConn a cursor would couple
+    # every test here to whatever queries the schema check happens to run, so
+    # the next change to that check would break nine unrelated tests again --
+    # which is exactly how these nine came to be red on main.
+    monkeypatch.setattr(
+        run_mod.schema_check, "verify_control_schema", lambda conn: None
+    )
     monkeypatch.setattr(run_mod, "_pack_state_of", lambda conn, name: None)
     monkeypatch.setattr(run_mod.db, "start_run", start_run)
     monkeypatch.setattr(
