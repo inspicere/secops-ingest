@@ -215,9 +215,25 @@ jobs:
       # reaching for a real cursor, and nine tests in the first file hand it a
       # stub connection. The second file is #16's OWN integration test, added
       # and never wired in.
+      # ITS OWN DATABASE, not the shared `secops` one. Every step above runs
+      # against `secops` in sequence, and the drift tests' live-database guard
+      # refuses any database whose control tables already hold rows -- which is
+      # precisely what the transform step leaves behind
+      # (control.transform_coverage, one row per target per day it derived).
+      #
+      # So this step is not order-dependent on what ran before it. Reordering
+      # the steps would only move the refusal: whichever of these files runs
+      # second inherits the first one's control rows.
       - name: Run ledger and schema drift against a real PostgreSQL
         env:
-          SECOPS_TEST_DSN: postgresql://postgres:pw@127.0.0.1:5432/secops
+          SECOPS_TEST_DSN: postgresql://postgres:pw@127.0.0.1:5432/secops_drift
         run: |
+          python - <<'PY'
+          import psycopg
+          dsn = "postgresql://postgres:pw@127.0.0.1:5432/postgres"
+          with psycopg.connect(dsn, autocommit=True) as c:
+              c.execute('DROP DATABASE IF EXISTS secops_drift')
+              c.execute('CREATE DATABASE secops_drift')
+          PY
           pytest tests/common/test_run_watermark_progression.py \
                  tests/schema/test_schema_drift_integration.py -v
