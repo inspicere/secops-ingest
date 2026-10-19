@@ -51,7 +51,12 @@ def _finish(
 ) -> None:
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE control.transform_run SET ended_at = now(), status = %s, "
+            # clock_timestamp(), not now(): now() is the TRANSACTION start time,
+            # and a transform that writes nothing leaves the transaction opened
+            # at its first read still current here -- so the run would be
+            # recorded as having taken no time. Same defect as
+            # common.db.finish_run, which has the full explanation.
+            "UPDATE control.transform_run SET ended_at = clock_timestamp(), status = %s, "
             "rows_upserted = %s, days_touched = %s, error_summary = %s WHERE run_id = %s",
             (status, rows, days, (error or "")[:2000] or None, run_id),
         )
