@@ -113,11 +113,29 @@ MIN_PAGE_SIZE = 25
 #: point is to find a size that works quickly, not to probe politely.
 SHRINK_FACTOR = 4
 
-#: Attempts per page size. Two, not the helper's default of five: a timeout
-#: means the request was too large, and asking the same question again is the
-#: behaviour this exists to replace. One retry still absorbs a genuinely
-#: transient blip before the size is reduced.
-PAGE_ATTEMPTS = 2
+#: Attempts per page size: ONE.
+#:
+#: This was two, and a measured full scan showed what the second attempt costs.
+#: Six pages of the shrink ladder consumed 13.4 minutes of a 39-minute run,
+#: because every size was tried twice at a 120s timeout before shrinking. The
+#: second attempt is a request already known to be too large: it cannot succeed
+#: for a different reason, and it costs a full timeout to learn nothing.
+#:
+#: Non-timeout failures are unaffected -- those still go through with_retries
+#: below with its full budget, because a 5xx or a dropped connection genuinely
+#: may succeed on a second try. Only the too-large case shrinks immediately.
+PAGE_ATTEMPTS = 1
+
+#: Consecutive successes before trying a larger page again, and it DOUBLES after
+#: every timeout.
+#:
+#: Recovery matters less than it looks: the measured run's tail cost 1.8 minutes
+#: of 39, so climbing back is a small win. Getting it wrong is a large loss --
+#: the slow band was ~28 pages wide, and growing back every few pages would have
+#: re-paid a timeout again and again while crossing it. Doubling the threshold
+#: means a region that keeps refusing is asked progressively less often, so the
+#: cost of optimism is bounded no matter how wide the bad region is.
+GROW_AFTER = 4
 
 #: The only ordering. `id` is indexed; `last_status_update` is not, so ordering
 #: on it makes PostgreSQL sort the whole collection for EVERY request. Measured
@@ -216,6 +234,10 @@ class DefectDojoSource:
         # server that refused 1000 once should not be asked for 1000 again, or
         # a long scan re-pays the timeout on every page.
         page_size = self.page_size
+        # Per-run paging state. On the instance rather than in locals because
+        # _get_page owns the policy and fetch() only carries the current size.
+        self._successes = 0
+        self._grow_after = GROW_AFTER
         floor = comparable(cursor) if cursor else None
         if floor is None:
             log.info("no watermark: first run reads the whole collection")
@@ -230,8 +252,8 @@ class DefectDojoSource:
                 "o": ORDER_BY,
             }
             started = time.monotonic()
-            payload, page_size = self._get_page(creds, offset, page_size)
-            params["limit"] = page_size
+            payload, used, page_size = self._get_page(creds, offset, page_size)
+            params["limit"] = used
             elapsed = time.monotonic() - started
             results = payload.get("results") or []
             scanned += len(results)
@@ -264,26 +286,34 @@ class DefectDojoSource:
             if not payload.get("next"):
                 log.info("scan complete: %d findings read, %d changed", scanned, kept)
                 return
-            offset += page_size
+            # `used`, not `page_size`: page_size is what the NEXT request will
+            # ask for, which may be larger. Advancing by it would skip every
+            # record between the two.
+            offset += used
 
     def _get_page(
         self, creds: Any, offset: int, page_size: int
-    ) -> tuple[dict[str, Any], int]:
+    ) -> tuple[dict[str, Any], int, int]:
         """Fetch one page, shrinking it rather than repeating it on a timeout.
 
         `with_retries` retries the IDENTICAL request. For a 5xx or a dropped
         connection that is right; for a timeout it is not, because the same
-        request will time out again. Measured against a DefectDojo at load 48,
-        five attempts at a 120s timeout produced ten minutes of silence and then
-        a failed run -- which is how a transient server problem turned into a
-        livelocked one, since the run committed rows but never its watermark.
+        request will time out again for the same reason. Measured against a
+        DefectDojo at load 48, five attempts at a 120s timeout produced ten
+        minutes of silence and then a failed run -- which is how a transient
+        server problem became a livelocked one, since the run committed rows but
+        never its watermark.
 
         A timeout means the request was too large to answer, so this asks for
         less AT THE SAME OFFSET. Nothing is skipped: the offset only advances
         once a page has actually been returned.
 
-        Returns the payload and the size that worked, so the caller can keep
-        using it.
+        Returns the payload, THE SIZE THIS PAGE ACTUALLY USED, and the size to
+        request next. Those last two differ whenever the policy grows the page,
+        and conflating them loses data: a 250-record page followed by a jump of
+        1000 skips 750 findings without failing anything. The caller advances
+        `offset` by the size used and sends the next size on the following
+        request.
         """
         import httpx
 
@@ -308,16 +338,34 @@ class DefectDojoSource:
                     )
                     raise
                 smaller = max(MIN_PAGE_SIZE, size // SHRINK_FACTOR)
+                # Each timeout makes the next attempt to grow back more
+                # reluctant, so a wide slow region is probed a handful of times
+                # rather than once per few pages.
+                self._grow_after *= 2
+                self._successes = 0
                 log.warning(
                     "offset=%d timed out at limit=%d; retrying at limit=%d "
-                    "(kept for the rest of the run)",
-                    offset, size, smaller,
+                    "(will reconsider after %d clean pages)",
+                    offset, size, smaller, self._grow_after,
                 )
                 size = smaller
                 continue
-            if size != page_size:
-                log.info("page size is now %d for the remainder of the run", size)
-            return payload, size
+
+            self._successes += 1
+            # Growth applies to the NEXT request, never to the page just
+            # served: `size` is what this page used and the offset advances by
+            # it.
+            next_size = size
+            if size < self.page_size and self._successes >= self._grow_after:
+                larger = min(self.page_size, size * SHRINK_FACTOR)
+                if larger != size:
+                    log.info(
+                        "%d clean pages at limit=%d; trying limit=%d again",
+                        self._successes, size, larger,
+                    )
+                    next_size = larger
+                self._successes = 0
+            return payload, size, next_size
 
     def _get(self, creds: Any, params: dict[str, Any]) -> dict[str, Any]:
         """One API call. Separated so tests can drive fetch() offline."""
