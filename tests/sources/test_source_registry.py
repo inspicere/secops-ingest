@@ -13,7 +13,7 @@ import pytest
 
 pytest.importorskip("httpx", reason="needs the 'http' extra")
 
-SCHEDULED = ["xsoar", "xdr", "xdr_alerts", "xdr_endpoints"]
+SCHEDULED = ["xsoar", "xdr", "xdr_alerts", "xdr_endpoints", "ksat"]
 
 
 @pytest.mark.parametrize("name", SCHEDULED)
