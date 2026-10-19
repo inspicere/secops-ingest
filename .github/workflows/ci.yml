@@ -207,3 +207,17 @@ jobs:
         env:
           SECOPS_TEST_DSN: postgresql://postgres:pw@127.0.0.1:5432/secops
         run: pytest tests/transform/test_transform_integration.py -v
+
+      # These two needed psycopg and so never ran in the test matrix, which
+      # installs only [dev,http] and skips them at importorskip. They were not
+      # named here either, so they ran NOWHERE -- and that is how #16 shipped a
+      # regression through seven green jobs: verify_control_schema() began
+      # reaching for a real cursor, and nine tests in the first file hand it a
+      # stub connection. The second file is #16's OWN integration test, added
+      # and never wired in.
+      - name: Run ledger and schema drift against a real PostgreSQL
+        env:
+          SECOPS_TEST_DSN: postgresql://postgres:pw@127.0.0.1:5432/secops
+        run: |
+          pytest tests/common/test_run_watermark_progression.py \
+                 tests/schema/test_schema_drift_integration.py -v
