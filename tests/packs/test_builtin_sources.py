@@ -66,7 +66,7 @@ def test_building_the_pack_imports_no_connector() -> None:
 
 
 def test_scheduled_cortex_sources_resolve_by_bare_name() -> None:
-    # These four are what the deployment schedules; bare names are what the
+    # These are what the deployment schedules; bare names are what the
     # systemd units pass.
-    for name in ("xsoar", "xdr", "xdr_alerts", "xdr_endpoints"):
+    for name in ("xsoar", "xdr", "xdr_alerts", "xdr_endpoints", "ksat"):
         assert resolve_source(name) == f"secops_ingest.sources.{name}:SOURCE"
