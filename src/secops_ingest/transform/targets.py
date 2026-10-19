@@ -824,6 +824,112 @@ INCIDENT_LIFECYCLE = Target(
     """,
 )
 
+#: KSAT enrollments are RE-READ in full every run, not tailed -- the API exposes
+#: no mutation axis to resume from (see sources/ksat.py). So this target's job is
+#: not "append what is new", it is "refresh what moved", and every mutable column
+#: is in the DO UPDATE list below for that reason.
+#:
+#: The grain is one row per enrollment: one person x one training module, whose
+#: status walks NOT_STARTED -> IN_PROGRESS -> COMPLETED over days or weeks.
+#: createdAt is the only immutable timestamp on the record, so it is both the
+#: upsert key and the partition key; everything else moves underneath it.
+#:
+#: NO PII. The connector deliberately requests only an opaque user id and status,
+#: omitting email, firstName and lastName, and this mart keeps it that way. A
+#: per-person completion report can join user_id outside the warehouse if someone
+#: is entitled to the names; the warehouse does not need them to count.
+KSAT_ENROLLMENTS = Target(
+    name="ksat_enrollments",
+    raw_table="raw_ksat.enrollments",
+    fact_table="mart_fact_ksat_enrollments",
+    fact_date_expr="created_at",
+    upsert_sql="""
+        INSERT INTO mart_fact_ksat_enrollments
+            (enrollment_id, created_at, updated_at, started_at, completed_at,
+             last_started_at, status, score, time_spent_s, policy_acknowledged,
+             user_id, user_status, campaign_id, campaign_name, campaign_status)
+        SELECT
+            source_id,
+            (payload->>'createdAt')::timestamptz,
+            (payload->>'updatedAt')::timestamptz,
+            (payload->>'startedAt')::timestamptz,
+            (payload->>'completedAt')::timestamptz,
+            (payload->>'lastStartedAt')::timestamptz,
+            payload->>'status',
+            (payload->>'score')::numeric,
+            (payload->>'timeSpent')::numeric,
+            (payload->>'policyAcknowledged')::boolean,
+            -- Nested objects need -> then ->>. payload->>'user' on a nested
+            -- object returns the JSON TEXT of the whole object, so a dashboard
+            -- would render {"id": "u-9001", "status": "active"} as the user id.
+            payload->'user'->>'id',
+            payload->'user'->>'status',
+            -- fetch() attaches the whole campaign object to each enrollment
+            -- rather than flattening it, so the same applies here.
+            payload->'campaign'->>'id',
+            payload->'campaign'->>'name',
+            payload->'campaign'->>'status'
+        FROM raw_ksat.enrollments
+        WHERE %(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz
+        -- EVERY mutable column. This is the whole point of the target: a
+        -- re-read source lands the same enrollment again with a new status, and
+        -- a column left out of this list freezes at whatever the first run saw.
+        -- That defect has already shipped here once, on dbotMirrorId, and it
+        -- was invisible because the row count stayed perfectly healthy.
+        ON CONFLICT (enrollment_id, created_at) DO UPDATE SET
+            updated_at          = EXCLUDED.updated_at,
+            started_at          = EXCLUDED.started_at,
+            completed_at        = EXCLUDED.completed_at,
+            last_started_at     = EXCLUDED.last_started_at,
+            status              = EXCLUDED.status,
+            score               = EXCLUDED.score,
+            time_spent_s        = EXCLUDED.time_spent_s,
+            policy_acknowledged = EXCLUDED.policy_acknowledged,
+            user_id             = EXCLUDED.user_id,
+            user_status         = EXCLUDED.user_status,
+            campaign_id         = EXCLUDED.campaign_id,
+            campaign_name       = EXCLUDED.campaign_name,
+            campaign_status     = EXCLUDED.campaign_status
+    """,
+    fact_ddl="""
+        CREATE TABLE IF NOT EXISTS mart_fact_ksat_enrollments (
+            enrollment_id       text        NOT NULL,
+            -- Immutable across the enrollment's lifecycle, which is what makes
+            -- it safe as both upsert key and partition key.
+            created_at          timestamptz NOT NULL,
+            updated_at          timestamptz,
+            started_at          timestamptz,
+            completed_at        timestamptz,
+            last_started_at     timestamptz,
+            status              text,
+            -- numeric, NOT integer, on both of these. KSAT scores are
+            -- percentages and nothing promises they are whole; timeSpent is
+            -- undocumented as to units and precision and has not been measured
+            -- against a live tenant. An ::int cast does not round a fractional
+            -- value here, it aborts the whole upsert with "invalid input syntax
+            -- for type integer" and leaves the mart empty -- which is exactly
+            -- how XSOAR severity 0.5 took two marts down from first schedule.
+            -- The cost of numeric on a column that turns out to be integral is
+            -- nothing; the cost of being wrong the other way is the target.
+            score               numeric,
+            time_spent_s        numeric,
+            policy_acknowledged boolean,
+            -- Opaque. See the note above the target: no email, no names.
+            user_id             text,
+            user_status         text,
+            campaign_id         text,
+            campaign_name       text,
+            campaign_status     text,
+            PRIMARY KEY (enrollment_id, created_at)
+        ) PARTITION BY RANGE (created_at);
+        CREATE INDEX IF NOT EXISTS mart_fact_ksat_enrollments_created_at_idx
+            ON mart_fact_ksat_enrollments (created_at);
+        -- Reporting reads this per campaign far more than per enrollment.
+        CREATE INDEX IF NOT EXISTS mart_fact_ksat_enrollments_campaign_idx
+            ON mart_fact_ksat_enrollments (campaign_id);
+    """,
+)
+
 TARGETS = {
     t.name: t
     for t in (
@@ -835,5 +941,6 @@ TARGETS = {
         XDR_ALERTS,
         XDR_ENDPOINTS,
         INCIDENT_LIFECYCLE,
+        KSAT_ENROLLMENTS,
     )
 }

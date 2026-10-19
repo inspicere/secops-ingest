@@ -34,6 +34,7 @@ import json
 import os
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -49,11 +50,12 @@ from secops_ingest.schema import control_sql, ddl_for_targets  # noqa: E402
 from secops_ingest.transform import runner  # noqa: E402
 from secops_ingest.transform.targets import (  # noqa: E402
     INCIDENT_LIFECYCLE,
+    KSAT_ENROLLMENTS,
     XDR_INCIDENTS,
     XSOAR_INCIDENTS,
 )
 
-TARGETS = [XSOAR_INCIDENTS, XDR_INCIDENTS, INCIDENT_LIFECYCLE]
+TARGETS = [XSOAR_INCIDENTS, XDR_INCIDENTS, INCIDENT_LIFECYCLE, KSAT_ENROLLMENTS]
 
 # The full measured severity domain from a live XSOAR instance over 5,766
 # incidents, including the 0.5 that broke production. Counts were
@@ -130,6 +132,7 @@ def warehouse(scratch_dsn: str, monkeypatch: pytest.MonkeyPatch) -> Iterator[Any
                 "DROP SCHEMA IF EXISTS control CASCADE;"
                 "DROP SCHEMA IF EXISTS raw_xsoar CASCADE;"
                 "DROP SCHEMA IF EXISTS raw_xdr CASCADE;"
+                "DROP SCHEMA IF EXISTS raw_ksat CASCADE;"
             )
             for t in TARGETS:
                 cur.execute(f"DROP TABLE IF EXISTS {t.fact_table} CASCADE")
@@ -314,3 +317,176 @@ def test_full_refresh_reclassifies_without_a_watermark_reset(warehouse: Any) -> 
     assert _rows(
         warehouse, "SELECT join_status FROM mart_fact_incident_lifecycle"
     ) == [("matched",)]
+
+
+# ---------------------------------------------------------------------------
+# KSAT enrollments
+#
+# This source is RE-READ in full every run rather than tailed, because the API
+# exposes no mutation axis (see sources/ksat.py). So the behaviour that matters
+# is not "does a new row land" -- it is "does a row that CHANGED get refreshed
+# in place". A fixture that only ever lands fresh enrollments would pass
+# against an upsert that silently freezes the first status it ever saw, which
+# is the same shape as the dbotMirrorId defect above.
+# ---------------------------------------------------------------------------
+
+
+def _z(dt: datetime) -> str:
+    """KSAT emits Z-suffixed UTC, not +00:00."""
+    return dt.isoformat().replace("+00:00", "Z")
+
+
+def _land_ksat(
+    conn: Any,
+    enrollment_id: str,
+    *,
+    status: str,
+    created: datetime,
+    score: Any = None,
+    time_spent: Any = None,
+    completed: datetime | None = None,
+    campaign_id: str = "771",
+    campaign_name: str = "2026 Q4 Security Awareness",
+    user_id: str = "u-9001",
+    ingested: datetime | None = None,
+) -> None:
+    """Land one enrollment as the connector would.
+
+    `_event_time` is createdAt, which is immutable across the enrollment's
+    lifecycle -- that is what makes the upsert key stable while every other
+    column moves. The campaign arrives NESTED, because fetch() attaches the
+    whole campaign object to each enrollment rather than flattening it.
+    """
+    payload: dict[str, Any] = {
+        "id": enrollment_id,
+        "status": status,
+        "createdAt": _z(created),
+        "updatedAt": _z(completed or created),
+        "startedAt": None if status == "NOT_STARTED" else _z(created),
+        "completedAt": _z(completed) if completed else None,
+        "lastStartedAt": None if status == "NOT_STARTED" else _z(created),
+        "timeSpent": time_spent,
+        "score": score,
+        "policyAcknowledged": status == "COMPLETED",
+        "user": {"id": user_id, "status": "active"},
+        "campaign": {
+            "id": campaign_id,
+            "name": campaign_name,
+            "status": "In Progress",
+            "startDate": created.date().isoformat(),
+            "endDate": None,
+            "percentComplete": 42,
+        },
+    }
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO raw_ksat.enrollments"
+            " (source_id, payload, _event_time, _ingested_at, _source_run_id)"
+            " VALUES (%s, %s, %s, %s, 1)"
+            " ON CONFLICT (source_id, _event_time) DO UPDATE SET"
+            "   payload = EXCLUDED.payload, _ingested_at = EXCLUDED._ingested_at",
+            (enrollment_id, json.dumps(payload), created,
+             ingested or datetime.now(UTC)),
+        )
+
+
+def test_an_enrollment_that_progresses_is_refreshed_in_place(warehouse: Any) -> None:
+    """NOT_STARTED -> COMPLETED must update the fact row, not add a second one.
+
+    The whole reason this source is re-read is that enrollments change status
+    long after they are created. An upsert whose DO UPDATE list omits status
+    would leave every enrollment reading NOT_STARTED forever, and the row count
+    would look perfectly healthy.
+    """
+    conn = warehouse
+    created = datetime.now(UTC) - timedelta(days=30)
+
+    _land_ksat(conn, "e-1", status="NOT_STARTED", created=created)
+    runner.execute(KSAT_ENROLLMENTS)
+
+    done = created + timedelta(days=5)
+    _land_ksat(conn, "e-1", status="COMPLETED", created=created,
+               completed=done, score=88, time_spent=1320)
+    runner.execute(KSAT_ENROLLMENTS)
+
+    rows = _rows(
+        conn,
+        "SELECT enrollment_id, status, completed_at, score, time_spent_s,"
+        " started_at, updated_at, policy_acknowledged"
+        " FROM mart_fact_ksat_enrollments",
+    )
+    assert len(rows) == 1, f"expected one row per enrollment, got {rows}"
+    assert rows[0][1] == "COMPLETED"
+    assert rows[0][2] is not None, "completed_at was never refreshed"
+    assert rows[0][3] == 88
+    assert rows[0][4] == 1320
+    # EVERY mutable column, not just the ones a reader thinks of. Omitting one
+    # from the DO UPDATE list freezes it at whatever the first run saw -- the
+    # dbotMirrorId defect, which sat on the single column the integration
+    # joined on.
+    assert rows[0][5] is not None, "started_at was never refreshed"
+    assert rows[0][6] is not None, "updated_at was never refreshed"
+    assert rows[0][7] is True, "policy_acknowledged was never refreshed"
+
+
+def test_a_fractional_score_survives_the_transform(warehouse: Any) -> None:
+    """score is numeric, not integer.
+
+    Exactly the XSOAR severity defect: an ::int cast does not reject 87.5, it
+    aborts the whole upsert with "invalid input syntax for type integer", and
+    the mart stays empty. KSAT scores are percentages and nothing promises they
+    are whole.
+    """
+    conn = warehouse
+    created = datetime.now(UTC) - timedelta(days=10)
+    _land_ksat(conn, "e-frac", status="COMPLETED", created=created,
+               completed=created + timedelta(hours=2), score=87.5, time_spent=600)
+    runner.execute(KSAT_ENROLLMENTS)
+
+    rows = _rows(conn, "SELECT score FROM mart_fact_ksat_enrollments"
+                       " WHERE enrollment_id = 'e-frac'")
+    assert rows == [(Decimal("87.5"),)], rows
+
+
+def test_the_nested_campaign_is_flattened_onto_the_fact(warehouse: Any) -> None:
+    """The campaign arrives as a nested object, not as flat keys.
+
+    payload->>'campaign' on a nested object yields the JSON TEXT of the whole
+    object, so a dashboard would render {"id": "771", ...} as the campaign
+    name. It has to be payload->'campaign'->>'name'.
+    """
+    conn = warehouse
+    created = datetime.now(UTC) - timedelta(days=3)
+    _land_ksat(conn, "e-camp", status="IN_PROGRESS", created=created,
+               campaign_id="903", campaign_name="Phishing Fundamentals")
+    runner.execute(KSAT_ENROLLMENTS)
+
+    rows = _rows(conn, "SELECT campaign_id, campaign_name, campaign_status"
+                       " FROM mart_fact_ksat_enrollments"
+                       " WHERE enrollment_id = 'e-camp'")
+    assert rows == [("903", "Phishing Fundamentals", "In Progress")], rows
+
+
+def test_a_not_started_enrollment_lands_with_null_outcomes(warehouse: Any) -> None:
+    """An unstarted enrollment has null score, timeSpent and completedAt.
+
+    JSON null reaches SQL as the string "null" through ->> only if you ask for
+    the wrong thing; the cast has to see a real NULL or it fails the run. The
+    row must still land -- an enrollment nobody has opened is a reportable fact,
+    and dropping it would understate every denominator.
+    """
+    conn = warehouse
+    created = datetime.now(UTC) - timedelta(days=1)
+    _land_ksat(conn, "e-fresh", status="NOT_STARTED", created=created)
+    runner.execute(KSAT_ENROLLMENTS)
+
+    rows = _rows(
+        conn,
+        "SELECT status, score, time_spent_s, completed_at, started_at,"
+        " policy_acknowledged, user_id, user_status"
+        " FROM mart_fact_ksat_enrollments"
+        " WHERE enrollment_id = 'e-fresh'",
+    )
+    assert rows == [
+        ("NOT_STARTED", None, None, None, None, False, "u-9001", "active")
+    ], rows
