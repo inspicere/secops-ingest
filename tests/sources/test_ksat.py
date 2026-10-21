@@ -254,15 +254,13 @@ def test_queries_stay_well_under_the_150_line_complexity_cap(
 
     for query in (TRAINING_CAMPAIGNS_QUERY, ENROLLMENTS_QUERY, *sent_queries):
         lines = [line for line in query.strip().splitlines() if line.strip()]
-        assert len(query.splitlines()) <= 50, (
-            f'query has {len(query.splitlines())} lines (cap is 150)'
-        )
-        # Formatting-independent: count only leaf field selections.
-        leaves = [
-            ln.strip() for ln in query.splitlines()
-            if ln.strip() and not any(c in ln for c in '(){}:$')
-        ]
-        assert len(leaves) <= 20, f'selection set grew: {leaves}'
+        assert len(lines) <= 50, f"query has {len(lines)} lines (cap is 150)"
+        # Formatting-independent: a leaf is a bare field name, so splitting an
+        # argument list across lines cannot inflate this the way the raw line
+        # count can.
+        leaves = [ln for ln in lines if not any(c in ln for c in "(){}:$")]
+        assert len(leaves) <= 20, f"selection set grew: {leaves}"
+
         # Forbidden arguments and PII fields that bloat complexity or leak PII:
         for forbidden in (
             "page",
