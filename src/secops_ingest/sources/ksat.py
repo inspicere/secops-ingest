@@ -77,6 +77,12 @@ DEFAULT_PAGE_SIZE = 100
 PAGE_CAP = 500
 DEFAULT_TIMEOUT = 60.0
 
+#: Hard bound on a page walk. 325 pages was the largest `pages` value
+#: measured (650 users at per=2); at the default page size a real
+#: collection is far smaller, so this only catches a server that keeps
+#: serving pages forever.
+PAGE_WALK_CAP = 2000
+
 #: 15 lines -- well below the 150-line GraphQL complexity cap.
 #:
 #: EVERY NAME HERE IS MEASURED, not inferred. The first version of this query
@@ -85,6 +91,10 @@ DEFAULT_TIMEOUT = 60.0
 #: `TrainingCampaignStatuses`, `startDate`/`endDate` instead of
 #: `startsAt`/`endsAt`, and `pagination.cursor` instead of
 #: `pagination.nextCursor`. Introspected against the live schema 2026-10-20.
+#:
+#: Pages on `page`, not `cursor`: measured on the live API, every
+#: collection accepts `cursor: BigInt` and never populates nextCursor, so
+#: keyset paging silently stops after page one. See _paginate.
 #:
 #: `statuses` is a LIST, and null means "every status" -- the six are CREATED,
 #: ENROLLING, IN_PROGRESS, CLOSED, COMPLETED and TESTMODE. TESTMODE campaigns
@@ -95,9 +105,9 @@ TRAINING_CAMPAIGNS_QUERY = """\
 query TrainingCampaigns(
   $statuses: [TrainingCampaignStatuses!]
   $per: Int!
-  $cursor: BigInt
+  $page: Int!
 ) {
-  trainingCampaigns(statuses: $statuses, per: $per, cursor: $cursor) {
+  trainingCampaigns(statuses: $statuses, per: $per, page: $page) {
     nodes {
       id
       name
@@ -107,7 +117,9 @@ query TrainingCampaigns(
       percentComplete
     }
     pagination {
-      nextCursor
+      page
+      pages
+      per
       totalCount
     }
   }
@@ -120,13 +132,13 @@ query Enrollments(
   $trainingCampaignId: Int!
   $status: EnrollmentStatuses
   $per: Int!
-  $cursor: BigInt
+  $page: Int!
 ) {
   enrollments(
     trainingCampaignId: $trainingCampaignId
     status: $status
     per: $per
-    cursor: $cursor
+    page: $page
   ) {
     nodes {
       id
@@ -145,7 +157,9 @@ query Enrollments(
       }
     }
     pagination {
-      nextCursor
+      page
+      pages
+      per
       totalCount
     }
   }
@@ -413,16 +427,29 @@ class KsatSource:
         root_field: str,
         base_variables: dict[str, Any],
     ) -> Iterator[dict[str, Any]]:
-        """Walk a GraphQL list query using keyset `cursor` pagination, never `page`."""
-        next_cursor: int | str | None = None
-        seen_cursors: set[str] = set()
+        """Walk a GraphQL list query with `page`, and check the walk was complete.
+
+        PAGE, NOT CURSOR, and this is measured rather than preferred. Every
+        collection on the live API accepts `cursor: BigInt` and never populates
+        `pagination.nextCursor`, so keyset paging stops after the first page
+        and the run reports success. Measured 2026-10-20: 2 of 650 users, 25 of
+        117 phishing runs, 100 of 648 recipients.
+
+        The vendor warns that page ordering holds only "as long as the reported
+        data itself does not change", and that warning is real -- but it
+        describes DUPLICATES and REORDERING, which an upsert absorbs. Cursor's
+        failure here is silent TRUNCATION, which nothing absorbs. So: page,
+        plus the completeness check below, which turns a short read into a
+        warning at the moment it happens rather than a row count nobody
+        queries months later.
+        """
+        page = 1
+        collected = 0
+        total_count: int | None = None
+        pages: int | None = None
 
         while True:
-            variables = {
-                **base_variables,
-                "per": self.page_size,
-                "cursor": next_cursor,
-            }
+            variables = {**base_variables, "per": self.page_size, "page": page}
             started = time.monotonic()
             payload = self._call_graphql(creds, query, variables)
             data = payload.get("data")
@@ -434,38 +461,57 @@ class KsatSource:
 
             nodes = block.get("nodes") or []
             pagination = block.get("pagination") or {}
+            if isinstance(pagination, dict):
+                if isinstance(pagination.get("totalCount"), int):
+                    total_count = pagination["totalCount"]
+                if isinstance(pagination.get("pages"), int):
+                    pages = pagination["pages"]
+
             log.info(
-                "ksat %s cursor=%s: %d record(s) in %.1fs",
+                "ksat %s page=%s: %d record(s) in %.1fs",
                 root_field,
-                next_cursor,
+                page,
                 len(nodes),
                 time.monotonic() - started,
             )
-            if not nodes:
-                return
 
             for node in nodes:
+                collected += 1
                 yield dict(node)
 
-            # nextCursor, not cursor: Pagination exposes nextCursor, page, pages,
-            # per and totalCount. Reading the wrong key is silent -- it comes
-            # back None, pagination stops after one page, and the run reports
-            # success having collected the first page only.
-            raw_next = (
-                pagination.get("nextCursor") if isinstance(pagination, dict) else None
-            )
-            if raw_next is None:
-                return
-            cursor_key = str(raw_next)
-            if cursor_key in seen_cursors:
+            if not nodes:
+                break
+            # Three terminators, most authoritative first:
+            #   1. `pages`, when the API reports it -- it always did in
+            #      measurement, on every collection.
+            #   2. a SHORT page: fewer nodes than asked for means the last one.
+            #      Without this, a server that omits `pages` and keeps serving
+            #      the same page walks to the cap -- which is a hang, not an
+            #      error, and nested walks multiply it.
+            #   3. the cap, for a server that does neither.
+            if pages is not None and page >= pages:
+                break
+            if len(nodes) < self.page_size:
+                break
+            if page >= PAGE_WALK_CAP:
                 log.warning(
-                    "ksat %s returned a repeated cursor %s; stopping",
+                    "ksat %s stopped at the %d-page cap with %d record(s) "
+                    "collected; the collection may be incomplete",
                     root_field,
-                    cursor_key,
+                    PAGE_WALK_CAP,
+                    collected,
                 )
-                return
-            seen_cursors.add(cursor_key)
-            next_cursor = raw_next
+                break
+            page += 1
+
+        if total_count is not None and collected < total_count:
+            log.warning(
+                "ksat %s collected %d of %d record(s) the API reported; "
+                "the walk was short and this run is incomplete",
+                root_field,
+                collected,
+                total_count,
+            )
 
     def _call_graphql(
         self,
