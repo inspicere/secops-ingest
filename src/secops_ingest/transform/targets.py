@@ -847,7 +847,7 @@ KSAT_ENROLLMENTS = Target(
         INSERT INTO mart_fact_ksat_enrollments
             (enrollment_id, created_at, updated_at, started_at, completed_at,
              last_started_at, status, score, time_spent_s, policy_acknowledged,
-             user_id, user_status, campaign_id, campaign_name, campaign_status)
+             user_id, user_archived, campaign_id, campaign_name, campaign_status)
         SELECT
             source_id,
             (payload->>'createdAt')::timestamptz,
@@ -857,13 +857,16 @@ KSAT_ENROLLMENTS = Target(
             (payload->>'lastStartedAt')::timestamptz,
             payload->>'status',
             (payload->>'score')::numeric,
-            (payload->>'timeSpent')::numeric,
+            (payload->>'timeSpentInSeconds')::numeric,
             (payload->>'policyAcknowledged')::boolean,
             -- Nested objects need -> then ->>. payload->>'user' on a nested
             -- object returns the JSON TEXT of the whole object, so a dashboard
             -- would render {"id": "u-9001", "status": "active"} as the user id.
             payload->'user'->>'id',
-            payload->'user'->>'status',
+            -- User has NO status field; it has `archived`. Measured by
+            -- introspection 2026-10-20, after the deployed query asked for
+            -- user { status } and the schema rejected it.
+            (payload->'user'->>'archived')::boolean,
             -- fetch() attaches the whole campaign object to each enrollment
             -- rather than flattening it, so the same applies here.
             payload->'campaign'->>'id',
@@ -886,7 +889,7 @@ KSAT_ENROLLMENTS = Target(
             time_spent_s        = EXCLUDED.time_spent_s,
             policy_acknowledged = EXCLUDED.policy_acknowledged,
             user_id             = EXCLUDED.user_id,
-            user_status         = EXCLUDED.user_status,
+            user_archived       = EXCLUDED.user_archived,
             campaign_id         = EXCLUDED.campaign_id,
             campaign_name       = EXCLUDED.campaign_name,
             campaign_status     = EXCLUDED.campaign_status
@@ -902,6 +905,12 @@ KSAT_ENROLLMENTS = Target(
             completed_at        timestamptz,
             last_started_at     timestamptz,
             status              text,
+            -- timeSpentInSeconds, not timeSpent: the latter does not exist on
+            -- Enrollment. Reading a key the payload lacks is SILENT -- ->>
+            -- returns NULL, the cast succeeds, and the column is empty
+            -- forever. A fixture built from the measured payload catches it;
+            -- one built from the same notes as the query does not.
+            --
             -- numeric, NOT integer, on both of these. KSAT scores are
             -- percentages and nothing promises they are whole; timeSpent is
             -- undocumented as to units and precision and has not been measured
@@ -916,7 +925,7 @@ KSAT_ENROLLMENTS = Target(
             policy_acknowledged boolean,
             -- Opaque. See the note above the target: no email, no names.
             user_id             text,
-            user_status         text,
+            user_archived       boolean,
             campaign_id         text,
             campaign_name       text,
             campaign_status     text,
