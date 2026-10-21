@@ -95,8 +95,8 @@ def campaign_node(
         "id": cid,
         "name": name,
         "status": status,
-        "startDate": "2026-10-01T00:00:00Z",
-        "endDate": "2026-12-31T23:59:59Z",
+        "startsAt": "2026-10-01T00:00:00Z",
+        "endsAt": "2026-12-31T23:59:59Z",
         "percentComplete": 65,
     }
 
@@ -119,10 +119,10 @@ def enrollment_node(
         "startedAt": started_at,
         "completedAt": completed_at,
         "lastStartedAt": started_at,
-        "timeSpent": 1200 if completed_at else 0,
+        "timeSpentInSeconds": 1200 if completed_at else 0,
         "score": 100 if completed_at else None,
         "policyAcknowledged": bool(completed_at),
-        "user": {"id": user_id, "status": "ACTIVE"},
+        "user": {"id": user_id, "archived": False},
     }
 
 
@@ -205,7 +205,17 @@ def test_resolve_registers_jwt_and_host_for_redaction(
 def test_queries_stay_well_under_the_150_line_complexity_cap(
     provider: StubProvider,
 ) -> None:
-    """KSAT rejects queries exceeding 150 lines; vendor examples run to ~300."""
+    """KSAT rejects queries exceeding 150 lines; vendor examples run to ~300.
+
+    The budget is 50 physical lines, raised from 30 on 2026-10-20. The queries
+    did not grow greedier -- their ARGUMENT LISTS were split one-per-line to
+    keep source lines under 100 characters, which a `# noqa` cannot fix inside
+    a triple-quoted string. Selections are unchanged: 6 campaign fields and 10
+    enrollment fields, every one of them used by the mart.
+
+    What this guard is for is a greedy selection set, so it also counts leaf
+    selections directly, which no amount of reformatting can inflate.
+    """
     sent_queries: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -219,7 +229,7 @@ def test_queries_stay_well_under_the_150_line_complexity_cap(
                     "data": {
                         "trainingCampaigns": {
                             "nodes": [campaign_node(101)],
-                            "pagination": {"cursor": None},
+                            "pagination": {"nextCursor": None},
                         }
                     }
                 },
@@ -230,7 +240,7 @@ def test_queries_stay_well_under_the_150_line_complexity_cap(
                 "data": {
                     "enrollments": {
                         "nodes": [enrollment_node(9001)],
-                        "pagination": {"cursor": None},
+                        "pagination": {"nextCursor": None},
                     }
                 }
             },
@@ -244,7 +254,13 @@ def test_queries_stay_well_under_the_150_line_complexity_cap(
 
     for query in (TRAINING_CAMPAIGNS_QUERY, ENROLLMENTS_QUERY, *sent_queries):
         lines = [line for line in query.strip().splitlines() if line.strip()]
-        assert len(lines) <= 30, f"query has {len(lines)} lines (cap is 150)"
+        assert len(lines) <= 50, f"query has {len(lines)} lines (cap is 150)"
+        # Formatting-independent: a leaf is a bare field name, so splitting an
+        # argument list across lines cannot inflate this the way the raw line
+        # count can.
+        leaves = [ln for ln in lines if not any(c in ln for c in "(){}:$")]
+        assert len(leaves) <= 20, f"selection set grew: {leaves}"
+
         # Forbidden arguments and PII fields that bloat complexity or leak PII:
         for forbidden in (
             "page",
@@ -287,7 +303,7 @@ def test_paging_follows_cursor_and_never_sends_page(
                         "data": {
                             "trainingCampaigns": {
                                 "nodes": [campaign_node(101, "Campaign A")],
-                                "pagination": {"cursor": 101},
+                                "pagination": {"nextCursor": 101},
                             }
                         }
                     },
@@ -298,14 +314,14 @@ def test_paging_follows_cursor_and_never_sends_page(
                     "data": {
                         "trainingCampaigns": {
                             "nodes": [campaign_node(202, "Campaign B")],
-                            "pagination": {"cursor": None},
+                            "pagination": {"nextCursor": None},
                         }
                     }
                 },
             )
 
         enrollment_vars.append(variables)
-        cid = variables["campaignId"]
+        cid = variables["trainingCampaignId"]
         cur = variables["cursor"]
         if cid == 101 and cur is None:
             return httpx.Response(
@@ -314,7 +330,7 @@ def test_paging_follows_cursor_and_never_sends_page(
                     "data": {
                         "enrollments": {
                             "nodes": [enrollment_node(1), enrollment_node(2)],
-                            "pagination": {"cursor": 1002},
+                            "pagination": {"nextCursor": 1002},
                         }
                     }
                 },
@@ -326,7 +342,7 @@ def test_paging_follows_cursor_and_never_sends_page(
                     "data": {
                         "enrollments": {
                             "nodes": [enrollment_node(3)],
-                            "pagination": {"cursor": None},
+                            "pagination": {"nextCursor": None},
                         }
                     }
                 },
@@ -338,7 +354,7 @@ def test_paging_follows_cursor_and_never_sends_page(
                     "data": {
                         "enrollments": {
                             "nodes": [enrollment_node(4)],
-                            "pagination": {"cursor": None},
+                            "pagination": {"nextCursor": None},
                         }
                     }
                 },
@@ -352,7 +368,7 @@ def test_paging_follows_cursor_and_never_sends_page(
     assert [r["id"] for r in records] == [1, 2, 3, 4]
     assert [r["campaign"]["id"] for r in records] == [101, 101, 101, 202]
     assert [v["cursor"] for v in campaign_vars] == [None, 101]
-    assert [(v["campaignId"], v["cursor"], v["per"]) for v in enrollment_vars] == [
+    assert [(v["trainingCampaignId"], v["cursor"], v["per"]) for v in enrollment_vars] == [
         (101, None, 2),
         (101, 1002, 2),
         (202, None, 2),
@@ -388,7 +404,7 @@ def test_record_modified_after_creation_is_collected_and_upserts_in_place(
                     "data": {
                         "trainingCampaigns": {
                             "nodes": [campaign_node(101)],
-                            "pagination": {"cursor": None},
+                            "pagination": {"nextCursor": None},
                         }
                     }
                 },
@@ -433,7 +449,7 @@ def test_record_modified_after_creation_is_collected_and_upserts_in_place(
                 "data": {
                     "enrollments": {
                         "nodes": nodes,
-                        "pagination": {"cursor": None},
+                        "pagination": {"nextCursor": None},
                     }
                 }
             },
@@ -509,7 +525,7 @@ def test_campaign_and_enrollment_status_scoping(
                     "data": {
                         "trainingCampaigns": {
                             "nodes": [campaign_node(101, status="IN_PROGRESS")],
-                            "pagination": {"cursor": None},
+                            "pagination": {"nextCursor": None},
                         }
                     }
                 },
@@ -520,7 +536,7 @@ def test_campaign_and_enrollment_status_scoping(
                 "data": {
                     "enrollments": {
                         "nodes": [enrollment_node(9001, status="COMPLETED")],
-                        "pagination": {"cursor": None},
+                        "pagination": {"nextCursor": None},
                     }
                 }
             },
@@ -530,8 +546,9 @@ def test_campaign_and_enrollment_status_scoping(
     creds = source.authenticate()
     got = list(source.fetch(creds, None))
     assert len(got) == 1
-    assert seen_vars[0]["status"] == "IN_PROGRESS"
-    assert seen_vars[1]["campaignId"] == 101
+    # `statuses` is a LIST on trainingCampaigns, unlike enrollments' `status`.
+    assert seen_vars[0]["statuses"] == ["IN_PROGRESS"]
+    assert seen_vars[1]["trainingCampaignId"] == 101
     assert seen_vars[1]["status"] == "COMPLETED"
 
 
@@ -645,7 +662,7 @@ def test_transient_503_retries_and_succeeds(provider: StubProvider) -> None:
                     "data": {
                         "trainingCampaigns": {
                             "nodes": [campaign_node(101)],
-                            "pagination": {"cursor": None},
+                            "pagination": {"nextCursor": None},
                         }
                     }
                 },
@@ -656,7 +673,7 @@ def test_transient_503_retries_and_succeeds(provider: StubProvider) -> None:
                 "data": {
                     "enrollments": {
                         "nodes": [enrollment_node(9001)],
-                        "pagination": {"cursor": None},
+                        "pagination": {"nextCursor": None},
                     }
                 }
             },
@@ -695,7 +712,7 @@ def test_authenticate_accepts_explicit_creds_and_fetch_auto_authenticates(
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            json={"data": {"trainingCampaigns": {"nodes": [], "pagination": {"cursor": None}}}},
+            json={"data": {"trainingCampaigns": {"nodes": [], "pagination": {"nextCursor": None}}}},
         )
 
     source = KsatSource(transport=httpx.MockTransport(handler))
@@ -722,7 +739,7 @@ def test_repeated_cursor_terminates_without_infinite_loop(
                                 campaign_node(101, status="IN_PROGRESS"),
                                 campaign_node(102, status="CLOSED"),
                             ],
-                            "pagination": {"cursor": None},
+                            "pagination": {"nextCursor": None},
                         }
                     }
                 },
@@ -734,7 +751,7 @@ def test_repeated_cursor_terminates_without_infinite_loop(
                 "data": {
                     "enrollments": {
                         "nodes": [enrollment_node(9001)],
-                        "pagination": {"cursor": 555},
+                        "pagination": {"nextCursor": 555},
                     }
                 }
             },
@@ -798,3 +815,183 @@ def test_timeout_and_http_error_raise_clean_ksat_error(
     assert FAKE_JWT not in str(exc_info2.value)
     assert "/graphql" not in str(exc_info2.value)
 
+
+
+# ---------------------------------------------------------------------------
+# The queries must name fields the LIVE schema actually has.
+#
+# WHY A TEXT ASSERTION, when this repo's own history says string assertions
+# agree with bugs rather than catching them: because the bug here WAS the
+# string. The first live run returned six GraphQL errors -- every name below
+# was wrong -- and 34 mock-based tests passed throughout, because the mocks
+# were built from the same incorrect notes as the query. A mock cannot be the
+# oracle for a vendor's schema; only the vendor can.
+#
+# Measured by introspection against training.knowbe4.com/graphql on
+# 2026-10-20. If KSAT renames a field, this test fails and the fix is to
+# re-introspect -- not to relax the assertion.
+# ---------------------------------------------------------------------------
+
+MEASURED_CAMPAIGN_FIELDS = ("startsAt", "endsAt", "percentComplete", "status", "name", "id")
+MEASURED_ENROLLMENT_FIELDS = (
+    "createdAt", "updatedAt", "startedAt", "completedAt", "lastStartedAt",
+    "timeSpentInSeconds", "score", "policyAcknowledged",
+)
+# Names the schema REJECTED, each with what it is really called.
+REJECTED = {
+    "startDate": "startsAt",
+    "endDate": "endsAt",
+    "timeSpent ": "timeSpentInSeconds",
+    "TrainingCampaignStatus:": "TrainingCampaignStatuses",
+    "EnrollmentStatus:": "EnrollmentStatuses",
+    "campaignId:": "trainingCampaignId",
+}
+
+
+def test_campaign_query_names_only_fields_the_schema_has() -> None:
+    q = TRAINING_CAMPAIGNS_QUERY
+    for field in MEASURED_CAMPAIGN_FIELDS:
+        assert field in q, f"campaign query is missing {field!r}"
+    assert "statuses:" in q, "trainingCampaigns takes 'statuses', not 'status'"
+    assert "TrainingCampaignStatuses" in q
+
+
+def test_enrollment_query_names_only_fields_the_schema_has() -> None:
+    q = ENROLLMENTS_QUERY
+    for field in MEASURED_ENROLLMENT_FIELDS:
+        assert field in q, f"enrollment query is missing {field!r}"
+    assert "trainingCampaignId:" in q, "the argument is trainingCampaignId, not campaignId"
+    assert "EnrollmentStatuses" in q
+    # User has no 'status' field; it has 'archived'.
+    assert "status" not in q.split("user {")[1].split("}")[0]
+
+
+def test_pagination_is_read_from_nextCursor_not_cursor() -> None:
+    """Pagination exposes nextCursor, page, pages, per, totalCount -- no 'cursor'."""
+    for q in (TRAINING_CAMPAIGNS_QUERY, ENROLLMENTS_QUERY):
+        block = q.split("pagination {")[1].split("}")[0]
+        assert "nextCursor" in block, f"pagination block reads {block!r}"
+
+
+def test_no_query_uses_a_name_the_schema_rejected() -> None:
+    for bad, good in REJECTED.items():
+        for name, q in (("campaigns", TRAINING_CAMPAIGNS_QUERY),
+                        ("enrollments", ENROLLMENTS_QUERY)):
+            assert bad not in q, f"{name} query still uses {bad!r}; schema wants {good!r}"
+
+
+def test_graphql_errors_are_surfaced_not_just_counted(
+    provider: StubProvider,
+) -> None:
+    """A schema mismatch must say WHAT was wrong and WHAT to use instead.
+
+    The first live run failed with "KSAT GraphQL query failed (6 error(s))" and
+    nothing else -- the vendor's six messages, each naming the offending field
+    and suggesting the right one, were read for len() and discarded. That cost
+    a deploy cycle and a live probe to recover information the API had already
+    handed us.
+
+    The fix reports STRUCTURE, not the raw message: the error code, the
+    offending leaf from `path`, and the identifiers inside the vendor's "did
+    you mean" clause. Raw messages stay out, because
+    test_graphql_errors_never_leak_token_endpoint_path_or_query_text proves a
+    vendor can put a token, an endpoint and a whole query inside one.
+    """
+    errors = [
+        {
+            "message": "Field 'startDate' doesn't exist on type "
+                       "'TrainingCampaign' (Did you mean `startsAt`?)",
+            "path": ["query TrainingCampaigns", "trainingCampaigns", "nodes", "startDate"],
+            "extensions": {"code": "undefinedField"},
+        },
+        {
+            "message": "Field 'cursor' doesn't exist on type 'Pagination' "
+                       "(Did you mean `nextCursor`?)",
+            "path": ["query TrainingCampaigns", "trainingCampaigns", "pagination", "cursor"],
+            "extensions": {"code": "undefinedField"},
+        },
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"errors": errors})
+
+    source = KsatSource(transport=httpx.MockTransport(handler))
+    with pytest.raises(KsatError) as exc_info:
+        list(source.fetch(source.authenticate(), None))
+    text = str(exc_info.value)
+
+    # the count, so the shape of the failure is still legible
+    assert "2 error(s)" in text
+    # the code and the offending leaf
+    assert "undefinedField" in text
+    assert "startDate" in text, f"did not say which field: {text!r}"
+    # and the actionable part: the name to use instead
+    assert "startsAt" in text, f"dropped the vendor's suggestion: {text!r}"
+    assert "nextCursor" in text
+    # still no query text, no endpoint, no credential
+    assert "query TrainingCampaigns" not in text
+    assert "/graphql" not in text
+    assert FAKE_JWT not in text
+
+
+def test_error_summary_drops_hostnames_and_paths_from_suggestions(
+    provider: StubProvider,
+) -> None:
+    """A suggestion clause is not a safe channel just because it is structured."""
+    errors = [
+        {
+            "message": f"Did you mean `{'training.knowbe4.com/graphql'}` or `startsAt`?",
+            "path": ["query X", "nodes", "/graphql"],
+            "extensions": {"code": "undefinedField"},
+        }
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"errors": errors})
+
+    source = KsatSource(transport=httpx.MockTransport(handler))
+    with pytest.raises(KsatError) as exc_info:
+        list(source.fetch(source.authenticate(), None))
+    text = str(exc_info.value)
+    assert "/graphql" not in text
+    assert "knowbe4" not in text
+    assert "startsAt" in text
+
+
+def test_zero_campaigns_warns_rather_than_succeeding_quietly(
+    provider: StubProvider,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No campaigns must not read as a healthy run.
+
+    Measured on a real Diamond-tier tenant: trainingCampaigns returns
+    totalCount=0 across all six statuses, because that customer runs training
+    in a different LMS. fetch() then yields nothing, the framework records
+    SUCCESS with rows_written=0, and a dashboard shows a working connector
+    delivering no data -- indefinitely, with nothing to distinguish it from a
+    tenant that simply has no activity this week.
+
+    An empty campaign list is the one case where "nothing to do" and
+    "misconfigured" are indistinguishable from the outside, so it says so.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "trainingCampaigns": {
+                        "nodes": [],
+                        "pagination": {"nextCursor": None, "totalCount": 0},
+                    }
+                }
+            },
+        )
+
+    source = KsatSource(transport=httpx.MockTransport(handler))
+    with caplog.at_level("WARNING"):
+        rows = list(source.fetch(source.authenticate(), None))
+
+    assert rows == []
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("no training campaign" in w.lower() for w in warnings), warnings
