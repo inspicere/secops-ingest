@@ -261,9 +261,17 @@ def test_queries_stay_well_under_the_150_line_complexity_cap(
         leaves = [ln for ln in lines if not any(c in ln for c in "(){}:$")]
         assert len(leaves) <= 20, f"selection set grew: {leaves}"
 
-        # Forbidden arguments and PII fields that bloat complexity or leak PII:
+        # Forbidden tokens: PII, and arguments that are wrong rather than
+        # merely expensive.
+        #
+        # `page` is NO LONGER forbidden, and that is a measured reversal. It was
+        # here because the design said "keyset cursor, never page". Measured on
+        # the live API 2026-10-20: every collection accepts cursor: BigInt and
+        # never populates nextCursor, so cursor paging reaches 2 of 650 users
+        # and reports success. page is the only one that works.
+        #
+        # per_page/perPage stay forbidden: neither exists on this API at all.
         for forbidden in (
-            "page",
             "per_page",
             "perPage",
             "dateRangeField",
@@ -276,106 +284,7 @@ def test_queries_stay_well_under_the_150_line_complexity_cap(
             assert forbidden not in query, f"forbidden token {forbidden!r} in query"
 
 
-# -- keyset cursor paging (never page) --------------------------------------
-
-
-def test_paging_follows_cursor_and_never_sends_page(
-    provider: StubProvider,
-) -> None:
-    campaign_vars: list[dict[str, Any]] = []
-    enrollment_vars: list[dict[str, Any]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.method == "POST"
-        assert request.headers["Authorization"] == f"Bearer {FAKE_JWT}"
-        body = json.loads(request.content.decode())
-        query = body["query"]
-        variables = body["variables"]
-        assert "page" not in variables
-        assert "per_page" not in variables
-
-        if "trainingCampaigns" in query:
-            campaign_vars.append(variables)
-            if variables["cursor"] is None:
-                return httpx.Response(
-                    200,
-                    json={
-                        "data": {
-                            "trainingCampaigns": {
-                                "nodes": [campaign_node(101, "Campaign A")],
-                                "pagination": {"nextCursor": 101},
-                            }
-                        }
-                    },
-                )
-            return httpx.Response(
-                200,
-                json={
-                    "data": {
-                        "trainingCampaigns": {
-                            "nodes": [campaign_node(202, "Campaign B")],
-                            "pagination": {"nextCursor": None},
-                        }
-                    }
-                },
-            )
-
-        enrollment_vars.append(variables)
-        cid = variables["trainingCampaignId"]
-        cur = variables["cursor"]
-        if cid == 101 and cur is None:
-            return httpx.Response(
-                200,
-                json={
-                    "data": {
-                        "enrollments": {
-                            "nodes": [enrollment_node(1), enrollment_node(2)],
-                            "pagination": {"nextCursor": 1002},
-                        }
-                    }
-                },
-            )
-        if cid == 101 and cur == 1002:
-            return httpx.Response(
-                200,
-                json={
-                    "data": {
-                        "enrollments": {
-                            "nodes": [enrollment_node(3)],
-                            "pagination": {"nextCursor": None},
-                        }
-                    }
-                },
-            )
-        if cid == 202 and cur is None:
-            return httpx.Response(
-                200,
-                json={
-                    "data": {
-                        "enrollments": {
-                            "nodes": [enrollment_node(4)],
-                            "pagination": {"nextCursor": None},
-                        }
-                    }
-                },
-            )
-        raise AssertionError(f"unexpected variables: {variables}")
-
-    source = KsatSource(page_size=2, transport=httpx.MockTransport(handler))
-    creds = source.authenticate()
-    records = list(source.fetch(creds, None))
-
-    assert [r["id"] for r in records] == [1, 2, 3, 4]
-    assert [r["campaign"]["id"] for r in records] == [101, 101, 101, 202]
-    assert [v["cursor"] for v in campaign_vars] == [None, 101]
-    assert [(v["trainingCampaignId"], v["cursor"], v["per"]) for v in enrollment_vars] == [
-        (101, None, 2),
-        (101, 1002, 2),
-        (202, None, 2),
-    ]
-
-
-# -- re-reading captures post-creation mutations ----------------------------
+# -- page-based paging (cursor is accepted and does nothing) ----------------
 
 
 def test_record_modified_after_creation_is_collected_and_upserts_in_place(
@@ -724,47 +633,6 @@ def test_authenticate_accepts_explicit_creds_and_fetch_auto_authenticates(
     assert list(source2.fetch(None, None)) == []
 
 
-def test_repeated_cursor_terminates_without_infinite_loop(
-    provider: StubProvider,
-) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content.decode())
-        if "trainingCampaigns" in body["query"]:
-            return httpx.Response(
-                200,
-                json={
-                    "data": {
-                        "trainingCampaigns": {
-                            "nodes": [
-                                campaign_node(101, status="IN_PROGRESS"),
-                                campaign_node(102, status="CLOSED"),
-                            ],
-                            "pagination": {"nextCursor": None},
-                        }
-                    }
-                },
-            )
-        # Server bug: returns the same cursor (555) on every page.
-        return httpx.Response(
-            200,
-            json={
-                "data": {
-                    "enrollments": {
-                        "nodes": [enrollment_node(9001)],
-                        "pagination": {"nextCursor": 555},
-                    }
-                }
-            },
-        )
-
-    source = KsatSource(
-        campaign_status="IN_PROGRESS",
-        transport=httpx.MockTransport(handler),
-    )
-    records = list(source.fetch(source.authenticate(), None))
-    assert [r["id"] for r in records] == [9001, 9001]
-
-
 def test_malformed_json_and_missing_data_raise_clean_ksat_error(
     provider: StubProvider,
 ) -> None:
@@ -866,11 +734,23 @@ def test_enrollment_query_names_only_fields_the_schema_has() -> None:
     assert "status" not in q.split("user {")[1].split("}")[0]
 
 
-def test_pagination_is_read_from_nextCursor_not_cursor() -> None:
-    """Pagination exposes nextCursor, page, pages, per, totalCount -- no 'cursor'."""
-    for q in (TRAINING_CAMPAIGNS_QUERY, ENROLLMENTS_QUERY):
-        block = q.split("pagination {")[1].split("}")[0]
-        assert "nextCursor" in block, f"pagination block reads {block!r}"
+def test_pagination_does_not_select_nextCursor_because_it_never_populates() -> None:
+    """nextCursor is deliberately NOT requested, and this records why.
+
+    Pagination exposes nextCursor, page, pages, per and totalCount. The first
+    version of this connector paged on nextCursor -- which the API accepts and
+    never populates. Measured 2026-10-20 across every collection: groups 2/12,
+    users 2/650, phishingCampaigns 2/19, phishingCampaignRuns 25/117,
+    phishingCampaignRecipients 100/648. Each reported a successful run.
+
+    Selecting a field nobody reads invites someone to read it again, so it is
+    left out and the reason lives here.
+    """
+    for query in (TRAINING_CAMPAIGNS_QUERY, ENROLLMENTS_QUERY):
+        block = query.split("pagination {")[1].split("}")[0]
+        assert "nextCursor" not in block, (
+            "nextCursor is selected again; it never populates on this API"
+        )
 
 
 def test_no_query_uses_a_name_the_schema_rejected() -> None:
@@ -995,3 +875,255 @@ def test_zero_campaigns_warns_rather_than_succeeding_quietly(
     assert rows == []
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert any("no training campaign" in w.lower() for w in warnings), warnings
+
+
+# ---------------------------------------------------------------------------
+# Paging walks `page`, because `cursor` does not work.
+#
+# MEASURED on the live tenant 2026-10-20, across every collection tested:
+#
+#   collection          totalCount  pages  first nextCursor  cursor walk reached
+#   groups                      12      6  None                                2
+#   users                      650    325  None                                2
+#   phishingCampaigns           19     10  None                                2
+#   phishingCampaignRuns       117      5  None                               25
+#   phishingCampaignRecipients 648      7  None                              100
+#
+# `cursor: BigInt` is ACCEPTED on every one of them and `nextCursor` is never
+# populated. So keyset paging silently stops after the first page and the run
+# reports success having collected a fraction of the collection -- 2 of 650
+# users, in the worst case measured.
+#
+# The original design said "use cursor, never page", reasoning from the
+# vendor's warning that page ordering is unstable under concurrent
+# modification. That warning is real but it describes a risk of DUPLICATES and
+# REORDERING, which an upsert absorbs; cursor's failure here is a silent
+# TRUNCATION, which nothing absorbs. An argument existing in the schema is not
+# the same as the argument working.
+# ---------------------------------------------------------------------------
+
+
+def _paged_handler(
+    total: int,
+    per: int,
+    *,
+    seen_pages: list[Any],
+    next_cursor: Any = None,
+) -> Any:
+    """A server that pages correctly on `page` and never sets nextCursor."""
+    pages = (total + per - 1) // per
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        v = body["variables"]
+        seen_pages.append(dict(v))
+        page = v.get("page") or 1
+        start = (page - 1) * per
+        ids = list(range(start, min(start + per, total)))
+        root = "trainingCampaigns" if "trainingCampaigns" in body["query"] else "enrollments"
+        nodes = (
+            [campaign_node(1000 + i) for i in ids] if root == "trainingCampaigns"
+            else [enrollment_node(2000 + i) for i in ids]
+        )
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    root: {
+                        "nodes": nodes,
+                        "pagination": {
+                            "nextCursor": next_cursor,
+                            "page": page,
+                            "pages": pages,
+                            "per": per,
+                            "totalCount": total,
+                        },
+                    }
+                }
+            },
+        )
+
+    return handler
+
+
+def test_paging_walks_every_page_even_when_nextCursor_is_null(
+    provider: StubProvider,
+) -> None:
+    """The measured server behaviour: pages=5, nextCursor=None, forever.
+
+    Under keyset paging this collected one page and stopped. 2 of 650 users was
+    the worst measured case, reported as a successful run.
+    """
+    seen: list[Any] = []
+    source = KsatSource(
+        transport=httpx.MockTransport(_paged_handler(7, 3, seen_pages=seen)),
+        page_size=3,
+    )
+    got = list(source.fetch(source.authenticate(), None))
+
+    campaign_calls = [v for v in seen if "statuses" in v]
+    assert [v.get("page") for v in campaign_calls] == [1, 2, 3], campaign_calls
+    assert all("cursor" not in v or v["cursor"] is None for v in campaign_calls)
+    # Every campaign is walked, and each contributes enrollments. The mock
+    # reuses enrollment ids across campaigns, so uniqueness is not the
+    # property under test here -- page coverage is.
+    assert len(campaign_calls) == 3
+    assert got, "walked every page and yielded nothing"
+
+
+def test_short_read_against_totalCount_warns(
+    provider: StubProvider,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Collecting fewer records than totalCount must be loud, not silent.
+
+    This is the guard that the cursor defect needed and did not have: the API
+    reports totalCount on every page, so a truncated walk is detectable at the
+    moment it happens rather than months later from a row count nobody checks.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        root = "trainingCampaigns" if "trainingCampaigns" in body["query"] else "enrollments"
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    root: {
+                        "nodes": [campaign_node(1)] if root == "trainingCampaigns" else [],
+                        # claims 50 exist, serves 1, and says there is one page
+                        "pagination": {
+                            "nextCursor": None, "page": 1, "pages": 1,
+                            "per": 50, "totalCount": 50,
+                        },
+                    }
+                }
+            },
+        )
+
+    source = KsatSource(transport=httpx.MockTransport(handler))
+    with caplog.at_level("WARNING"):
+        list(source.fetch(source.authenticate(), None))
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("1 of 50" in w or "totalCount" in w.lower() for w in warnings), warnings
+
+
+def test_page_walk_is_bounded_when_the_server_never_runs_out(
+    provider: StubProvider,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A server that serves a full page forever must not hang the run.
+
+    Under keyset paging the analogous hazard was a repeated cursor. Under page
+    paging it is a server that reports no `pages` and never short-pages. Both
+    end the same way: bounded, with a warning that says the collection may be
+    incomplete.
+    """
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        calls["n"] += 1
+        root = "trainingCampaigns" if "trainingCampaigns" in body["query"] else "enrollments"
+        node = campaign_node(1) if root == "trainingCampaigns" else enrollment_node(2)
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    root: {
+                        # always a FULL page, and no `pages` to stop on
+                        "nodes": [node, node],
+                        "pagination": {"nextCursor": None, "per": 2},
+                    }
+                }
+            },
+        )
+
+    source = KsatSource(transport=httpx.MockTransport(handler), page_size=2)
+    monkey_cap = 3
+    original = ksat_mod.PAGE_WALK_CAP
+    try:
+        ksat_mod.PAGE_WALK_CAP = monkey_cap
+        with caplog.at_level("WARNING"):
+            list(source.fetch(source.authenticate(), None))
+    finally:
+        ksat_mod.PAGE_WALK_CAP = original
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("cap" in w for w in warnings), warnings
+    assert calls["n"] < 100, f"walk was not bounded: {calls['n']} calls"
+
+
+def test_queries_declare_every_variable_the_paginator_sends(
+    provider: StubProvider,
+) -> None:
+    """A variable the query does not declare is not a variable.
+
+    This is the hole the mocks could not see. _paginate was switched from
+    `cursor` to `page` and every mock-based paging test passed -- because the
+    mocks read variables["page"] straight off the request, while the query text
+    still declared $cursor and never mentioned $page. A real GraphQL server
+    ignores or rejects an undeclared variable; a MockTransport cannot tell.
+
+    So assert the contract directly: whatever _paginate puts in `variables`
+    must appear as a `$name` declaration in the query it is sent with.
+    """
+    sent: list[tuple[str, dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        sent.append((body["query"], body["variables"]))
+        root = "trainingCampaigns" if "trainingCampaigns" in body["query"] else "enrollments"
+        node = campaign_node(1) if root == "trainingCampaigns" else enrollment_node(2)
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    root: {
+                        "nodes": [node],
+                        "pagination": {
+                            "nextCursor": None, "page": 1, "pages": 1,
+                            "per": 50, "totalCount": 1,
+                        },
+                    }
+                }
+            },
+        )
+
+    source = KsatSource(transport=httpx.MockTransport(handler))
+    list(source.fetch(source.authenticate(), None))
+
+    assert sent, "no request was made"
+    for query, variables in sent:
+        for name in variables:
+            assert f"${name}" in query, (
+                f"query sends {name!r} but never declares ${name}: "
+                f"declares {[w for w in query.split() if w.startswith('$')]}"
+            )
+
+
+#: Pagination fields `_paginate` reads out of every response.
+PAGINATION_FIELDS_READ = ("pages", "totalCount")
+
+
+def test_queries_select_the_pagination_fields_the_walker_reads() -> None:
+    """Reading a field the query never asked for is reading nothing.
+
+    _paginate terminates on `pagination.pages` and checks completeness against
+    `pagination.totalCount`. Neither arrives unless the query SELECTS it, and a
+    MockTransport cannot tell the difference: the mocks in this file return a
+    pagination block containing `pages` no matter what the query requested, so
+    45 tests passed while `pages` was dead code and the walk silently fell back
+    to its secondary terminator.
+
+    Caught by a live probe, not by a mock. This is the mock-shaped blind spot
+    that produced the original six-error failure, in a second guise.
+    """
+    for name, query in (("campaigns", TRAINING_CAMPAIGNS_QUERY),
+                        ("enrollments", ENROLLMENTS_QUERY)):
+        block = query.split("pagination {")[1].split("}")[0]
+        for field in PAGINATION_FIELDS_READ:
+            assert field in block, (
+                f"{name} query reads pagination.{field} but does not select it; "
+                f"block is {block.split()!r}"
+            )
