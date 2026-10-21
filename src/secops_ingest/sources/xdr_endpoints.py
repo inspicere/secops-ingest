@@ -53,6 +53,11 @@ class XdrEndpointsSource:
     name = "xdr_endpoints"
     table = "raw_xdr.endpoint_snapshots"
 
+    #: NOT ordered: this is a snapshot source. It ignores the cursor entirely
+    #: and writes one row per endpoint under a new snapshot timestamp, so there
+    #: is no position to advance.
+    fetch_order_is_watermark_order = False
+
     def __init__(self) -> None:
         self.secret = os.environ.get("SECOPS_XDR_ENDPOINTS_SECRET", "xdr")
         self.page_size = min(env_int("SECOPS_XDR_ENDPOINTS_PAGE_SIZE", PAGE_CAP),

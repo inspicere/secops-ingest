@@ -12,6 +12,9 @@ rather than once per connector.
 from __future__ import annotations
 
 import logging
+import os
+import signal
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -34,6 +37,20 @@ class Source(Protocol):
     name: str
     table: str
 
+    #: Does fetch() yield records in non-decreasing watermark order?
+    #:
+    #: Only a source that says yes may have its watermark advanced by a run that
+    #: stopped early, because only then is "the highest mark seen so far" also
+    #: "everything below this has been read".
+    #:
+    #: defectdojo scans DESCENDING -- its first page carries the highest mark --
+    #: so advancing would skip every record below it. xdr_endpoints ignores the
+    #: cursor entirely. Both must stay False.
+    #:
+    #: Absent means False. A connector written before this existed does not get
+    #: its position advanced on the strength of an attribute it never set.
+    fetch_order_is_watermark_order: bool
+
     def authenticate(self) -> Any:
         """Fetch credentials ONCE per run. Held in memory, never written."""
 
@@ -49,6 +66,16 @@ class Source(Protocol):
 
     def watermark_of(self, record: dict[str, Any]) -> Any:
         """Value to advance the watermark to. Usually a modification time."""
+
+
+#: Seconds a run may spend before it winds down, 0 meaning stop at once and a
+#: negative value meaning no deadline.
+#:
+#: Comfortably below the unit's TimeoutStartSec, because the point is to stop
+#: BEFORE systemd does: a SIGTERM kill lands rows and discards the position,
+#: which is the livelock. 1500 against a 1800s cap leaves 300s to land the final
+#: batch and close the ledger row.
+DEFAULT_DEADLINE_SEC = int(os.environ.get("SECOPS_INGEST_DEADLINE_SEC", "1500"))
 
 
 @dataclass
@@ -114,12 +141,62 @@ def _pack_state_of(conn: Any, source_name: str) -> str | None:
     return stored.state
 
 
+
+class _Budget:
+    """How long this run may take. Negative means no limit."""
+
+    def __init__(self, seconds: int) -> None:
+        self.seconds = seconds
+        self.started = time.monotonic()
+
+    def expired(self) -> bool:
+        if self.seconds < 0:
+            return False
+        return (time.monotonic() - self.started) >= self.seconds
+
+
+class _Stopper:
+    """Set by SIGTERM so a systemd stop becomes a wind-down."""
+
+    def __init__(self) -> None:
+        self.signalled = False
+
+    def __call__(self, signum: int, frame: Any) -> None:
+        self.signalled = True
+
+
+def _install_sigterm() -> _Stopper:
+    """Turn SIGTERM into a flag, falling back silently off the main thread.
+
+    Unhandled, SIGTERM kills Python without running the except handler, so no
+    terminal status is written and control.ingest_run keeps a RUNNING row
+    forever. signal.signal raises ValueError outside the main thread, which is
+    where tests and embedders may call this; losing the handler there is
+    harmless because nothing is sending the process a signal.
+    """
+    stopper = _Stopper()
+    try:
+        signal.signal(signal.SIGTERM, stopper)
+    except ValueError:  # pragma: no cover - not the main thread
+        log.debug("not the main thread; SIGTERM handler not installed")
+    return stopper
+
+
+def _stop_reason(budget: _Budget, stopper: _Stopper) -> str | None:
+    if stopper.signalled:
+        return "SIGTERM"
+    if budget.expired():
+        return f"the {budget.seconds}s deadline"
+    return None
+
+
 def execute(
     source: Source,
     *,
     dry_run: bool = False,
     batch_size: int = DEFAULT_BATCH,
     provider: object | None = None,
+    deadline_sec: int | None = None,
 ) -> Result:
     """Run one ingest cycle. Never returns silently on failure."""
     with db.connect(provider) as conn:
@@ -158,6 +235,9 @@ def execute(
         )
         read = written = 0
         high_watermark: Any = None
+        stop: str | None = None
+        budget = _Budget(DEFAULT_DEADLINE_SEC if deadline_sec is None else deadline_sec)
+        stopper = _install_sigterm()
         try:
             creds = source.authenticate()
             cursor = db.get_watermark(conn, source.name)
@@ -174,6 +254,12 @@ def execute(
                 if len(batch) >= batch_size:
                     written += _land(conn, source, batch, dry_run)
                     batch = []
+                # Checked AFTER landing, so a stop never strands a full batch,
+                # and between records rather than inside fetch(), because the
+                # connector owns its paging and this must not reach into it.
+                stop = _stop_reason(budget, stopper)
+                if stop:
+                    break
             if batch:
                 written += _land(conn, source, batch, dry_run)
 
@@ -183,10 +269,33 @@ def execute(
 
             # Ordering is deliberate: advance only after a successful land. A
             # crash before this re-fetches an overlap, which the upsert absorbs.
-            if high_watermark is not None:
+            #
+            # A run stopped early may advance ONLY if its source declares that
+            # it yields in watermark order. Otherwise "the highest mark seen"
+            # says nothing about what was read, and writing it would skip every
+            # record the run never reached.
+            ordered = bool(getattr(source, "fetch_order_is_watermark_order", False))
+            may_advance = stop is None or ordered
+            if high_watermark is not None and may_advance:
                 db.set_watermark(conn, source.name, high_watermark)
+            elif high_watermark is not None:
+                log.warning(
+                    "source=%s stopped early (%s) and does not yield in watermark "
+                    "order; cursor left at %s so nothing below the highest mark "
+                    "seen is skipped", source.name, stop, cursor,
+                )
 
-            db.finish_run(conn, run_id, "SUCCESS", read, written)
+            # A partial run reports SUCCESS -- it did what it could and the next
+            # run continues -- but says so, because a partial run that looks
+            # identical to a complete one hides the thing an operator needs.
+            note = (
+                f"stopped at {stop}: read {read} row(s), "
+                f"{'advanced' if may_advance and high_watermark else 'kept'} the cursor"
+                if stop else None
+            )
+            if stop:
+                log.warning("source=%s %s", source.name, note)
+            db.finish_run(conn, run_id, "SUCCESS", read, written, note)
             return Result("SUCCESS", read, written)
 
         except Exception as exc:

@@ -64,6 +64,11 @@ class WazuhSource:
     name = "wazuh"
     table = "raw_wazuh.alerts"
 
+    #: Keyset paging on `search_after` over an ascending `timestamp` sort, and
+    #: `timestamp` is also the watermark. Same field, same direction, so the
+    #: highest mark seen really does mean everything below it has been read.
+    fetch_order_is_watermark_order = True
+
     def __init__(self) -> None:
         self.url = (os.environ.get("SECOPS_WAZUH_URL") or "").rstrip("/")
         self.index = os.environ.get("SECOPS_WAZUH_INDEX", DEFAULT_INDEX)
