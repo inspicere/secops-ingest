@@ -365,10 +365,10 @@ def _land_ksat(
         "startedAt": None if status == "NOT_STARTED" else _z(created),
         "completedAt": _z(completed) if completed else None,
         "lastStartedAt": None if status == "NOT_STARTED" else _z(created),
-        "timeSpent": time_spent,
+        "timeSpentInSeconds": time_spent,
         "score": score,
         "policyAcknowledged": status == "COMPLETED",
-        "user": {"id": user_id, "status": "active"},
+        "user": {"id": user_id, "archived": False},
         "campaign": {
             "id": campaign_id,
             "name": campaign_name,
@@ -483,10 +483,10 @@ def test_a_not_started_enrollment_lands_with_null_outcomes(warehouse: Any) -> No
     rows = _rows(
         conn,
         "SELECT status, score, time_spent_s, completed_at, started_at,"
-        " policy_acknowledged, user_id, user_status"
+        " policy_acknowledged, user_id, user_archived"
         " FROM mart_fact_ksat_enrollments"
         " WHERE enrollment_id = 'e-fresh'",
     )
     assert rows == [
-        ("NOT_STARTED", None, None, None, None, False, "u-9001", "active")
+        ("NOT_STARTED", None, None, None, None, False, "u-9001", False)
     ], rows
