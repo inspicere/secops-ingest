@@ -29,7 +29,7 @@ from secops_ingest import redaction  # noqa: E402
 from secops_ingest.builtin import PACK  # noqa: E402
 from secops_ingest.common.watermark import comparable, newer  # noqa: E402
 from secops_ingest.packs.registry import resolve_source  # noqa: E402
-from secops_ingest.sources import ksat as ksat_mod  # noqa: E402
+from secops_ingest.sources import _ksat as _ksat_mod  # noqa: E402
 from secops_ingest.sources.ksat import (  # noqa: E402
     ENROLLMENTS_QUERY,
     PAGE_CAP,
@@ -82,7 +82,8 @@ def provider(monkeypatch: pytest.MonkeyPatch) -> StubProvider:
             "ksat.api_key": FAKE_JWT,
         }
     )
-    monkeypatch.setattr(ksat_mod, "get_provider", lambda: stub)
+    # resolve() lives in the shared client now, so patch it there.
+    monkeypatch.setattr(_ksat_mod, "get_provider", lambda: stub)
     return stub
 
 
@@ -600,7 +601,8 @@ def test_transient_503_retries_and_succeeds(provider: StubProvider) -> None:
 
 def test_empty_api_key_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     stub = StubProvider({"ksat.base_url": "ksat.example.com/graphql", "ksat.api_key": "   "})
-    monkeypatch.setattr(ksat_mod, "get_provider", lambda: stub)
+    # resolve() lives in the shared client now, so patch it there.
+    monkeypatch.setattr(_ksat_mod, "get_provider", lambda: stub)
     with pytest.raises(KsatError, match="api_key"):
         resolve("ksat")
 
@@ -1039,15 +1041,14 @@ def test_page_walk_is_bounded_when_the_server_never_runs_out(
             },
         )
 
-    source = KsatSource(transport=httpx.MockTransport(handler), page_size=2)
-    monkey_cap = 3
-    original = ksat_mod.PAGE_WALK_CAP
-    try:
-        ksat_mod.PAGE_WALK_CAP = monkey_cap
-        with caplog.at_level("WARNING"):
-            list(source.fetch(source.authenticate(), None))
-    finally:
-        ksat_mod.PAGE_WALK_CAP = original
+    # The cap is injected rather than monkeypatched onto a module: a global
+    # mutated by a test leaks into whatever runs next, and the production
+    # default is far too large to exercise here.
+    source = KsatSource(
+        transport=httpx.MockTransport(handler), page_size=2, page_walk_cap=3
+    )
+    with caplog.at_level("WARNING"):
+        list(source.fetch(source.authenticate(), None))
 
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert any("cap" in w for w in warnings), warnings
