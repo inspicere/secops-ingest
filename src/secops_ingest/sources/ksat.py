@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -63,6 +64,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .. import redaction
 from ..common.http import RETRYABLE_STATUS, RetryBudgetExhausted, with_retries
 from ..common.payload import to_json
 from ..redaction import register_secret
@@ -76,19 +78,37 @@ PAGE_CAP = 500
 DEFAULT_TIMEOUT = 60.0
 
 #: 15 lines -- well below the 150-line GraphQL complexity cap.
+#:
+#: EVERY NAME HERE IS MEASURED, not inferred. The first version of this query
+#: was written from notes and returned six GraphQL errors on its first live
+#: call -- `status` instead of `statuses`, `TrainingCampaignStatus` instead of
+#: `TrainingCampaignStatuses`, `startDate`/`endDate` instead of
+#: `startsAt`/`endsAt`, and `pagination.cursor` instead of
+#: `pagination.nextCursor`. Introspected against the live schema 2026-10-20.
+#:
+#: `statuses` is a LIST, and null means "every status" -- the six are CREATED,
+#: ENROLLING, IN_PROGRESS, CLOSED, COMPLETED and TESTMODE. TESTMODE campaigns
+#: are real campaigns in test mode; a deployment that reports on completion
+#: rates probably wants them excluded, which is why the filter is exposed
+#: rather than hard-coded.
 TRAINING_CAMPAIGNS_QUERY = """\
-query TrainingCampaigns($status: TrainingCampaignStatus, $per: Int!, $cursor: BigInt) {
-  trainingCampaigns(status: $status, per: $per, cursor: $cursor) {
+query TrainingCampaigns(
+  $statuses: [TrainingCampaignStatuses!]
+  $per: Int!
+  $cursor: BigInt
+) {
+  trainingCampaigns(statuses: $statuses, per: $per, cursor: $cursor) {
     nodes {
       id
       name
       status
-      startDate
-      endDate
+      startsAt
+      endsAt
       percentComplete
     }
     pagination {
-      cursor
+      nextCursor
+      totalCount
     }
   }
 }"""
@@ -96,8 +116,18 @@ query TrainingCampaigns($status: TrainingCampaignStatus, $per: Int!, $cursor: Bi
 #: 23 lines -- requests only outcome fields and an opaque user id/status pair,
 #: omitting PII (email, firstName, lastName) and staying well under the 150-line cap.
 ENROLLMENTS_QUERY = """\
-query Enrollments($campaignId: Int!, $status: EnrollmentStatus, $per: Int!, $cursor: BigInt) {
-  enrollments(campaignId: $campaignId, status: $status, per: $per, cursor: $cursor) {
+query Enrollments(
+  $trainingCampaignId: Int!
+  $status: EnrollmentStatuses
+  $per: Int!
+  $cursor: BigInt
+) {
+  enrollments(
+    trainingCampaignId: $trainingCampaignId
+    status: $status
+    per: $per
+    cursor: $cursor
+  ) {
     nodes {
       id
       status
@@ -106,19 +136,89 @@ query Enrollments($campaignId: Int!, $status: EnrollmentStatus, $per: Int!, $cur
       startedAt
       completedAt
       lastStartedAt
-      timeSpent
+      timeSpentInSeconds
       score
       policyAcknowledged
       user {
         id
-        status
+        archived
       }
     }
     pagination {
-      cursor
+      nextCursor
+      totalCount
     }
   }
 }"""
+
+
+#: At most this many errors summarised. A rejected query yields one error per
+#: offending field; six was the real count on the first live run.
+_MAX_ERRORS = 6
+
+#: "(Did you mean `startsAt`?)" / "Did you mean `a`, `b` or `c`" -- the
+#: vendor's own correction, and the single most useful token in the response.
+_SUGGESTION_RE = re.compile(r"[Dd]id you mean ([^)?.]+)")
+_IDENT_RE = re.compile(r"[`'\"]([A-Za-z_][A-Za-z0-9_]{0,60})[`'\"]")
+
+
+def _error_summary(errors: Any) -> str:
+    """Summarise GraphQL errors as code + location + the vendor's suggestion.
+
+    STRUCTURE, NOT FREE TEXT, and that distinction is the whole design. This
+    used to report only a count, so the first live run failed with
+    "KSAT GraphQL query failed (6 error(s))" while the response body held six
+    messages each naming the offending field AND the correct one. Recovering
+    that cost a deploy cycle and a live probe against the vendor.
+
+    But the raw `message` cannot be echoed: a vendor is free to put anything in
+    it, and a test in this suite proves the point by returning a message
+    containing the bearer token, the endpoint path and the whole query. So this
+    takes only:
+
+      * `extensions.code` -- a fixed vocabulary (undefinedField,
+        argumentNotAccepted, variableRequiresValidType, variableNotUsed).
+      * the LAST element of `path` -- the offending leaf, e.g. `startDate`.
+        Not the whole path, which carries the operation name.
+      * identifiers inside the "did you mean" clause -- the correction, which
+        by construction is a name our query does NOT yet use.
+
+    Anything containing a slash or a dot is dropped, so hostnames and paths
+    cannot ride along, and every part is scrubbed through the redaction
+    registry so the token is masked even if a vendor echoed it.
+    """
+    if not isinstance(errors, list):
+        return "1 error (unparseable error payload)"
+
+    lines: list[str] = []
+    for err in errors[:_MAX_ERRORS]:
+        if not isinstance(err, dict):
+            continue
+        code = str((err.get("extensions") or {}).get("code") or "error")
+        message = redaction.scrub(str(err.get("message") or ""))
+
+        path = err.get("path")
+        leaf = ""
+        if isinstance(path, list) and path:
+            candidate = str(path[-1])
+            if "/" not in candidate and "." not in candidate and len(candidate) <= 60:
+                leaf = candidate
+
+        suggestion = ""
+        found = _SUGGESTION_RE.search(message)
+        if found:
+            names = [
+                n for n in _IDENT_RE.findall(found.group(1))
+                if "/" not in n and "." not in n
+            ][:4]
+            if names:
+                suggestion = " (did you mean: " + ", ".join(names) + ")"
+
+        lines.append(f"{code}" + (f" at {leaf}" if leaf else "") + suggestion)
+
+    more = len(errors) - len(lines)
+    summary = f"{len(errors)} error(s): " + "; ".join(lines or ["(no detail)"])
+    return summary + (f" (+{more} more)" if more > 0 else "")
 
 
 class KsatError(RuntimeError):
@@ -265,10 +365,29 @@ class KsatSource:
                 active_creds,
                 TRAINING_CAMPAIGNS_QUERY,
                 "trainingCampaigns",
-                {"status": self.campaign_status},
+                # statuses is a list; None means every status.
+                {
+                    "statuses": (
+                        [self.campaign_status] if self.campaign_status else None
+                    )
+                },
             )
         )
-        log.info("ksat: fetched %d training campaign(s)", len(campaigns))
+        if not campaigns:
+            # "Nothing to do" and "pointed at the wrong tenant" are
+            # indistinguishable from outside when both yield SUCCESS with zero
+            # rows. Measured on a real Diamond-tier tenant: zero campaigns
+            # across all six statuses, because its training lives in another
+            # LMS entirely. Say so once per run rather than let a dashboard
+            # show a healthy connector delivering nothing.
+            log.warning(
+                "ksat: no training campaign%s returned; this source will land "
+                "no rows. Either this tenant runs no KSAT training, or "
+                "SECOPS_KSAT_CAMPAIGN_STATUS excludes everything it has.",
+                "s" if self.campaign_status is None else f"s with status {self.campaign_status}",
+            )
+        else:
+            log.info("ksat: fetched %d training campaign(s)", len(campaigns))
 
         for campaign in campaigns:
             if (
@@ -281,7 +400,7 @@ class KsatSource:
                 active_creds,
                 ENROLLMENTS_QUERY,
                 "enrollments",
-                {"campaignId": campaign_id, "status": self.enrollment_status},
+                {"trainingCampaignId": campaign_id, "status": self.enrollment_status},
             ):
                 record = dict(enrollment)
                 record.setdefault("campaign", campaign)
@@ -328,7 +447,13 @@ class KsatSource:
             for node in nodes:
                 yield dict(node)
 
-            raw_next = pagination.get("cursor") if isinstance(pagination, dict) else None
+            # nextCursor, not cursor: Pagination exposes nextCursor, page, pages,
+            # per and totalCount. Reading the wrong key is silent -- it comes
+            # back None, pagination stops after one page, and the run reports
+            # success having collected the first page only.
+            raw_next = (
+                pagination.get("nextCursor") if isinstance(pagination, dict) else None
+            )
             if raw_next is None:
                 return
             cursor_key = str(raw_next)
@@ -418,8 +543,7 @@ class KsatSource:
 
         errors = decoded.get("errors")
         if errors:
-            count = len(errors) if isinstance(errors, list) else 1
-            raise KsatError(f"KSAT GraphQL query failed ({count} error(s))")
+            raise KsatError(f"KSAT GraphQL query failed: {_error_summary(errors)}")
 
         return decoded
 
