@@ -28,8 +28,11 @@ In scope:
 - disclosure of secret material through logs, exceptions, tracebacks, or error messages
 - a secret name that escapes its provider's namespace or directory
 - SQL injection through connector-supplied identifiers or values
-- privilege assumptions in the example systemd units or documented database grants
-- dependency confusion or entry-point hijacking in the backend discovery mechanism
+- privilege assumptions in the example systemd units or documented database grants -- for
+  example a worker role able to write another job's control tables, or `control.pack`
+- dependency confusion or entry-point hijacking in the backend or pack discovery mechanism,
+  including a way past `SECOPS_ALLOWED_PACKS`
+- a dependency version or hash in `requirements/deploy.txt` that does not match what it claims
 
 Out of scope:
 
@@ -39,6 +42,19 @@ Out of scope:
   in the README
 - anything requiring an attacker who already has code execution as the worker's user; at that
   point the credentials are theirs regardless
+
+## What the defaults assume
+
+- **Database roles are least-privilege per job.** `python -m secops_ingest.schema` grants each
+  worker write access to its own `control` tables only, and nothing writes `control.pack`
+  except the schema owner. One shared ingest role still covers every raw schema unless a
+  `--remote-ingest-role` confines a writer to one; within `control.ingest_run` and
+  `control.ingest_watermark`, any ingest role can still write any source's rows.
+- **Pack code is trusted code.** Without `SECOPS_ALLOWED_PACKS`, every installed distribution
+  that advertises the `secops_ingest.packs` entry point is imported at startup of every worker.
+- **Dependencies are only as pinned as the install.** The extras' ranges are capped by major
+  version; exact versions and hashes are enforced only when `requirements/deploy.txt` is
+  installed with `--require-hashes`.
 
 ## Handling secrets in reports
 

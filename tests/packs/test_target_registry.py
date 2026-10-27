@@ -48,6 +48,29 @@ def test_two_packs_claiming_one_target_name_is_fatal() -> None:
     assert "other" in str(excinfo.value)
 
 
+def test_a_worker_can_skip_colliding_targets_and_keep_the_rest(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`enable`/`drop` need the raise (their deletes are scoped by target
+    name); a transform run only needs the colliding name kept out, not every
+    other target taken down with it."""
+    import logging
+
+    from secops_ingest.builtin import PACK as BUILTIN
+
+    other = Pack(
+        name="other", version="0.1.0", requires_core=">=0",
+        sources={"things": "other.things:SOURCE"}, targets=(VENDOR_TARGET,),
+    )
+    with caplog.at_level(logging.ERROR):
+        targets = all_targets(
+            {"builtin": BUILTIN, "vendor": VENDOR, "other": other}, skip_collisions=True
+        )
+    assert "vendor_things" not in targets
+    assert "example_messages" in targets
+    assert "'vendor' and 'other'" in caplog.text
+
+
 def test_invalid_target_name_is_rejected_at_the_registry_boundary() -> None:
     # Target.__post_init__ does not check the name's shape -- it becomes an
     # argparse choice and a control.* column value only once it reaches the

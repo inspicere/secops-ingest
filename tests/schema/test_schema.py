@@ -194,7 +194,7 @@ def test_registry_collision_is_a_clean_exit_not_a_traceback(
     # die with a raw traceback instead of a one-line, non-zero exit.
     from secops_ingest.packs.registry import DuplicatePack
 
-    def boom() -> dict[str, object]:
+    def boom(*_args: object) -> dict[str, object]:
         raise DuplicatePack("pack 'vendor' is registered by both pack-a and pack-b")
 
     monkeypatch.setattr("secops_ingest.schema.__main__.all_targets", boom)
@@ -241,9 +241,10 @@ def test_sequence_privileges_are_granted() -> None:
     INSERT alone is not enough — the role also needs USAGE on the sequence, and
     the failure lands on the first write of the first run.
     """
-    for role in ("ingest_role", "transform_role"):
-        sql = g(**{role: "r"})
-        assert "USAGE, SELECT ON ALL SEQUENCES IN SCHEMA control" in sql
+    assert "USAGE, SELECT ON SEQUENCE control.ingest_run_run_id_seq TO r;" in g(ingest_role="r")
+    assert "USAGE, SELECT ON SEQUENCE control.transform_run_run_id_seq TO r;" in g(
+        transform_role="r"
+    )
 
 
 def test_transform_gets_control_grants() -> None:
@@ -253,7 +254,8 @@ def test_transform_gets_control_grants() -> None:
     first insert, naming a table nobody was thinking about.
     """
     sql = g(transform_role="wh_transform")
-    assert "ON ALL TABLES IN SCHEMA control TO wh_transform" in sql
+    for table in ("transform_run", "transform_watermark", "transform_coverage"):
+        assert f"GRANT SELECT, INSERT, UPDATE ON control.{table} TO wh_transform;" in sql
 
 
 def test_transform_can_delete_from_the_mart() -> None:
@@ -271,11 +273,17 @@ def test_default_privileges_cover_future_partitions() -> None:
     assert "ALTER DEFAULT PRIVILEGES IN SCHEMA raw_wazuh" in g(ingest_role="wh_ingest")
 
 
-def test_read_role_sees_the_mart_and_nothing_else() -> None:
+def test_read_role_sees_the_mart_and_control_and_never_raw() -> None:
+    """A pipeline-health dashboard reads control through the reporting connection.
+
+    Without control, a freshly built warehouse fails its own positive assert
+    ("wh_metabase CAN read control") and no freshness card is possible -- the
+    test host only passed on grants applied by hand.
+    """
     sql = g(read_role="wh_metabase")
     assert "GRANT SELECT ON mart_fact_wazuh_alerts TO wh_metabase;" in sql
+    assert "GRANT SELECT ON ALL TABLES IN SCHEMA control TO wh_metabase;" in sql
     assert "raw_wazuh" not in sql
-    assert "control" not in sql
     assert "INSERT" not in sql and "DELETE" not in sql
 
 

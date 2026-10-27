@@ -29,6 +29,17 @@ pip install "secops-ingest[vault]"        # HashiCorp Vault backend
 pip install "secops-ingest[delinea]"      # Delinea Secret Server backend
 ```
 
+Extras are capped below each dependency's next major version. A deployed worker should install
+exact, hash-checked versions instead of whatever the ranges resolve to on the day:
+
+```bash
+pip install --require-hashes -r requirements/deploy.txt     # postgres + http, verified
+pip install --no-deps "secops-ingest @ git+<repo>@<ref>"     # just this package
+```
+
+Two steps because a VCS URL cannot carry a hash, and `--require-hashes` refuses anything that
+does not. `requirements/deploy.txt` is generated; CONTRIBUTING.md says how.
+
 ## Try it without any credential
 
 A reference connector ships with the package. It emits synthetic records so the whole path —
@@ -229,12 +240,25 @@ distribution that installs and versions independently. Register one with:
 neither `psycopg` nor `SECOPS_DB_DSN` -- with either missing it just reports state as unknown --
 which is deliberate: it is the command you reach for when the install might be broken.
 
+With a database it also prints each pack's state, and marks a pack whose version recorded in
+the warehouse differs from the installed one -- the only trace a `pip install --upgrade` that
+resolved to nothing leaves. It exits non-zero when discovery had to skip a pack for a reason you
+must fix: two distributions claiming one pack name (both are skipped, and everything else keeps
+running), or a distribution outside `SECOPS_ALLOWED_PACKS`.
+
 The other verbs manage a pack's lifecycle in the warehouse, and all three need `SECOPS_DB_DSN`
-and the `postgres` extra:
+and the `postgres` extra. **The DSN must be the warehouse's schema-owner role**, not a worker's:
+the worker roles may only read `control.pack`, because a worker that could write it could
+re-enable a pack an operator had disabled.
 
     python -m secops_ingest.packs enable knowbe4    # create its tables, mark it ENABLED
+    python -m secops_ingest.packs enable knowbe4 --state-only   # mark it ENABLED; DDL applied elsewhere
     python -m secops_ingest.packs disable knowbe4   # stop its connectors; tables are untouched
     python -m secops_ingest.packs drop knowbe4 --yes-destroy-data   # destroy its tables and history
+
+`--state-only` is for a warehouse whose DDL is applied by something else -- a generated schema
+file converged by a deployment tool -- so the owner credential is used for one `INSERT` and
+nothing more.
 
 `enable` and `disable` are both safe to re-run: `enable` is idempotent DDL, and `disable` just
 converges the pack's stored state to `DISABLED`, whether or not it was ever enabled.
@@ -251,6 +275,12 @@ deleted -- deleting it would make a surviving timer stop refusing to run.
 The module exposing `PACK` must import cheaply -- connector dependencies are
 imported only when a source runs, which is why `Pack.sources` holds
 `"module:attr"` strings rather than objects.
+
+Loading a pack runs its code inside the process that holds every resolved secret. On a host,
+set `SECOPS_ALLOWED_PACKS` to the distributions you installed on purpose (comma-separated; core is
+always allowed): an entry point from any other distribution is skipped *before* it is loaded.
+Unset, every installed pack loads; set but empty, none do. Each pack that loads is logged with
+its distribution and version.
 
 ## Writing a connector
 
@@ -320,8 +350,43 @@ python -m secops_ingest.schema --target wazuh_alerts --partitions-ahead 6
 # privileges, if you want them — role names are yours, nothing is assumed
 python -m secops_ingest.schema \
     --ingest-role secops_ingest --transform-role secops_transform \
-    --read-role secops_reader | psql "$DSN"
+    --read-role secops_reader --monitor-role secops_monitor | psql "$DSN"
+
+# everything the installed package knows about, plus raw tables it cannot know
+python -m secops_ingest.schema --all-targets --all-sources --raw raw_vendor.events
+
+# what a partition timer runs; exits non-zero (with ON_ERROR_STOP) if next month is missing
+python -m secops_ingest.schema --all-targets --all-sources --partitions-only \
+    | psql -v ON_ERROR_STOP=1 "$DSN"
+
+# JSON: each target's tables, and every target that reads each raw table
+python -m secops_ingest.schema --all-targets --all-sources --table-map
 ```
+
+`--all-sources` imports every connector to read its `table`, so it needs the connectors'
+extras installed; a connector it cannot import is an error naming it, never a silent omission.
+
+The roles:
+
+| flag | may write | may read |
+|---|---|---|
+| `--ingest-role` | every raw schema not given to a remote writer; `control.ingest_run`, `control.ingest_watermark` | all of `control` |
+| `--remote-ingest-role ROLE:SCHEMA` | that one raw schema; its own ingest runs and watermarks | all of `control` |
+| `--transform-role` | the mart; `control.transform_run`, `_watermark`, `_coverage` | every raw schema, all of `control` |
+| `--read-role` | nothing | the mart, all of `control`, `control.partition_health()` |
+| `--monitor-role` | nothing | all of `control`, `control.partition_health()` |
+
+Nobody but the schema owner writes `control.pack`. The workers read all of `control` because
+the startup drift check needs to see every table, and they write only their own: whoever holds
+the ingest password must not be able to forge transform coverage (which would let raw expiry
+drop rows nobody reported) or move the other job's watermark. The grants REVOKE what they do not
+grant, so re-applying them also narrows a warehouse converged with older, broader grants.
+`--remote-ingest-role` is for a worker on another host: the shared ingest role loses that
+schema, so the remote host's credential can damage one vendor's raw data, not every vendor's.
+Until that host has switched to the new role, add `--shared-ingest-keeps-remote` (logged, and
+marked TRANSITIONAL in the SQL) so the shared role keeps the schema meanwhile.
+`--owner-role` adds `ALTER DEFAULT PRIVILEGES FOR ROLE <owner>`, so tables the owner creates
+later carry grants too, not only those created by whoever applied the file.
 
 Three layers: `raw_*` landing tables partitioned monthly on an immutable event
 time, `control` for run history, watermarks and the coverage ledger, and
@@ -331,7 +396,7 @@ Emitting rather than applying keeps the schema usable from psql, Ansible, a
 migration tool, or a code review — and means this part needs no database driver.
 Everything is `IF NOT EXISTS` or a guarded `DO` block, so re-running is safe.
 
-Three things in it are load-bearing and easy to undo by accident:
+Four things in it are load-bearing and easy to undo by accident:
 
 **`_event_time` must come from an immutable field.** It is the partition key.
 Sources that mutate records watermark on the modification time so state changes
@@ -341,7 +406,15 @@ somebody touched it.
 **The month arithmetic is PostgreSQL's.** Adding an "average month" of seconds in
 application code drifts and eventually skips a month — which surfaces as inserts
 failing at midnight on the first, with no prior warning. Keep the lookahead
-window maintained on every deploy rather than assuming it.
+window maintained from a timer (`--partitions-only`), not only on deploys.
+
+**Every partitioned parent has a DEFAULT partition.** A mutating source re-reads an
+old record by modification time but partitions it on creation time, so a 2024
+incident touched today has no monthly partition. Without a DEFAULT it would fail its
+run, hold the watermark, and fail the same way on every later run. With one it lands,
+and `SELECT * FROM control.partition_health()` reports how many rows each DEFAULT
+holds and how far ahead each parent's months reach: alert on `default_rows > 0`
+(those rows are outside the monthly expiry) and on `covered_until` within a month.
 
 **The coverage ledger is what makes raw expiry safe.** Raw is a bounded
 re-derivation buffer, so dropping a partition is irreversible. Nothing may drop a
@@ -367,6 +440,10 @@ Redaction is a backstop, not a licence to log credentials.
 
 Scheduling is deliberately external. The interface is a CLI, so systemd timers, cron, and
 Kubernetes `CronJob` all work unchanged. Example units are in [`examples/systemd/`](examples/systemd/).
+
+Schedule the partition window too: a daily `python -m secops_ingest.schema --all-targets
+--all-sources --partitions-only | psql -v ON_ERROR_STOP=1`, run as the role that owns the raw
+tables. It is idempotent and creates nothing but partitions.
 
 ## What this deliberately does not do
 

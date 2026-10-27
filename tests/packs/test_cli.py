@@ -145,20 +145,22 @@ def test_collision_duplicate_pack_exits_with_code_1(
     Goes through actual discovery (via the injectable `extra` entry points)
     rather than hand-writing the message discover() would produce, so this
     test breaks the moment the real message changes -- not the other way
-    around.
+    around. The listing of everything that DID load is still printed: those
+    packs are still running, and the operator needs to see them too.
     """
     eps = [
         _FakeEntryPoint("vendor", _vendor_pack(), dist_name="pack-a"),
         _FakeEntryPoint("vendor", _vendor_pack(), dist_name="pack-b"),
     ]
     monkeypatch.setattr(
-        "secops_ingest.packs.__main__.discover", lambda: discover(extra=eps)
+        "secops_ingest.packs.__main__.discover", lambda **kw: discover(extra=eps, **kw)
     )
 
     assert main(["list"]) == 1
 
     captured = capsys.readouterr()
-    assert captured.out == ""
+    assert captured.out.startswith("builtin")
+    assert "vendor" not in captured.out
     assert "pack 'vendor' is registered by both" in captured.err
     assert "pack-a" in captured.err
     assert "pack-b" in captured.err
