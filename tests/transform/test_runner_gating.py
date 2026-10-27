@@ -115,3 +115,41 @@ def test_every_target_still_declares_the_since_parameter(name: str) -> None:
     """full_refresh binds it to NULL rather than removing it, so the branch the
     upsert takes on a full refresh must still exist."""
     assert "%(since)s" in TARGETS[name].upsert_sql
+
+
+# -- the chunk bound ----------------------------------------------------------
+
+@pytest.mark.parametrize("name", sorted(TARGETS))
+def test_every_built_in_target_is_chunkable(name: str) -> None:
+    """Without %(until)s a backlog is one statement, and one the role's
+    statement_timeout cancels is cancelled again on every later run."""
+    assert TARGETS[name].chunkable
+
+
+def test_a_target_without_until_is_still_accepted() -> None:
+    """Optional, so a pack written before the bound existed keeps loading."""
+    assert make().chunkable is False
+
+
+def test_a_bare_until_inside_is_null_is_refused() -> None:
+    sql = ("INSERT INTO mart_fact_t SELECT 1 FROM raw_x.things "
+           "WHERE %(since)s::timestamptz IS NULL AND (%(until)s IS NULL)")
+    with pytest.raises(ValueError, match="cast the upper bound"):
+        make(upsert_sql=sql)
+
+
+# -- whole snapshots only -----------------------------------------------------
+
+def test_only_the_endpoint_snapshot_target_copies_complete_runs_only() -> None:
+    """A snapshot is one run's picture of the estate; a tailed source has no
+    such unit, and gating it on its run would drop every record a stopped run
+    did land."""
+    opted = {n for n, t in TARGETS.items() if t.complete_runs_only}
+    assert opted == {"xdr_endpoints"}
+
+
+def test_complete_runs_only_without_the_filter_is_refused() -> None:
+    """The flag only drives the hold-back and the report; the SQL does the
+    filtering. A flag with no filter would report skips that never happen."""
+    with pytest.raises(ValueError, match="complete_runs_only needs"):
+        make(complete_runs_only=True)
