@@ -674,3 +674,87 @@ def test_backfill_still_collects_every_record(source: DefectDojoSource) -> None:
     rec = Recorder([out_of_order, page([finding(2, "2026-09-05T00:00:00-05:00")])])
     got = drive(source, rec, cursor=None)
     assert sorted(r["id"] for r in got) == [1, 2, 3]
+
+
+# -- cleartext (V-14) -----------------------------------------------------------
+
+class _CountingProvider:
+    def __init__(self) -> None:
+        self.asked = 0
+
+    def get(self, name: str) -> str:
+        self.asked += 1
+        return "tok-not-real-abc"
+
+
+def test_an_http_url_is_refused_before_the_token_is_fetched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "http://dojo.example.com")
+    monkeypatch.delenv("SECOPS_DEFECTDOJO_ALLOW_HTTP", raising=False)
+    provider = _CountingProvider()
+    monkeypatch.setattr("secops_ingest.sources.defectdojo.get_provider", lambda: provider)
+
+    with pytest.raises(ValueError, match="SECOPS_DEFECTDOJO_ALLOW_HTTP"):
+        DefectDojoSource().authenticate()
+    assert provider.asked == 0, "a refused URL never has a token to send"
+
+
+def test_an_http_url_is_accepted_when_opted_in_and_says_so_every_run(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The lab DefectDojo is http:// today; refusing outright would take it dark."""
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "http://dojo.example.com")
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_ALLOW_HTTP", "1")
+    monkeypatch.setattr("secops_ingest.sources.defectdojo.get_provider",
+                        lambda: _CountingProvider())
+    with caplog.at_level("WARNING"):
+        DefectDojoSource().authenticate()
+        DefectDojoSource().authenticate()
+    assert caplog.text.count("CLEARTEXT") == 2
+
+
+def test_a_url_without_a_scheme_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_URL", "dojo.example.com")
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_ALLOW_HTTP", "1")
+    with pytest.raises(ValueError, match="https"):
+        DefectDojoSource().authenticate()
+
+
+# -- the watermark is capped at the scan's start (V-08) ---------------------------
+
+def test_a_finding_changed_behind_the_scan_is_read_again_next_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE RACE. The scan passes finding 51500; an analyst mitigates it; then
+    finding 100, further on, is triaged later still. The maximum mark seen is
+    100's, above 51500's new one, so persisting the maximum would filter the
+    mitigation out of every later run. The scan vouches only for its start."""
+    from datetime import UTC, datetime, timedelta
+
+    from secops_ingest.common import context
+    from secops_ingest.common.watermark import comparable
+
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_CLOCK_SKEW_SEC", "300")
+    started = datetime.now(UTC)
+    mitigated_at = (started + timedelta(seconds=60)).isoformat()   # behind the scan
+    triaged_at = (started + timedelta(seconds=120)).isoformat()    # ahead of it
+
+    src = DefectDojoSource()
+    src._get = Recorder([  # type: ignore[method-assign]
+        page([finding(51500, "2026-01-01T00:00:00+00:00")], more=True),
+        page([finding(100, triaged_at)]),
+    ])
+    ctx = context.RunContext(source="defectdojo")
+    with context.running(ctx):
+        list(src.fetch({}, None))
+
+    ceiling = comparable(ctx.watermark_ceiling)
+    assert ceiling <= started - timedelta(seconds=300) + timedelta(seconds=5)
+    assert ceiling < comparable(mitigated_at), "the mitigation is above next run's floor"
+
+
+def test_the_clock_skew_must_be_a_positive_integer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SECOPS_DEFECTDOJO_CLOCK_SKEW_SEC", "soon")
+    with pytest.raises(ValueError, match="SECOPS_DEFECTDOJO_CLOCK_SKEW_SEC"):
+        DefectDojoSource()

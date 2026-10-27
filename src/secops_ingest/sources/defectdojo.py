@@ -63,6 +63,13 @@ Configuration:
                                  per-request timeout in seconds (default 120)
     SECOPS_DEFECTDOJO_CA_BUNDLE  CA bundle for the API's certificate
     SECOPS_DEFECTDOJO_INSECURE   set to 1 to skip TLS verification (logged)
+    SECOPS_DEFECTDOJO_ALLOW_HTTP set to 1 to accept an http:// URL (logged every
+                                 run). Without it, anything but https:// is
+                                 refused, because the API token is sent on
+                                 every request.
+    SECOPS_DEFECTDOJO_CLOCK_SKEW_SEC
+                                 how far this host's clock may lead DefectDojo's
+                                 (default 300); see `fetch`
 """
 
 from __future__ import annotations
@@ -71,9 +78,12 @@ import logging
 import os
 import time
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from functools import partial
 from typing import Any
+from urllib.parse import urlsplit
 
+from ..common import context
 from ..common.http import RetryBudgetExhausted, with_retries
 from ..common.payload import to_json
 from ..common.watermark import comparable
@@ -156,6 +166,11 @@ GROW_AFTER = 4
 #: until the next run -- harmless but needlessly late.
 ORDER_BY = "-id"
 
+#: How far this host's clock may lead DefectDojo's. The watermark is capped at
+#: the scan's start minus this, and the cap is read on this host's clock while
+#: `last_status_update` is stamped on the server's.
+DEFAULT_CLOCK_SKEW_SEC = 300
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if not raw:
@@ -184,17 +199,47 @@ class DefectDojoSource:
         self.secret_name = os.environ.get("SECOPS_DEFECTDOJO_SECRET", "defectdojo_api_token")
         self.page_size = _env_int("SECOPS_DEFECTDOJO_PAGE_SIZE", DEFAULT_PAGE_SIZE)
         self.timeout_sec = _env_int("SECOPS_DEFECTDOJO_TIMEOUT_SEC", DEFAULT_TIMEOUT_SEC)
+        self.clock_skew_sec = _env_int("SECOPS_DEFECTDOJO_CLOCK_SKEW_SEC",
+                                       DEFAULT_CLOCK_SKEW_SEC)
 
     # -- credentials --------------------------------------------------------
 
     def authenticate(self) -> Any:
         if not self.url:
             raise ValueError("SECOPS_DEFECTDOJO_URL is not set")
+        # Before the token is fetched, so a refused URL never has one to send.
+        self._require_https()
         token = get_provider().get(self.secret_name)
         from ..redaction import register_secret
 
         register_secret(token)
         return {"Authorization": f"Token {token}"}
+
+    def _require_https(self) -> None:
+        """Refuse to send the token anywhere but https://, unless told to.
+
+        The token goes in a header on every request, hourly, so http:// is a
+        cleartext credential on the wire for as long as nobody notices. KSAT
+        and Delinea already refuse it. The opt-out exists because the lab
+        DefectDojo is http:// today and refusing outright would take the
+        source dark; it is explicit, and it says so on every run, because a
+        silent opt-out becomes permanent.
+        """
+        scheme = urlsplit(self.url).scheme.lower()
+        if scheme == "https":
+            return
+        if scheme == "http" and os.environ.get("SECOPS_DEFECTDOJO_ALLOW_HTTP") == "1":
+            log.warning(
+                "DefectDojo API token is being sent in CLEARTEXT over http:// "
+                "(SECOPS_DEFECTDOJO_ALLOW_HTTP=1). Put TLS in front of DefectDojo "
+                "and remove this setting."
+            )
+            return
+        raise ValueError(
+            f"SECOPS_DEFECTDOJO_URL must be https:// (got scheme {scheme or 'none'!r}); "
+            "the API token would be sent in cleartext. Set "
+            "SECOPS_DEFECTDOJO_ALLOW_HTTP=1 to accept http:// anyway."
+        )
 
     # -- fetching -----------------------------------------------------------
 
@@ -234,7 +279,19 @@ class DefectDojoSource:
         to M yielded every record at M, because all of them were newer than the
         cursor it started from. The old design needed a `<` stop to re-read ties
         precisely because it stopped early; a full scan does not.
+
+        THE WATERMARK IS CAPPED AT THE SCAN'S START. The scan is not a snapshot:
+        it takes minutes, and a finding it has already passed can be modified
+        while it runs. That finding's new mark is below whatever the scan sees
+        later, so persisting the maximum seen would make the next run filter it
+        out as already read, and its mitigation would never land. Every change
+        made before the scan started is in the records the scan reads, so the
+        start -- less the clock skew between this host and DefectDojo -- is the
+        highest mark this run can vouch for. Anything modified after it is read
+        again next run, which the upsert absorbs.
         """
+        scan_start = datetime.now(UTC) - timedelta(seconds=self.clock_skew_sec)
+        context.cap_watermark(scan_start.isoformat())
         offset = 0
         # Run-local, because a timeout reduces it for the REST of the run: a
         # server that refused 1000 once should not be asked for 1000 again, or

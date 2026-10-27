@@ -46,15 +46,19 @@ with an old id.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import secrets
 import time
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urlsplit
 
+from ..common import context
 from ..redaction import register_secret
 from ..secrets import get_provider
 
+log = logging.getLogger(__name__)
 
 def env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
@@ -99,6 +103,7 @@ def resolve(secret: str, path: str) -> CortexCreds:
     register_secret(key)
 
     parts = urlsplit(url if "://" in url else f"https://{url}")
+    scheme = _require_https(secret, parts.scheme.lower())
     host = parts.netloc
     # The API host carries a literal `api-` prefix. Accept the stored value with
     # or without it so an operator pasting the console URL still works.
@@ -130,8 +135,32 @@ def resolve(secret: str, path: str) -> CortexCreds:
             f"{var} must be 'standard' or 'advanced', got {mode!r}")
 
     return CortexCreds(key=key, key_id=key_id,
-                       base=f"{parts.scheme or 'https'}://{host}{path}",
+                       base=f"{scheme}://{host}{path}",
                        auth_mode=mode)
+
+
+def _require_https(secret: str, scheme: str) -> str:
+    """Return the scheme to use, refusing anything but https unless told to.
+
+    Standard auth puts the raw API key in the Authorization header, so a stored
+    `http://` URL sends it in cleartext on every request -- and the scheme used
+    to be kept as stored, silently. The opt-out is keyed on the secret, like
+    the auth mode, and logged every run. The URL itself is never logged: the
+    tenant host is the identifier this module keeps out of the journal.
+    """
+    if scheme == "https":
+        return scheme
+    var = f"SECOPS_{secret.upper().replace('-', '_').replace('.', '_')}_ALLOW_HTTP"
+    if scheme == "http" and os.environ.get(var) == "1":
+        log.warning(
+            "%s: API key is being sent in CLEARTEXT over http:// (%s=1). "
+            "Store an https:// URL and remove this setting.", secret, var,
+        )
+        return scheme
+    raise ValueError(
+        f"{secret}.url must be https:// (got scheme {scheme or 'none'!r}); the API "
+        f"key would be sent in cleartext. Set {var}=1 to accept http:// anyway."
+    )
 
 
 def headers(creds: CortexCreds) -> dict[str, str]:
@@ -167,3 +196,29 @@ def headers(creds: CortexCreds) -> dict[str, str]:
         "x-xdr-auth-id": creds.key_id,
         "Content-Type": "application/json",
     }
+
+
+def int_or_none(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def window_shrank(before: int | None, now: Any, offset: int) -> bool:
+    """True, and the run reported incomplete, if a pinned window shrank mid-scan.
+
+    XDR and XSOAR both pin an upper bound on the field they sort and page by
+    offset. Nothing can enter such a window, so its total can only fall, and
+    only because a record was modified past the pin and left -- shifting every
+    later row forward so the next offset skips one. A fall between two pages
+    therefore means the newer page may already be shifted: the caller stops
+    before yielding it, and as an ordered source advances only over what it
+    read. See XdrSource.fetch.
+    """
+    after = int_or_none(now)
+    if before is None or after is None or after >= before:
+        return False
+    context.report_partial(
+        f"{before - after} record(s) left the pinned window mid-scan (total "
+        f"{before} -> {after}), so offset paging past row {offset} may have "
+        "skipped one; stopped at the last contiguous page"
+    )
+    return True

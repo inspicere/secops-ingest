@@ -230,3 +230,46 @@ def test_disabling_verification_warns_every_run(
     with caplog.at_level("WARNING"):
         assert source._tls_verify() is False
     assert "TLS verification DISABLED" in caplog.text
+
+
+# -- partial answers (V-34) ------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"_shards": {"total": 3, "successful": 2, "failed": 1}, "hits": {"hits": []}},
+        {"timed_out": True, "_shards": {"total": 3, "failed": 0}, "hits": {"hits": []}},
+    ],
+    ids=["failed-shard", "timed-out"],
+)
+def test_a_partial_200_is_retried_not_landed(
+    source: WazuhSource, monkeypatch: pytest.MonkeyPatch, body: dict[str, Any],
+) -> None:
+    """OpenSearch serves what the healthy shards hold and says so only in the
+    body. Landing that page advanced this ORDERED source past alerts that were
+    never returned -- further back than the lag overlap ever looks."""
+    import httpx
+
+    from secops_ingest.common.http import RetryableResponse
+
+    def post(url: str, **kw: Any) -> httpx.Response:
+        return httpx.Response(200, json=body, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", post)
+    with pytest.raises(RetryableResponse, match="partial result"):
+        source._search(("u", "p"), {"size": 2})
+
+
+def test_a_complete_200_is_returned_as_is(
+    source: WazuhSource, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    body = {"_shards": {"total": 3, "successful": 3, "failed": 0},
+            "timed_out": False, **as_hits([alert("a", "2026-01-01T00:00:00Z")])}
+
+    def post(url: str, **kw: Any) -> httpx.Response:
+        return httpx.Response(200, json=body, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", post)
+    assert source._search(("u", "p"), {"size": 2}) == body

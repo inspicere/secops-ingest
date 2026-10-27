@@ -134,3 +134,35 @@ def test_the_leased_password_is_registered_for_redaction(monkeypatch):
     resolve_conninfo(FakeLeaser({"username": "u", "password": "leased-password-value"}))
     assert redaction.scrub("x leased-password-value y") != "x leased-password-value y"
     redaction._REGISTRY.clear()
+
+
+def test_reading_the_watermark_ends_its_transaction() -> None:
+    """V-45. The fetch that follows can run half an hour before the first
+    write; without this the session sits idle in transaction for all of it."""
+    from secops_ingest.common import db
+
+    class _Cur:
+        def __enter__(self) -> _Cur:
+            return self
+
+        def __exit__(self, *a: object) -> None:
+            return None
+
+        def execute(self, sql: str, params: tuple[object, ...]) -> None:
+            return None
+
+        def fetchone(self) -> tuple[str]:
+            return ("2026-01-01T00:00:00Z",)
+
+    class _Conn:
+        commits = 0
+
+        def cursor(self) -> _Cur:
+            return _Cur()
+
+        def commit(self) -> None:
+            self.commits += 1
+
+    conn = _Conn()
+    assert db.get_watermark(conn, "wazuh") == "2026-01-01T00:00:00Z"  # type: ignore[arg-type]
+    assert conn.commits == 1
