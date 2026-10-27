@@ -122,3 +122,19 @@ def test_no_socket_from_either_source_is_still_an_error(monkeypatch):
     monkeypatch.delenv("SECOPS_VAULT_AGENT_SOCKET", raising=False)
     with pytest.raises(SecretError, match="requires a socket path"):
         VaultAgentSecretProvider()
+
+
+def test_a_non_json_body_is_a_secret_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>not vault</html>")
+
+    with pytest.raises(SecretError, match="non-JSON body"):
+        _provider(handler).fetch_locator({"path": "p", "field": "f"})
+
+
+def test_a_json_list_body_is_a_secret_error_not_an_attribute_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=["unexpected"])
+
+    with pytest.raises(SecretError, match="no data block"):
+        _provider(handler).fetch_locator({"path": "p", "field": "f"})

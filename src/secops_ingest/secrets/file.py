@@ -6,10 +6,16 @@ Kubernetes secret volumes, all of which present secrets as one file per name.
 
 from __future__ import annotations
 
+import logging
 import os
 import pathlib
+import stat
+from typing import ClassVar
 
 from .base import SecretError, SecretNotFound, SecretProvider
+from .mapping import Posture
+
+log = logging.getLogger(__name__)
 
 
 class FileSecretProvider(SecretProvider):
@@ -17,6 +23,11 @@ class FileSecretProvider(SecretProvider):
 
     Under systemd, point this at ``$CREDENTIALS_DIRECTORY``.
     """
+
+    #: A file on the host is not a PAM. Declared so that a run resolving through this
+    #: provider records 'dev' rather than NULL: NULL reads as "not declared",
+    #: and this provider's posture is known.
+    posture: ClassVar[Posture] = Posture.DEV
 
     def __init__(self, directory: str | os.PathLike[str] | None = None, **kwargs: object) -> None:
         super().__init__(**kwargs)  # type: ignore[arg-type]
@@ -35,15 +46,42 @@ class FileSecretProvider(SecretProvider):
         # base.validate_name() already rejects separators and traversal, but
         # confinement is re-checked here so this provider is safe even if it is
         # ever called directly.
+        #
+        # Judged by where the name lands, not by its parent: Kubernetes secret
+        # volumes link `name -> ..data/name` and `..data -> ..<timestamp>/`, so
+        # a resolved secret sits one directory below this one. Requiring the
+        # parent to equal the directory reported every such secret as missing.
+        # Anything that resolves outside the directory is still refused.
         path = (self._dir / name).resolve()
-        if path.parent != self._dir:
+        if path == self._dir or not path.is_relative_to(self._dir):
             raise SecretNotFound(name)
         try:
-            # Strip only trailing newline: leading/trailing whitespace can be
-            # significant in a secret, but editors and `echo` add a newline.
-            return path.read_text(encoding="utf-8").rstrip("\n")
+            with path.open(encoding="utf-8") as handle:
+                self._warn_if_world_readable(name, os.fstat(handle.fileno()).st_mode)
+                # Strip only trailing newline: leading/trailing whitespace can
+                # be significant in a secret, but editors and `echo` add one.
+                return handle.read().rstrip("\n")
         except FileNotFoundError as exc:
             raise SecretNotFound(name) from exc
         except OSError as exc:
             # Message omits the path to avoid disclosing store layout.
             raise SecretError(f"could not read secret: {name}") from exc
+
+    @staticmethod
+    def _warn_if_world_readable(name: str, mode: int) -> None:
+        """Say so when any user on the host can read or rewrite a secret file.
+
+        A warning, not a refusal. Docker secrets (0444) and Kubernetes secret
+        volumes (0644 by default) are world-readable inside a container where
+        nobody else runs, and refusing them would take those deployments
+        down. On a shared host it is a real exposure, and the run should say
+        it is running with one rather than read the file without comment.
+        Checked on the open handle, so it describes the file actually read.
+        """
+        if mode & (stat.S_IROTH | stat.S_IWOTH):
+            log.warning(
+                "secret file for %s is open to every user on the host (mode %03o); "
+                "restrict it to 0640 or tighter",
+                name,
+                stat.S_IMODE(mode),
+            )

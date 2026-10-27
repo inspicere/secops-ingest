@@ -82,8 +82,16 @@ class VaultAgentSecretProvider(SecretProvider):
             raise SecretError(
                 f"vault agent returned {response.status_code} while reading a {kind}"
             )
-        body = response.json()
-        data = body.get("data")
+        try:
+            body = response.json()
+        except ValueError as exc:
+            # Something other than Vault answered on the socket, or answered
+            # with a page. A bare JSONDecodeError would break the SecretError
+            # contract and read as a parser crash.
+            raise SecretError(
+                f"vault agent returned a non-JSON body while reading a {kind}"
+            ) from exc
+        data = body.get("data") if isinstance(body, dict) else None
         if not isinstance(data, dict):
             raise SecretError(f"vault agent response for a {kind} has no data block")
         return data

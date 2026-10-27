@@ -8,8 +8,10 @@ proprietary dependency.
 from __future__ import annotations
 
 import os
+from typing import ClassVar
 
 from .base import SecretNotFound, SecretProvider
+from .mapping import Posture
 
 
 class EnvSecretProvider(SecretProvider):
@@ -18,6 +20,11 @@ class EnvSecretProvider(SecretProvider):
     ``wazuh-indexer-password`` resolves to
     ``SECOPS_SECRET_WAZUH_INDEXER_PASSWORD``.
     """
+
+    #: An environment variable is not a PAM. Declared so that a run resolving through this
+    #: provider records 'dev' rather than NULL: NULL reads as "not declared",
+    #: and this provider's posture is known.
+    posture: ClassVar[Posture] = Posture.DEV
 
     def __init__(self, prefix: str = "SECOPS_SECRET_", **kwargs: object) -> None:
         super().__init__(**kwargs)  # type: ignore[arg-type]

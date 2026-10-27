@@ -13,8 +13,9 @@ def current_posture(provider: object | None) -> str | None:
 
     Never raises. The posture is a diagnostic written alongside a run; a run
     that ingested correctly must not be recorded as FAILED because reading a
-    label failed. A provider with no posture -- env, file, vault -- yields
-    None, which reads as "not declared" rather than as a claim.
+    label failed. env and file declare 'dev'; the composite reports what its
+    map declares. A provider with no posture -- vault, or no provider at all
+    -- yields None, which reads as "not declared" rather than as a claim.
     """
     try:
         posture = getattr(provider, "posture", None)

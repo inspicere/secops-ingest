@@ -42,6 +42,20 @@ DRIFT_SECONDS = 300.0
 _TIMEOUT = 30.0
 
 
+def _json_body(response: Any, what: str) -> Any:
+    """Decode a 2xx body, or fail as a SecretError that says what was wrong.
+
+    A captive proxy or WAF answering 200 with an HTML page would otherwise
+    surface as a bare JSONDecodeError, outside the SecretError contract the
+    callers rely on (base.SecretProvider.get), and read as a parser crash
+    rather than as "something other than Secret Server answered".
+    """
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise SecretError(f"secret server returned a non-JSON body {what}") from exc
+
+
 def _require_https(base_url: str) -> None:
     """Refuse a non-https base_url: the client_secret is POSTed to it.
 
@@ -109,7 +123,9 @@ class SecretServerClient:
             raise SecretError(
                 f"secret server returned {response.status_code} during authentication"
             )
-        body = response.json()
+        body = _json_body(response, "during authentication")
+        if not isinstance(body, dict):
+            raise SecretError("secret server returned no access_token")
         token = body.get("access_token")
         if not isinstance(token, str) or not token:
             raise SecretError("secret server returned no access_token")
@@ -165,13 +181,17 @@ class SecretServerClient:
             raise SecretError(
                 f"secret server returned {response.status_code} reading secret {secret_id}"
             )
-        body = response.json()
+        body = _json_body(response, f"reading secret {secret_id}")
         # The single-field endpoint returns the bare value for simple fields and
         # {"itemValue": ...} for others.
         if isinstance(body, dict):
             if "itemValue" not in body:
                 raise SecretError(f"secret {secret_id} field {slug} has no itemValue")
-            return str(body["itemValue"])
+            body = body["itemValue"]
+        if body is None or isinstance(body, (dict, list)) or str(body) == "":
+            # str(None) is "None", which would be sent to the vendor as the
+            # password and come back as a vendor 401 pointing the wrong way.
+            raise SecretError(f"secret {secret_id} field {slug} is empty")
         return str(body)
 
     def close(self) -> None:
