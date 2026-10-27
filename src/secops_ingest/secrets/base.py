@@ -74,12 +74,19 @@ class SecretProvider(ABC):
         Raises:
             InvalidSecretName: the name is not a valid identifier.
             SecretNotFound: the backend has no such secret.
-            SecretError: the backend could not be reached.
+            SecretError: the backend could not be reached, or the value is
+                empty.
         """
         validate_name(name)
         if self._cache is not None and name in self._cache:
             return self._cache[name]
         value = self._fetch(name)
+        if not value.strip():
+            # An empty value is a truncated write or an unfilled field, never a
+            # credential. Returned, it would be sent to the vendor and fail as
+            # a 401 that points at the vendor; and Secret("") registers nothing
+            # for redaction. Refusing it here names the actual problem.
+            raise SecretError(f"secret is empty: {name}")
         if self._cache is not None:
             self._cache[name] = value
         return value

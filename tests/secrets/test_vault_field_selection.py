@@ -1,8 +1,10 @@
 """Offline tests for VaultSecretProvider's <secret>.<field> addressing.
 
-No server and no hvac. The provider builds its client lazily, so injecting a
-stub covers the part that actually varies -- how a name is split and which
-field is returned -- without the 'vault' extra installed. The integration
+No server, and hvac only where a test says so. The provider builds its client
+lazily, so injecting a stub covers the part that actually varies -- how a name
+is split and which field is returned -- without the 'vault' extra installed.
+Telling a missing path from a denied token needs hvac's own exception types,
+so the tests of that split skip without the extra. The integration
 suite in test_vault_backend_integration.py proves the same behaviour against a
 real server; this proves it on a laptop.
 """
@@ -18,10 +20,17 @@ from secops_ingest.secrets.vault import VaultSecretProvider
 
 
 class StubKvV2:
-    """Stands in for hvac's kv.v2 API and records the path it was asked for."""
+    """Stands in for hvac's kv.v2 API and records the path it was asked for.
 
-    def __init__(self, store: dict[str, dict[str, str]]) -> None:
+    `missing` is what a read of an absent path raises. hvac raises InvalidPath;
+    tests that need that pass it in, and the rest never read an absent path.
+    """
+
+    def __init__(
+        self, store: dict[str, dict[str, str]], missing: type[Exception] = KeyError
+    ) -> None:
         self.store = store
+        self.missing = missing
         self.paths: list[str] = []
 
     def read_secret_version(
@@ -29,20 +38,24 @@ class StubKvV2:
     ) -> dict[str, Any]:
         self.paths.append(path)
         if path not in self.store:
-            raise KeyError(path)          # hvac raises; the provider catches broadly
+            raise self.missing(path)
         return {"data": {"data": dict(self.store[path])}}
 
 
 class StubClient:
-    def __init__(self, store: dict[str, dict[str, str]]) -> None:
-        self.secrets = type("_S", (), {"kv": type("_K", (), {"v2": StubKvV2(store)})()})()
+    def __init__(self, store: dict[str, dict[str, str]], missing: type[Exception]) -> None:
+        kv = StubKvV2(store, missing)
+        self.secrets = type("_S", (), {"kv": type("_K", (), {"v2": kv})()})()
 
 
 def provider_for(
-    store: dict[str, dict[str, str]], *, prefix: str = ""
+    store: dict[str, dict[str, str]],
+    *,
+    prefix: str = "",
+    missing: type[Exception] = KeyError,
 ) -> tuple[VaultSecretProvider, StubKvV2]:
     p = VaultSecretProvider(url="http://127.0.0.1:1", path_prefix=prefix)  # never dialled
-    client = StubClient(store)
+    client = StubClient(store, missing)
     # Injecting the lazily-built client; the provider never dials out.
     p._client = client
     return p, client.secrets.kv.v2
@@ -107,6 +120,7 @@ def test_field_may_contain_dots_because_the_split_is_on_the_first() -> None:
 
 
 def test_a_dotted_name_for_an_absent_secret_is_not_found() -> None:
-    p, _ = provider_for({})
+    hv = pytest.importorskip("hvac.exceptions", reason="needs the 'vault' extra")
+    p, _ = provider_for({}, missing=hv.InvalidPath)
     with pytest.raises(SecretNotFound):
         p.get("nosuch.field")

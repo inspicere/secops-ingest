@@ -23,6 +23,18 @@ def register_secret(value: str | None) -> None:
         _REGISTRY.add(value)
 
 
+def _replace_registered(text: str, placeholder: str) -> str:
+    # Longest first. When one registered value contains another -- a host and
+    # an endpoint URL built on it, or a key that embeds a shorter one --
+    # replacing the shorter first breaks the longer one apart, and its tail
+    # reaches the log intact: "abcdefgh" before "abcdefghTAIL" leaves
+    # "***REDACTED***TAIL". Set order made that a matter of luck.
+    for value in sorted(_REGISTRY, key=len, reverse=True):
+        if value in text:
+            text = text.replace(value, placeholder)
+    return text
+
+
 def scrub(text: str) -> str:
     """Remove any registered secret from `text`.
 
@@ -30,10 +42,7 @@ def scrub(text: str) -> str:
     request URLs (which some APIs put tokens in) and echo auth material from
     4xx bodies, and error_summary is written to the database.
     """
-    for value in _REGISTRY:
-        if value in text:
-            text = text.replace(value, PLACEHOLDER)
-    return text
+    return _replace_registered(text, PLACEHOLDER)
 
 
 class RedactingFilter(logging.Filter):
@@ -59,10 +68,7 @@ class RedactingFilter(logging.Filter):
         register_secret(value)
 
     def _scrub(self, text: str) -> str:
-        for value in self._values:
-            if value in text:
-                text = text.replace(value, self._placeholder)
-        return text
+        return _replace_registered(text, self._placeholder)
 
     def filter(self, record: logging.LogRecord) -> bool:
         if not self._values:

@@ -134,3 +134,69 @@ def test_a_provider_without_fetch_locator_falls_back_to_name_lookup():
         factory=lambda kind, config, credential: ByName(),
     )
     assert provider.get("a.b") == "name:a.b"
+
+
+# -- only the needed chain is built ---------------------------------------------
+
+CHAIN_MAP = {
+    "posture": "assured",
+    "providers": {
+        "agent": {"kind": "vault_agent", "config": {"tag": "A"}},
+        "pam": {"kind": "delinea", "config": {"tag": "P"}, "credential": "pam.cred"},
+        "vault2": {"kind": "vault", "config": {"tag": "V"}, "credential": "vault2.cred"},
+    },
+    "entries": {
+        "pam.cred": {"provider": "agent", "path": "pam", "field": "f"},
+        "vault2.cred": {"provider": "agent", "path": "v2", "field": "f"},
+        "xdr.key": {"provider": "vault2", "path": "xdr", "field": "k"},
+        "phish.token": {"provider": "pam", "secret": "7", "field": "password"},
+    },
+}
+
+
+def test_a_broken_pam_does_not_fail_names_that_never_use_it():
+    # The global resolution order is agent, pam, vault2. Walking it built pam
+    # on the way to vault2, so pam's broken credential failed xdr.key, which
+    # never touches pam.
+    built: list[str] = []
+
+    def factory(kind: str, config: dict[str, str], credential: Secret | None) -> SecretProvider:
+        if kind == "delinea":
+            raise SecretNotFound("pam.cred")
+        built.append(kind)
+        return Recorder(config["tag"], credential)
+
+    provider = MappedSecretProvider(map_source=MapHolder(CHAIN_MAP), factory=factory)
+    assert provider.get("xdr.key") == "V:k"
+    assert built == ["vault_agent", "vault"]
+    with pytest.raises(SecretNotFound):
+        provider.get("phish.token")
+
+
+def test_a_provider_that_failed_to_build_is_retried():
+    attempts = {"delinea": 0}
+
+    def factory(kind: str, config: dict[str, str], credential: Secret | None) -> SecretProvider:
+        if kind == "delinea":
+            attempts["delinea"] += 1
+            if attempts["delinea"] == 1:
+                raise SecretNotFound("transient")
+        return Recorder(config["tag"], credential)
+
+    provider = MappedSecretProvider(map_source=MapHolder(CHAIN_MAP), factory=factory)
+    with pytest.raises(SecretNotFound):
+        provider.get("phish.token")
+    assert provider.get("phish.token") == "P:password"
+
+
+def test_a_map_naming_the_composite_as_a_kind_is_refused():
+    from secops_ingest.secrets.mapping import InvalidMap
+
+    doc = {
+        "posture": "dev",
+        "providers": {"inner": {"kind": "mapped"}},
+        "entries": {"a.b": {"provider": "inner", "name": "a.b"}},
+    }
+    provider = MappedSecretProvider(map_source=MapHolder(doc))
+    with pytest.raises(InvalidMap, match="kind 'mapped'"):
+        provider.get("a.b")

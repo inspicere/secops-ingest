@@ -211,3 +211,44 @@ def test_an_https_base_url_is_accepted_in_any_case():
         transport=httpx.MockTransport(lambda r: httpx.Response(200)),
     )
     client.close()
+
+
+# -- bodies that are not what Secret Server sends ---------------------------------
+
+
+def _token_then(field_response):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == TOKEN_PATH:
+            return httpx.Response(200, json={"access_token": "tok", "expires_in": 3600})
+        return field_response
+
+    return handler
+
+
+def test_a_non_json_field_body_is_a_secret_error():
+    # A captive proxy or WAF answering 200 with a page.
+    from secops_ingest.secrets import SecretError
+
+    page = httpx.Response(200, text="<html>Sign in to continue</html>")
+    with pytest.raises(SecretError, match="non-JSON body reading secret 4821"):
+        _client(_token_then(page)).field("4821", "password")
+
+
+def test_a_non_json_token_body_is_a_secret_error():
+    from secops_ingest.secrets import SecretError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>proxy</html>")
+
+    with pytest.raises(SecretError, match="non-JSON body during authentication"):
+        _client(handler).field("4821", "password")
+
+
+@pytest.mark.parametrize("body", [b'{"itemValue": null}', b'{"itemValue": ""}', b"null"])
+def test_an_empty_field_is_refused_rather_than_sent_as_none(body):
+    # str(None) is "None", which used to reach the vendor as the password.
+    from secops_ingest.secrets import SecretError
+
+    response = httpx.Response(200, content=body, headers={"content-type": "application/json"})
+    with pytest.raises(SecretError, match="field password is empty"):
+        _client(_token_then(response)).field("4821", "password")

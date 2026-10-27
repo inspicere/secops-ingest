@@ -125,3 +125,15 @@ def test_end_to_end_through_a_handler(registry: None, caplog: pytest.LogCaptureF
     logger.removeFilter(f)
     assert "supersecretvalue" not in caplog.text
     assert "status=200" in caplog.text
+
+
+def test_a_secret_containing_another_is_scrubbed_whole(registry: None) -> None:
+    # Set order used to decide this. Replacing the shorter value first split
+    # the longer one and left its tail in the text.
+    redaction.register_secret("abcdefgh")
+    redaction.register_secret("abcdefghTAILSECRET99")
+    assert redaction.scrub("token=abcdefghTAILSECRET99") == f"token={PLACEHOLDER}"
+    r = record("token=%s", "abcdefghTAILSECRET99")
+    RedactingFilter().filter(r)
+    assert r.getMessage() == f"token={PLACEHOLDER}"
+    assert "TAIL" not in r.getMessage()
