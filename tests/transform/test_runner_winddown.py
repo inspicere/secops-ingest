@@ -284,14 +284,3 @@ def test_target_schema_drift_refuses_before_any_ledger_row(
     assert seen == [["t"]]
     assert taken == []
     assert harness["started"] == 0
-
-
-def test_without_the_target_check_the_run_proceeds(
-    harness: dict[str, Any], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Merge window: on a tree without verify_target_schema, nothing changes."""
-    from secops_ingest.common import schema_check
-
-    monkeypatch.delattr(schema_check, "verify_target_schema", raising=False)
-
-    assert runner.execute(make()).status == "SUCCESS"

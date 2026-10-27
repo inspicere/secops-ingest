@@ -150,18 +150,8 @@ def _stop_reason(budget: _Budget, stopper: _Stopper) -> str | None:
 
 
 def _verify_target_schema(conn: Any, target: Target) -> None:
-    """Refuse to run against target tables older than this package.
-
-    MERGE WINDOW: verify_target_schema lands on fix/audit-schema, not on this
-    branch, so it is looked up rather than imported; on a tree without it this
-    is the old behaviour. Once both branches are merged, replace this with a
-    direct call to schema_check.verify_target_schema(conn, [target]).
-    """
-    check = getattr(schema_check, "verify_target_schema", None)
-    if check is None:
-        log.debug("schema_check has no verify_target_schema; target drift check skipped")
-        return
-    check(conn, [target])
+    """Refuse to run against target tables older than this package."""
+    schema_check.verify_target_schema(conn, [target])
 
 
 def _start(conn: Any, target: str, posture: str | None) -> int:

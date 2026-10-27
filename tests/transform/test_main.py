@@ -26,7 +26,7 @@ from secops_ingest.transform.__main__ import main
 def test_registry_collision_is_a_clean_exit_not_a_traceback(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    def boom() -> dict[str, object]:
+    def boom(**_: object) -> dict[str, object]:
         raise DuplicatePack("pack 'vendor' is registered by both pack-a and pack-b")
 
     monkeypatch.setattr("secops_ingest.transform.__main__.all_targets", boom)
@@ -40,7 +40,7 @@ def test_registry_collision_is_a_clean_exit_not_a_traceback(
 def test_duplicate_target_is_also_a_clean_exit(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    def boom() -> dict[str, object]:
+    def boom(**_: object) -> dict[str, object]:
         raise DuplicateTarget("transform target 'x' is declared by both 'a' and 'b'")
 
     monkeypatch.setattr("secops_ingest.transform.__main__.all_targets", boom)
@@ -60,7 +60,7 @@ def test_logging_is_configured_with_the_redacting_filter_before_discovery(
     # redacting filter.
     seen_filters_during_discovery: list[bool] = []
 
-    def spy() -> dict[str, object]:
+    def spy(**_: object) -> dict[str, object]:
         root = logging.getLogger()
         has_redactor = any(
             f.__class__.__name__ == "RedactingFilter"
@@ -109,7 +109,7 @@ def test_exit_code_agrees_with_the_ledger(
     from secops_ingest.transform import runner
 
     monkeypatch.setattr(
-        "secops_ingest.transform.__main__.all_targets", lambda: {"t": object()}
+        "secops_ingest.transform.__main__.all_targets", lambda **_: {"t": object()}
     )
     monkeypatch.setattr(runner, "execute", lambda target: runner.TransformResult(status))
 
@@ -149,7 +149,7 @@ def test_target_schema_drift_is_a_one_line_refusal(
     # the attribute does not exist yet.
     monkeypatch.setattr(schema_check, "TargetSchemaDrift", TargetSchemaDrift, raising=False)
     monkeypatch.setattr(
-        "secops_ingest.transform.__main__.all_targets", lambda: {"t": object()}
+        "secops_ingest.transform.__main__.all_targets", lambda **_: {"t": object()}
     )
 
     def drifted(target: object) -> object:

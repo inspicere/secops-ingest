@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import inspect
 import logging
 import sys
 
@@ -19,14 +18,8 @@ def _runnable_targets() -> dict[str, Target]:
     down, built-in ones included (V-33): this entry point only RUNS targets,
     so it drops the colliding ones loudly and keeps the rest. `pack enable` and
     `drop` keep refusing outright, because they write by target name.
-
-    MERGE WINDOW: skip_collisions lands on fix/audit-schema. On a registry
-    without it this falls back to the old refuse-everything behaviour; once
-    both branches are merged, call all_targets(skip_collisions=True) directly.
     """
-    if "skip_collisions" in inspect.signature(all_targets).parameters:
-        return all_targets(skip_collisions=True)  # type: ignore[call-arg, unused-ignore]
-    return all_targets()
+    return all_targets(skip_collisions=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -67,13 +60,8 @@ def main(argv: list[str] | None = None) -> int:
     from . import runner
 
     # A tuple, so the target check's refusal reads exactly like the control
-    # one. MERGE WINDOW: TargetSchemaDrift lands on fix/audit-schema; import it
-    # directly once both branches are merged.
-    drift: tuple[type[Exception], ...] = tuple(
-        getattr(schema_check, name)
-        for name in ("ControlSchemaDrift", "TargetSchemaDrift")
-        if hasattr(schema_check, name)
-    )
+    # one.
+    drift = (schema_check.ControlSchemaDrift, schema_check.TargetSchemaDrift)
 
     try:
         result = runner.execute(targets[args.target])
