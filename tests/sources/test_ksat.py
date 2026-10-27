@@ -27,6 +27,7 @@ httpx = pytest.importorskip("httpx", reason="needs the 'http' extra")
 
 from secops_ingest import redaction  # noqa: E402
 from secops_ingest.builtin import PACK  # noqa: E402
+from secops_ingest.common import context  # noqa: E402
 from secops_ingest.common.watermark import comparable, newer  # noqa: E402
 from secops_ingest.packs.registry import resolve_source  # noqa: E402
 from secops_ingest.sources import _ksat as _ksat_mod  # noqa: E402
@@ -1003,11 +1004,15 @@ def test_short_read_against_totalCount_warns(
         )
 
     source = KsatSource(transport=httpx.MockTransport(handler))
-    with caplog.at_level("WARNING"):
+    ctx = context.RunContext(source="ksat")
+    with caplog.at_level("WARNING"), context.running(ctx):
         list(source.fetch(source.authenticate(), None))
 
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert any("1 of 50" in w or "totalCount" in w.lower() for w in warnings), warnings
+    # And the run is told, not only the journal: a WARNING beside a clean
+    # SUCCESS row and a moved updated_at was the whole of it before.
+    assert ctx.partial and "1 of 50" in ctx.partial[0]
 
 
 def test_page_walk_is_bounded_when_the_server_never_runs_out(
@@ -1047,11 +1052,13 @@ def test_page_walk_is_bounded_when_the_server_never_runs_out(
     source = KsatSource(
         transport=httpx.MockTransport(handler), page_size=2, page_walk_cap=3
     )
-    with caplog.at_level("WARNING"):
+    ctx = context.RunContext(source="ksat")
+    with caplog.at_level("WARNING"), context.running(ctx):
         list(source.fetch(source.authenticate(), None))
 
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert any("cap" in w for w in warnings), warnings
+    assert any("cap" in reason for reason in ctx.partial), ctx.partial
     assert calls["n"] < 100, f"walk was not bounded: {calls['n']} calls"
 
 
@@ -1128,3 +1135,18 @@ def test_queries_select_the_pagination_fields_the_walker_reads() -> None:
                 f"{name} query reads pagination.{field} but does not select it; "
                 f"block is {block.split()!r}"
             )
+
+
+@pytest.mark.parametrize("code", [401, 403])
+def test_a_refused_credential_is_announced_as_auth_failed(
+    provider: StubProvider, capsys: pytest.CaptureFixture[str], code: int,
+) -> None:
+    """KSAT maps 4xx to its own error before with_retries sees it, so it has to
+    announce auth.failed itself."""
+    source = KsatSource(transport=httpx.MockTransport(lambda r: httpx.Response(code)))
+    with pytest.raises(KsatError):
+        list(source.fetch(source.authenticate(), None))
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()
+              if line.startswith("{")]
+    assert [(e["event"], e["status"]) for e in events] == [("auth.failed", code)]

@@ -43,18 +43,21 @@ WAREHOUSE_UNREACHABLE = "warehouse.unreachable"
 WATERMARK_ADVANCED = "watermark.advanced"
 SCHEMA_DRIFT = "schema.drift"
 ROWS_LANDED = "rows.landed"
+ROWS_REJECTED = "rows.rejected"
 
 # Events that should page someone. Kept here so the list is reviewable in one
 # place rather than scattered across call sites.
 ALERTABLE = frozenset({
     RUN_FAILED, AUTH_FAILED, RETRY_EXHAUSTED, WAREHOUSE_UNREACHABLE, SCHEMA_DRIFT,
+    # Records skipped as malformed are records missing from the warehouse.
+    ROWS_REJECTED,
 })
 
 _SEVERITY = {
     RUN_START: "INFO", RUN_OK: "INFO", ROWS_LANDED: "INFO", WATERMARK_ADVANCED: "INFO",
     RETRY: "WARNING", RATE_LIMITED: "WARNING",
     RUN_FAILED: "ERROR", AUTH_FAILED: "ERROR", RETRY_EXHAUSTED: "ERROR",
-    WAREHOUSE_UNREACHABLE: "CRITICAL", SCHEMA_DRIFT: "ERROR",
+    WAREHOUSE_UNREACHABLE: "CRITICAL", SCHEMA_DRIFT: "ERROR", ROWS_REJECTED: "ERROR",
 }
 
 _SYSLOG_LEVEL = {
@@ -80,7 +83,6 @@ def _syslog_logger() -> logging.Logger | None:
     host = os.getenv("SECOPS_SYSLOG_HOST")
     if not host:
         return None
-    port = int(os.getenv("SECOPS_SYSLOG_PORT", "514"))
     proto = os.getenv("SECOPS_SYSLOG_PROTO", "udp").lower()
     sock = socket.SOCK_STREAM if proto == "tcp" else socket.SOCK_DGRAM
     lg = logging.getLogger("secops_ingest.syslog")
@@ -88,6 +90,9 @@ def _syslog_logger() -> logging.Logger | None:
     lg.propagate = False
     if not lg.handlers:
         try:
+            # Parsed inside the guard: a typo'd port must announce itself below
+            # rather than raise from every emit() and be swallowed there.
+            port = int(os.getenv("SECOPS_SYSLOG_PORT", "514"))
             h = logging.handlers.SysLogHandler(
                 address=(host, port), socktype=sock,
                 facility=logging.handlers.SysLogHandler.LOG_LOCAL5)
@@ -117,10 +122,48 @@ def emit(event: str, source: str, run_id: int | None = None,
          **fields: Any) -> dict[str, Any]:
     """Emit one structured event to stdout, and to syslog when configured.
 
-    Never raises: observability failing must not fail the run.
+    Never raises: observability failing must not fail the run. That covers the
+    record itself as well as both channels -- a field whose str() raises, or a
+    redaction registry in a bad state, degrades to a minimal event rather than
+    an exception at a call site that is usually already handling one.
+
+    String fields are scrubbed of registered secrets. Callers pass exception
+    text here, and an event is written to two places a log filter never sees.
     """
+    try:
+        rec = _record(event, source, run_id, fields)
+        line = json.dumps(rec, separators=(",", ":"), default=str, sort_keys=False)
+    # Deliberately blind, for the reason in the docstring.
+    except Exception:  # noqa: BLE001
+        rec = {"ts": _now(), "event": event, "severity": _SEVERITY.get(event, "INFO"),
+               "source": str(source), "host": _HOST, "alertable": event in ALERTABLE,
+               "obs_error": "event fields could not be rendered"}
+        line = json.dumps(rec, separators=(",", ":"))
+    try:
+        print(line, file=sys.stdout, flush=True)
+    # Nothing to log to: stdout IS the reporting channel, so a failure here has
+    # no surviving way to announce itself. Swallowing is the only option that
+    # keeps ingestion running, which is the whole point of this module.
+    except Exception:  # noqa: BLE001, S110
+        pass
+    try:
+        lg = _syslog_logger()
+        if lg:
+            lg.log(_SYSLOG_LEVEL.get(rec["severity"], logging.INFO), line)
+    # The event already reached stdout above, so a syslog failure has been
+    # reported by definition. Re-raising would turn a degraded collector into a
+    # failed ingest run.
+    except Exception:  # noqa: BLE001, S110
+        pass
+    return rec
+
+
+def _record(event: str, source: str, run_id: int | None,
+            fields: dict[str, Any]) -> dict[str, Any]:
+    from ..redaction import scrub
+
     severity = _SEVERITY.get(event, "INFO")
-    rec = {
+    rec: dict[str, Any] = {
         "ts": _now(),
         "event": event,
         "severity": severity,
@@ -132,23 +175,5 @@ def emit(event: str, source: str, run_id: int | None = None,
         rec["run_id"] = run_id
     for k, v in fields.items():
         if k not in rec:
-            rec[k] = v
-
-    line = json.dumps(rec, separators=(",", ":"), default=str, sort_keys=False)
-    try:
-        print(line, file=sys.stdout, flush=True)
-    # Nothing to log to: stdout IS the reporting channel, so a failure here has
-    # no surviving way to announce itself. Swallowing is the only option that
-    # keeps ingestion running, which is the whole point of this module.
-    except Exception:  # noqa: BLE001, S110
-        pass
-    try:
-        lg = _syslog_logger()
-        if lg:
-            lg.log(_SYSLOG_LEVEL.get(severity, logging.INFO), line)
-    # The event already reached stdout above, so a syslog failure has been
-    # reported by definition. Re-raising would turn a degraded collector into a
-    # failed ingest run.
-    except Exception:  # noqa: BLE001, S110
-        pass
+            rec[k] = scrub(v) if isinstance(v, str) else v
     return rec

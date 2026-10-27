@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
+from typing import Any
 
 import pytest
 
@@ -228,3 +229,61 @@ def test_pack_state_lookup_error_propagates(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert source.fetched is False
     assert started == []
+
+
+# -- V-31: stored vs installed pack version ----------------------------------------
+
+def _stored(version: str) -> Any:
+    return lambda conn, name: PackState(
+        name=name, version=version, state="ENABLED", enabled_at=None, disabled_at=None
+    )
+
+
+def test_a_stored_version_that_differs_is_warned_about_and_the_run_proceeds(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An upgrade pip resolved to nothing exits 0; only control.pack disagrees."""
+    _stub_db(monkeypatch, [])
+    monkeypatch.setattr("secops_ingest.packs.state.get_state", _stored("0.0.9"))
+    monkeypatch.setattr(run_mod, "_describe_drift",
+                        lambda stored, installed: f"warehouse records {stored}, "
+                                                  f"installed is {installed}")
+    with caplog.at_level(logging.WARNING):
+        result = run_mod.execute(_Source())
+
+    assert result.status == "SUCCESS"
+    assert "pack builtin: warehouse records 0.0.9" in caplog.text
+
+
+def test_an_equal_version_says_nothing(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _stub_db(monkeypatch, [])
+    monkeypatch.setattr("secops_ingest.packs.state.get_state", _stored("0.1.0"))
+    monkeypatch.setattr(run_mod, "_describe_drift", lambda stored, installed: None)
+    with caplog.at_level(logging.WARNING):
+        run_mod.execute(_Source())
+    assert "pack builtin:" not in caplog.text
+
+
+def test_a_failing_version_comparison_never_fails_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(stored: str, installed: str) -> str | None:
+        raise RuntimeError("bug in the comparison")
+
+    _stub_db(monkeypatch, [])
+    monkeypatch.setattr("secops_ingest.packs.state.get_state", _stored("9.9.9"))
+    monkeypatch.setattr(run_mod, "_describe_drift", boom)
+    assert run_mod.execute(_Source()).status == "SUCCESS"
+
+
+def test_without_the_comparison_installed_the_worker_does_not_warn() -> None:
+    """describe_drift lands on the pack-version branch; until then, no warning."""
+    from secops_ingest.packs import version
+
+    if hasattr(version, "describe_drift"):
+        assert run_mod._describe_drift("1.0.0", "1.0.0") is None
+        assert run_mod._describe_drift("1.0.0", "1.1.0")
+    else:
+        assert run_mod._describe_drift("1.0.0", "1.1.0") is None

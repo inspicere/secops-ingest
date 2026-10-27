@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ..common.payload import to_json
+from ..common.watermark import comparable
 
 
 class ExampleSource:
@@ -49,7 +50,11 @@ class ExampleSource:
                 "category": ["clean", "spam", "threat"][i % 3],
                 "severity": ["low", "medium", "high"][i % 3],
             }
-            if cursor and record["updatedAt"] <= cursor:
+            # Compared as instants, never as strings. String order is right
+            # here only because every record is written in one format; copied
+            # into a connector whose vendor mixes UTC offsets, it skips
+            # records. common.watermark.comparable explains why.
+            if cursor and comparable(record["updatedAt"]) <= comparable(cursor):
                 continue
             yield record
 

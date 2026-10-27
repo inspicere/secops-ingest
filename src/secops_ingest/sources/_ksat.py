@@ -22,7 +22,14 @@ from urllib.parse import urlsplit
 import httpx
 
 from .. import redaction
-from ..common.http import RETRYABLE_STATUS, RetryBudgetExhausted, with_retries
+from ..common import context
+from ..common.http import (
+    AUTH_STATUS,
+    RETRYABLE_STATUS,
+    RetryBudgetExhausted,
+    report_auth_failure,
+    with_retries,
+)
 from ..redaction import register_secret
 from ..secrets import get_provider
 
@@ -291,23 +298,23 @@ class KsatClient:
             if len(nodes) < self.page_size:
                 break
             if page >= self.page_walk_cap:
-                log.warning(
-                    "ksat %s stopped at the %d-page cap with %d record(s) "
-                    "collected; the collection may be incomplete",
-                    root_field,
-                    self.page_walk_cap,
-                    collected,
+                context.report_partial(
+                    f"ksat {root_field} stopped at the {self.page_walk_cap}-page "
+                    f"cap with {collected} record(s) collected; the collection "
+                    "may be incomplete"
                 )
                 break
             page += 1
 
+        # Reported to the run, not only logged. A short walk used to be a
+        # WARNING line and a SUCCESS row, and the watermark's updated_at --
+        # documented as "when the last full re-read succeeded" -- moved anyway.
+        # Now the ledger says the run was incomplete and, because KSAT does not
+        # yield in watermark order, the cursor is kept.
         if total_count is not None and collected < total_count:
-            log.warning(
-                "ksat %s collected %d of %d record(s) the API reported; "
-                "the walk was short and this run is incomplete",
-                root_field,
-                collected,
-                total_count,
+            context.report_partial(
+                f"ksat {root_field} collected {collected} of {total_count} "
+                "record(s) the API reported; the walk was short"
             )
 
     def call_graphql(
@@ -373,6 +380,8 @@ class KsatClient:
                 request=response.request,
                 response=response,
             )
+        if response.status_code in AUTH_STATUS:
+            report_auth_failure(response.status_code)
         if response.status_code >= 400:
             raise KsatError(f"KSAT API returned HTTP {response.status_code}")
 

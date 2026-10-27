@@ -89,3 +89,32 @@ def test_a_configured_backend_that_cannot_be_built_fails_the_run(
 
     assert cli.main(["wazuh"]) == 1
     assert seen["called"] is False
+
+
+def test_an_unbuildable_backend_is_recorded_not_only_logged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # It used to exit before start_run, so pipeline health saw only staleness.
+    # The run is still refused; the failure now reaches the ledger, by the
+    # source's own name rather than the reference the operator typed.
+    monkeypatch.setenv("SECOPS_SECRETS_BACKEND", "mapped")
+
+    def broken() -> object:
+        raise SecretError("requires a map_source provider")
+
+    class _Named:
+        name = "wazuh"
+
+    recorded: list[tuple[str, str]] = []
+    monkeypatch.setattr(cli, "get_provider", broken)
+    seen = _record_execute(monkeypatch)
+    monkeypatch.setattr(cli, "_load_source", lambda name: _Named())
+    monkeypatch.setattr(run_mod, "record_unstartable",
+                        lambda source, reason: recorded.append((source, reason)) or True)
+
+    assert cli.main(["builtin.wazuh"]) == 1
+    assert seen["called"] is False
+    assert recorded == [
+        ("wazuh", "secret provider could not be built: SecretError: "
+                  "requires a map_source provider"),
+    ]

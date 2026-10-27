@@ -78,11 +78,27 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # No backend named is the ordinary static-DSN case: no provider at all.
         # A backend named but unbuildable is a misconfiguration, so get_provider's
-        # failure propagates and fails the run. Falling back there would run the
-        # job on whatever SECOPS_DB_DSN holds, with only a warning to show for it.
+        # failure fails the run. Falling back there would run the job on
+        # whatever SECOPS_DB_DSN holds, with only a warning to show for it.
         kwargs["provider"] = (
             get_provider() if os.environ.get("SECOPS_SECRETS_BACKEND") else None
         )
+    except Exception as exc:
+        # Failing is right; failing with no trace is not. This used to exit
+        # before start_run, so pipeline health saw only staleness. The run is
+        # still refused -- nothing below runs the job -- but the failure is
+        # now a FAILED ledger row where the warehouse is reachable, and a
+        # run.failed event either way.
+        log.exception("source=%s failed: the secret provider could not be built",
+                      args.source)
+        run_mod.record_unstartable(
+            str(getattr(source, "name", args.source)),
+            f"secret provider could not be built: {type(exc).__name__}: {exc}",
+        )
+        return 1
+    try:
+        # Warehouse unreachable, schema drift and run failures each emit their
+        # own structured event inside execute(); this only decides the exit.
         result = run_mod.execute(source, **kwargs)
     except ControlSchemaDrift as exc:
         # The warehouse is older than the package: a configuration state, not

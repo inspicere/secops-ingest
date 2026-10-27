@@ -35,7 +35,7 @@ from typing import Any
 
 from ..common.http import with_retries
 from ..common.payload import to_json
-from ._cortex import CortexCreds, env_int, headers, resolve
+from ._cortex import CortexCreds, env_int, headers, int_or_none, resolve, window_shrank
 
 log = logging.getLogger(__name__)
 
@@ -104,11 +104,22 @@ class XdrSource:
         below the watermark this run then advances to, so no later run asks for
         it either.
 
-        Pinning an upper bound at run start makes the result set stable for the
-        length of the scan, exactly as xsoar.py pins `toDate`. Anything modified
-        after the pin is simply picked up next run. `operator: "lte"` on
-        modification_time was verified accepted (HTTP 200) against the live
+        Pinning an upper bound at run start keeps incidents from ENTERING the
+        result set mid-scan, exactly as xsoar.py pins `toDate`. Anything
+        modified after the pin is simply picked up next run. `operator: "lte"`
+        on modification_time was verified accepted (HTTP 200) against the live
         tenant on 2026-09-14.
+
+        THE PIN DOES NOT STOP INCIDENTS LEAVING IT. An incident in the window
+        that is modified mid-scan gets a modification_time past the pin and
+        drops out, every row behind it shifts one place forward, and the next
+        offset steps over one. Inside a pinned window nothing can arrive, so
+        `total_count` can only fall, and only by a departure: when it falls
+        between pages, the page just served may already be shifted. The scan
+        stops at the last page known to be contiguous and reports the run as
+        incomplete; this source is ordered, so the watermark advances to what
+        was read and the next run resumes there. The departed incident itself
+        is past the pin, so the next run reads it too.
         """
         filters: list[dict[str, Any]] = []
         now_ms = self._now_ms()
@@ -130,6 +141,7 @@ class XdrSource:
                         "value": now_ms})
 
         frm = 0
+        total: int | None = None
         while True:
             body = {"request_data": {
                 "filters": filters,
@@ -146,6 +158,9 @@ class XdrSource:
                      time.monotonic() - started, reply.get("total_count", "?"))
             if not rows:
                 return
+            if window_shrank(total, reply.get("total_count"), frm):
+                return
+            total = int_or_none(reply.get("total_count"))
             yield from rows
             if len(rows) < self.page_size:
                 return

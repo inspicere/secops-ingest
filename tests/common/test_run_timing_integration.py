@@ -80,3 +80,32 @@ def test_ended_at_measures_the_run_not_its_transaction(conn: psycopg.Connection)
         f"ended_at - started_at was {elapsed:.3f}s for a run held open for 1.1s; "
         "ended_at is recording a transaction's start rather than the run's end"
     )
+
+
+def test_reap_closes_only_this_sources_old_running_rows(conn: psycopg.Connection) -> None:
+    """V-17. A run killed by SIGKILL leaves RUNNING forever; the next run of the
+    same source closes it. A fresh RUNNING row (a live run) and another
+    source's row are left alone. Needs a real server for make_interval and the
+    clock_timestamp() arithmetic."""
+    old = db.start_run(conn, "reap-test")
+    fresh = db.start_run(conn, "reap-test")
+    other = db.start_run(conn, "reap-test-other")
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE control.ingest_run SET started_at = now() - interval '2 hours' "
+            "WHERE run_id = ANY(%s)", ([old, other],),
+        )
+    conn.commit()
+
+    assert db.reap_abandoned(conn, "reap-test", 3600) == 1
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT run_id, status, ended_at IS NOT NULL, error_summary "
+            "FROM control.ingest_run WHERE run_id = ANY(%s) ORDER BY run_id",
+            ([old, fresh, other],),
+        )
+        rows = {r[0]: r[1:] for r in cur.fetchall()}
+    assert rows[old][:2] == ("FAILED", True) and rows[old][2].startswith("abandoned")
+    assert rows[fresh][0] == "RUNNING"
+    assert rows[other][0] == "RUNNING"

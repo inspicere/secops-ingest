@@ -135,6 +135,7 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     )
     monkeypatch.setattr(run_mod, "_pack_state_of", lambda conn, name: None)
     monkeypatch.setattr(run_mod.db, "start_run", start_run)
+    monkeypatch.setattr(run_mod.db, "reap_abandoned", lambda *a, **k: 0)
     monkeypatch.setattr(
         run_mod.db, "get_watermark", lambda conn, name: calls["cursor_in"]
     )
