@@ -11,7 +11,7 @@ import logging
 import pytest
 
 from secops_ingest.packs.model import Pack
-from secops_ingest.packs.registry import DuplicatePack, discover
+from secops_ingest.packs.registry import ALLOWLIST_ENV, discover
 from secops_ingest.packs.version import InvalidVersionSpec
 
 
@@ -50,15 +50,17 @@ def test_entry_point_pack_is_merged() -> None:
     assert set(packs) == {"builtin", "vendor"}
 
 
-def test_duplicate_name_names_both_distributions() -> None:
+def test_duplicate_name_names_both_distributions(caplog: pytest.LogCaptureFixture) -> None:
     eps = [
         _FakeEntryPoint("vendor", _pack(), dist_name="pack-a"),
         _FakeEntryPoint("vendor", _pack(), dist_name="pack-b"),
     ]
-    with pytest.raises(DuplicatePack) as excinfo:
-        discover(extra=eps)
-    assert "pack-a" in str(excinfo.value)
-    assert "pack-b" in str(excinfo.value)
+    problems: list[str] = []
+    with caplog.at_level(logging.ERROR):
+        discover(extra=eps, problems=problems)
+    assert "pack-a" in caplog.text and "pack-b" in caplog.text
+    assert len(problems) == 1
+    assert "pack-a" in problems[0] and "pack-b" in problems[0]
 
 
 def test_a_pack_colliding_with_builtin_is_skipped_naming_core_the_winner(
@@ -81,17 +83,18 @@ def test_a_pack_colliding_with_builtin_is_skipped_naming_core_the_winner(
     assert "builtin" in caplog.text
 
 
-def test_collision_between_two_third_party_packs_is_still_fatal() -> None:
-    # F2 narrows the fatal case to third-party/third-party collisions; this
-    # pins that the narrowing did not remove the protection entirely.
+def test_collision_between_two_third_party_packs_skips_both_and_keeps_the_rest() -> None:
+    # Fatal used to mean every ingest timer, transform and schema emission
+    # exited 1 -- built-in sources included -- because of one stale copy of a
+    # pack in the venv. Neither claimant is preferred (that would depend on
+    # iteration order); both are dropped, and everything else runs.
     eps = [
         _FakeEntryPoint("vendor", _pack(name="vendor"), dist_name="pack-a"),
+        _FakeEntryPoint("other", _pack(name="other"), dist_name="pack-c"),
         _FakeEntryPoint("vendor", _pack(name="vendor"), dist_name="pack-b"),
     ]
-    with pytest.raises(DuplicatePack) as excinfo:
-        discover(extra=eps)
-    assert "pack-a" in str(excinfo.value)
-    assert "pack-b" in str(excinfo.value)
+    packs = discover(extra=eps)
+    assert set(packs) == {"builtin", "other"}
 
 
 def test_invalid_core_version_fails_loudly_naming_core_not_a_pack() -> None:
@@ -144,32 +147,33 @@ def test_entry_point_that_is_not_a_pack_is_skipped(caplog: pytest.LogCaptureFixt
 
 def test_incompatible_pack_first_then_compatible_same_name_is_duplicate() -> None:
     # Incompatible pack loads first, then compatible with same name.
-    # Both should be tracked; duplicate should raise regardless of order.
+    # Both should be tracked; the collision is reported regardless of order,
+    # and the compatible one must not slip through as the "winner".
     eps = [
         _FakeEntryPoint("vendor", _pack(name="vendor", requires=">=9,<10"),
                        dist_name="pack-a"),
         _FakeEntryPoint("vendor", _pack(name="vendor", requires=">=0"),
                        dist_name="pack-b"),
     ]
-    with pytest.raises(DuplicatePack) as excinfo:
-        discover(core_version="0.1.0", extra=eps)
-    assert "pack-a" in str(excinfo.value)
-    assert "pack-b" in str(excinfo.value)
+    problems: list[str] = []
+    packs = discover(core_version="0.1.0", extra=eps, problems=problems)
+    assert "vendor" not in packs
+    assert "pack-a" in problems[0] and "pack-b" in problems[0]
 
 
 def test_compatible_pack_first_then_incompatible_same_name_is_duplicate() -> None:
     # Compatible pack loads first, then incompatible with same name.
-    # Collision should raise regardless of order.
+    # The collision is reported regardless of order.
     eps = [
         _FakeEntryPoint("vendor", _pack(name="vendor", requires=">=0"),
                        dist_name="pack-a"),
         _FakeEntryPoint("vendor", _pack(name="vendor", requires=">=9,<10"),
                        dist_name="pack-b"),
     ]
-    with pytest.raises(DuplicatePack) as excinfo:
-        discover(core_version="0.1.0", extra=eps)
-    assert "pack-a" in str(excinfo.value)
-    assert "pack-b" in str(excinfo.value)
+    problems: list[str] = []
+    packs = discover(core_version="0.1.0", extra=eps, problems=problems)
+    assert "vendor" not in packs
+    assert "pack-a" in problems[0] and "pack-b" in problems[0]
 
 
 def test_incompatible_unique_pack_is_skipped_not_fatal(
@@ -181,3 +185,61 @@ def test_incompatible_unique_pack_is_skipped_not_fatal(
         packs = discover(core_version="0.1.0", extra=eps)
     assert "unique" not in packs
     assert "unique" in caplog.text
+
+
+# -- the allowlist ---------------------------------------------------------------
+
+
+class _ExplodingEntryPoint(_FakeEntryPoint):
+    """Fails the test if anything loads it: refusal must happen before load."""
+
+    def load(self) -> object:
+        raise AssertionError(f"{self.name} was loaded despite the allowlist")
+
+
+def test_unset_allowlist_loads_every_pack(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(ALLOWLIST_ENV, raising=False)
+    packs = discover(extra=[_FakeEntryPoint("vendor", _pack(), dist_name="vendor-pack")])
+    assert "vendor" in packs
+
+
+def test_allowlist_admits_named_distributions_only(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv(ALLOWLIST_ENV, "Vendor_Pack, other-pack")
+    eps = [
+        _FakeEntryPoint("vendor", _pack(name="vendor"), dist_name="vendor-pack"),
+        _ExplodingEntryPoint("sneaky", _pack(name="sneaky"), dist_name="typosquat"),
+    ]
+    problems: list[str] = []
+    with caplog.at_level(logging.WARNING):
+        packs = discover(extra=eps, problems=problems)
+    assert set(packs) == {"builtin", "vendor"}
+    assert "typosquat" in caplog.text
+    assert any("typosquat" in p for p in problems)
+
+
+def test_empty_allowlist_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A templating slip that renders the variable empty must not mean "all"."""
+    monkeypatch.setenv(ALLOWLIST_ENV, "")
+    packs = discover(extra=[_ExplodingEntryPoint("vendor", _pack(), dist_name="vendor-pack")])
+    assert set(packs) == {"builtin"}
+
+
+def test_entry_point_with_no_distribution_is_refused_by_an_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(ALLOWLIST_ENV, "vendor-pack")
+    ep = _ExplodingEntryPoint("vendor", _pack())
+    ep.dist = None
+    assert set(discover(extra=[ep])) == {"builtin"}
+
+
+def test_loaded_packs_are_logged_with_their_distribution(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    ep = _FakeEntryPoint("vendor", _pack(), dist_name="vendor-pack")
+    ep.dist.version = "1.4.2"  # type: ignore[attr-defined]
+    with caplog.at_level(logging.INFO):
+        discover(extra=[ep])
+    assert "loaded pack 'vendor' 0.1.0 from vendor-pack 1.4.2" in caplog.text

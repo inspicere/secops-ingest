@@ -64,6 +64,32 @@ Connectors live in `secops_ingest/sources/` and follow the contract shown in the
   the vendor mutates records after creation, a creation-time watermark will silently skip every
   update.
 
+## Dependencies and the deploy lock
+
+Every extra in `pyproject.toml` has an upper bound below the next major version. Raising one is
+a reviewed change, not something a deploy picks up.
+
+`requirements/deploy.txt` pins every dependency of the deployed extras (`postgres`, `http`)
+with hashes. Regenerate it whenever an extra changes, and commit the result:
+
+```bash
+uv pip compile pyproject.toml --extra postgres --extra http \
+    --generate-hashes --universal --python-version 3.11 --no-header \
+    -o requirements/deploy.txt
+```
+
+then put back the explanatory header at the top of the file. `tests/test_deploy_lock.py` fails
+if a deployed dependency is missing from the lock, has no hash, or is pinned outside its range.
+
+## Versions
+
+Bump `version` in `pyproject.toml` *and* `__version__` in `src/secops_ingest/__init__.py` on every
+release that changes behaviour; `tests/test_version.py` fails if they differ. A version that never
+moves is not harmless: a pack's `requires_core` is checked against it, and `pack list` compares it
+with the version recorded in `control.pack` -- both checks are blind if every ref is `0.1.0`. Keep
+it a plain dotted number: anything else is outside the grammar packs are checked with, and pack
+discovery refuses to start.
+
 ## Commit messages
 
 Explain why, not what — the diff already says what. If you found a trap worth remembering,

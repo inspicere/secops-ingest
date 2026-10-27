@@ -198,7 +198,7 @@ def test_enable_target_not_schema_qualified_reports_pack_and_target(
 
     monkeypatch.setattr(
         "secops_ingest.packs.__main__.discover",
-        lambda: discover(extra=[_FakeEntryPoint()]),
+        lambda **kw: discover(extra=[_FakeEntryPoint()], **kw),
     )
     monkeypatch.setenv("SECOPS_DB_DSN", "postgresql://unused")
 
@@ -217,11 +217,15 @@ class _ZeroRowCursor:
     def __exit__(self, *exc_info: object) -> None:
         return None
 
-    def execute(self, *args: object, **kwargs: object) -> None:
-        return None
+    def __init__(self) -> None:
+        self._last = ""
+
+    def execute(self, query: object, *args: object, **kwargs: object) -> None:
+        self._last = str(query)
 
     def fetchone(self) -> tuple[int]:
-        return (0,)
+        # `drop` takes each target's transform lock; nobody else holds it here.
+        return (1,) if "pg_try_advisory_lock" in self._last else (0,)
 
 
 class _FakeDropConnection:
@@ -415,7 +419,7 @@ def test_drop_refuses_on_a_source_name_collision_and_destroys_nothing(
 
     monkeypatch.setattr(
         "secops_ingest.packs.__main__.discover",
-        lambda: discover(extra=[_FakeEntryPoint()]),
+        lambda **kw: discover(extra=[_FakeEntryPoint()], **kw),
     )
     monkeypatch.setattr(psycopg, "connect", _must_not_connect)
     monkeypatch.setenv("SECOPS_DB_DSN", "postgresql://unused")
@@ -432,6 +436,7 @@ class _RecordingCursor:
 
     def __init__(self, log: list[str]) -> None:
         self._log = log
+        self._last = ""
 
     def __enter__(self) -> _RecordingCursor:
         return self
@@ -441,6 +446,7 @@ class _RecordingCursor:
 
     def execute(self, query: object, *args: object, **kwargs: object) -> None:
         text = str(query)
+        self._last = text
         if "DROP TABLE" in text:
             self._log.append("DROP TABLE")
         elif "DELETE FROM" in text:
@@ -449,7 +455,7 @@ class _RecordingCursor:
             self._log.append("OTHER")  # e.g. the row-count SELECTs
 
     def fetchone(self) -> tuple[int]:
-        return (0,)
+        return (1,) if "pg_try_advisory_lock" in self._last else (0,)
 
 
 class _RecordingConnection:
@@ -553,7 +559,7 @@ def test_enable_refuses_on_a_target_name_collision(
 
     monkeypatch.setattr(
         "secops_ingest.packs.__main__.discover",
-        lambda: discover(extra=[_FakeEntryPoint()]),
+        lambda **kw: discover(extra=[_FakeEntryPoint()], **kw),
     )
     monkeypatch.setenv("SECOPS_DB_DSN", "postgresql://unused")
 
@@ -597,7 +603,7 @@ def test_drop_refuses_on_a_target_name_collision_and_destroys_nothing(
 
     monkeypatch.setattr(
         "secops_ingest.packs.__main__.discover",
-        lambda: discover(extra=[_FakeEntryPoint()]),
+        lambda **kw: discover(extra=[_FakeEntryPoint()], **kw),
     )
     monkeypatch.setattr(psycopg, "connect", _must_not_connect)
     monkeypatch.setenv("SECOPS_DB_DSN", "postgresql://unused")
