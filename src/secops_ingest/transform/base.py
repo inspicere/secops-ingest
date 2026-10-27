@@ -30,6 +30,15 @@ class Target:
 
     #: Upsert deriving facts from raw. Receives %(since)s — the previous
     #: watermark, or NULL on first run — and MUST be idempotent.
+    #:
+    #: SHOULD also bound the slice above with
+    #: `_ingested_at <= %(until)s::timestamptz`. The runner then applies a
+    #: backlog in chunks, committing and advancing the watermark after each one,
+    #: so no single statement has to fit the role's statement_timeout. Without
+    #: it the whole backlog is one statement: a backlog the server cancels at
+    #: the timeout is cancelled again, identically, on every later run, and the
+    #: watermark never moves. Optional only so a pack written before this keeps
+    #: running; the runner says so in every such run's ledger row.
     upsert_sql: str
 
     #: Expression on the FACT table yielding the reporting date. Used to decide
@@ -67,6 +76,19 @@ class Target:
     #: incident_lifecycle: ~48k rows, well under a second.
     full_refresh: bool = False
 
+    #: Copy raw rows only from ingest runs that completed: `control.ingest_run`
+    #: SUCCESS with no error_summary note, which is how common/run.py marks a
+    #: run that read everything.
+    #:
+    #: ON for a snapshot target, where every row of one run is one picture of
+    #: the estate. A run that failed or stopped part-way has committed half a
+    #: picture under one snapshot_at, and copying it reads as agents vanishing.
+    #: The upsert carries the filter itself (an EXISTS on control.ingest_run);
+    #: this flag tells the runner to hold the watermark below any run still in
+    #: progress, so its rows are not skipped for good, and to record which runs
+    #: it left out.
+    complete_runs_only: bool = False
+
     def __post_init__(self) -> None:
         if "%(since)s" not in self.upsert_sql:
             raise ValueError(
@@ -78,6 +100,17 @@ class Target:
                 f"target {self.name}: cast the watermark parameter "
                 "(%(since)s::timestamptz) — PostgreSQL cannot infer a type for a "
                 "bare parameter inside IS NULL and raises AmbiguousParameter"
+            )
+        if "%(until)s IS NULL" in self.upsert_sql.replace("  ", " "):
+            raise ValueError(
+                f"target {self.name}: cast the upper bound (%(until)s::timestamptz) "
+                "for the same reason as %(since)s"
+            )
+        if self.complete_runs_only and "control.ingest_run" not in self.upsert_sql:
+            raise ValueError(
+                f"target {self.name}: complete_runs_only needs the upsert to filter "
+                "on control.ingest_run, or the runner would report skipping runs "
+                "that the SQL still copies"
             )
         if bool(self.rollup_table) != bool(self.rollup_sql):
             raise ValueError(
@@ -98,6 +131,11 @@ class Target:
             raise ValueError(
                 f"target {self.name}: rollup_ddl given but no rollup_table"
             )
+
+    @property
+    def chunkable(self) -> bool:
+        """Can the runner bound each statement above, and so chunk a backlog?"""
+        return "%(until)s" in self.upsert_sql
 
 
 def should_skip(target: Target, since: Any, new_mark: Any) -> bool:

@@ -94,3 +94,69 @@ def test_logging_is_configured_with_the_redacting_filter_before_discovery(
         root.handlers, root.level = saved_handlers, saved_level
 
     assert seen_filters_during_discovery == [True]
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [("SUCCESS", 0), ("DISABLED", 0), ("BUSY", 0), ("FAILED", 1)],
+)
+def test_exit_code_agrees_with_the_ledger(
+    monkeypatch: pytest.MonkeyPatch, status: str, code: int
+) -> None:
+    """A wind-down returns FAILED rather than raising; the unit must still fail,
+    or a transform that is behind reads as healthy to systemd."""
+    pytest.importorskip("psycopg", reason="the runner needs the 'postgres' extra")
+    from secops_ingest.transform import runner
+
+    monkeypatch.setattr(
+        "secops_ingest.transform.__main__.all_targets", lambda: {"t": object()}
+    )
+    monkeypatch.setattr(runner, "execute", lambda target: runner.TransformResult(status))
+
+    assert main(["t"]) == code
+
+
+def test_a_registry_that_can_skip_collisions_is_asked_to(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """V-33: this entry point only runs targets, so a name two packs claim
+    drops those two targets, not every transform on the host."""
+    seen: list[bool] = []
+
+    def registry(packs: object = None, *, skip_collisions: bool = False) -> dict[str, object]:
+        seen.append(skip_collisions)
+        return {}
+
+    monkeypatch.setattr("secops_ingest.transform.__main__.all_targets", registry)
+    with pytest.raises(SystemExit):  # no targets, so argparse rejects "t"
+        main(["t"])
+
+    assert seen == [True]
+
+
+def test_target_schema_drift_is_a_one_line_refusal(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Reported exactly like ControlSchemaDrift: one line, exit 1, no traceback."""
+    pytest.importorskip("psycopg", reason="the runner needs the 'postgres' extra")
+    from secops_ingest.common import schema_check
+    from secops_ingest.transform import runner
+
+    class TargetSchemaDrift(RuntimeError):
+        pass
+
+    # raising=False: the class lands on fix/audit-schema; on this branch alone
+    # the attribute does not exist yet.
+    monkeypatch.setattr(schema_check, "TargetSchemaDrift", TargetSchemaDrift, raising=False)
+    monkeypatch.setattr(
+        "secops_ingest.transform.__main__.all_targets", lambda: {"t": object()}
+    )
+
+    def drifted(target: object) -> object:
+        raise TargetSchemaDrift("mart_fact_t is missing column(s): x; re-apply the DDL")
+
+    monkeypatch.setattr(runner, "execute", drifted)
+
+    assert main(["t"]) == 1
+    err = capsys.readouterr().err
+    assert err.strip() == "mart_fact_t is missing column(s): x; re-apply the DDL"

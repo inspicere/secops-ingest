@@ -28,7 +28,12 @@ EXAMPLE = Target(
         FROM raw_example.messages
         -- Casts are required: PostgreSQL cannot infer a type for a bare
         -- parameter used in `IS NULL`, and raises AmbiguousParameter.
-        WHERE %(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz
+        --
+        -- %(until)s is the top of the chunk the runner is applying. It lets a
+        -- backlog land as many short statements, each committed, rather than
+        -- one that the role's statement_timeout can cancel forever.
+        WHERE (%(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz)
+          AND _ingested_at <= %(until)s::timestamptz
         -- Partitioned on reported_at, so the partition key is in the primary
         -- key and therefore in the conflict target.
         ON CONFLICT (message_id, reported_at) DO UPDATE SET
@@ -107,7 +112,8 @@ WAZUH = Target(
             payload->'decoder'->>'name',
             payload->>'location'
         FROM raw_wazuh.alerts
-        WHERE %(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz
+        WHERE (%(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz)
+          AND _ingested_at <= %(until)s::timestamptz
         -- Alerts are append-only, so this conflict clause fires only on the
         -- connector's deliberate re-read of its late-arrival overlap window.
         -- It exists so that overlap costs nothing but a rewrite of identical
@@ -214,7 +220,8 @@ DEFECTDOJO = Target(
             (payload->>'sla_start_date')::date,
             (payload->>'sla_expiration_date')::date
         FROM raw_defectdojo.findings
-        WHERE %(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz
+        WHERE (%(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz)
+          AND _ingested_at <= %(until)s::timestamptz
         -- Every mutable column is refreshed. Unlike an append-only source, this
         -- clause is the normal path rather than the exception: most rows arrive
         -- because their state changed, not because they are new.
@@ -344,7 +351,8 @@ XSOAR_INCIDENTS = Target(
             payload->>'dbotMirrorId',
             (payload->>'openDuration')::bigint
         FROM raw_xsoar.incidents
-        WHERE %(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz
+        WHERE (%(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz)
+          AND _ingested_at <= %(until)s::timestamptz
         -- Every mutable column is refreshed, as on DEFECTDOJO above.
         --
         -- xdr_incident_id in particular. dbotMirrorId is NOT necessarily set
@@ -434,7 +442,8 @@ XDR_INCIDENTS = Target(
             (payload->>'user_count')::int,
             payload->>'assigned_user_mail'
         FROM raw_xdr.incidents
-        WHERE %(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz
+        WHERE (%(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz)
+          AND _ingested_at <= %(until)s::timestamptz
         -- The per-severity breakdown is refreshed WITH alert_count, never
         -- without it. An incident accrues alerts after it opens; refreshing the
         -- total while freezing its components produced rows reading
@@ -514,7 +523,8 @@ XDR_ALERTS = Target(
             payload->>'host_name',
             payload->>'agent_os_type'
         FROM raw_xdr.alerts
-        WHERE %(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz
+        WHERE (%(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz)
+          AND _ingested_at <= %(until)s::timestamptz
         -- Fires only on the connector's deliberate late-arrival overlap, which
         -- re-reads a trailing window every run. Without this clause that
         -- overlap would be a duplicate-key crash instead of a rewrite of
@@ -573,6 +583,7 @@ XDR_ENDPOINTS = Target(
     raw_table="raw_xdr.endpoint_snapshots",
     fact_table="mart_fact_xdr_endpoint_snapshots",
     fact_date_expr="snapshot_at",
+    complete_runs_only=True,
     upsert_sql="""
         INSERT INTO mart_fact_xdr_endpoint_snapshots
             (endpoint_id, snapshot_at, endpoint_name, endpoint_status,
@@ -597,8 +608,19 @@ XDR_ENDPOINTS = Target(
             -- the half of policy health that this table exists for.
             payload->>'assigned_prevention_policy',
             payload->>'assigned_extensions_policy'
-        FROM raw_xdr.endpoint_snapshots
-        WHERE %(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz
+        FROM raw_xdr.endpoint_snapshots r
+        WHERE (%(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz)
+          AND _ingested_at <= %(until)s::timestamptz
+          -- Whole snapshots only. A run that failed or stopped early landed
+          -- part of the estate under one snapshot_at, and a half estate reads
+          -- as agents that vanished: the false signal this table exists to
+          -- avoid. error_summary IS NULL is common/run.py's "read everything";
+          -- every incomplete SUCCESS carries a note. See complete_runs_only.
+          AND EXISTS (
+                SELECT 1 FROM control.ingest_run i
+                WHERE i.run_id = r._source_run_id
+                  AND i.status = 'SUCCESS'
+                  AND i.error_summary IS NULL)
         -- Both policy columns are mutable: a reassignment is exactly the drift
         -- this table is here to make visible, so a re-landed snapshot must be
         -- able to correct them.
@@ -766,7 +788,7 @@ INCIDENT_LIFECYCLE = Target(
             ORDER BY i.created_at DESC
             LIMIT 1
         ) d ON true
-        WHERE %(since)s::timestamptz IS NULL
+        WHERE (%(since)s::timestamptz IS NULL
            OR x._ingested_at > %(since)s::timestamptz
            -- UNREACHABLE WHILE full_refresh IS SET, and kept on purpose.
            -- full_refresh pins %(since)s to NULL, so the first branch already
@@ -778,7 +800,10 @@ INCIDENT_LIFECYCLE = Target(
                 SELECT 1 FROM mart_fact_incident_lifecycle l
                 WHERE l.xsoar_incident_id = x.source_id
                   AND l.created_at = (x.payload->>'created')::timestamptz
-                  AND l.join_status = 'pending_xdr')
+                  AND l.join_status = 'pending_xdr'))
+          -- The chunk's upper bound applies to every branch, the pending_xdr
+          -- retry included: a row above it belongs to a later chunk.
+          AND x._ingested_at <= %(until)s::timestamptz
         -- xdr_incident_id MUST be refreshed alongside join_status. It is
         -- derived from dbotMirrorId, which XSOAR sets when mirroring is
         -- established rather than at incident creation, so it is exactly as
@@ -873,7 +898,8 @@ KSAT_ENROLLMENTS = Target(
             payload->'campaign'->>'name',
             payload->'campaign'->>'status'
         FROM raw_ksat.enrollments
-        WHERE %(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz
+        WHERE (%(since)s::timestamptz IS NULL OR _ingested_at > %(since)s::timestamptz)
+          AND _ingested_at <= %(until)s::timestamptz
         -- EVERY mutable column. This is the whole point of the target: a
         -- re-read source lands the same enrollment again with a new status, and
         -- a column left out of this list freezes at whatever the first run saw.
