@@ -12,9 +12,12 @@ from typing import Any
 
 import pytest
 
-from secops_ingest.sources import _cortex
-from secops_ingest.sources import xdr_endpoints as endpoints_mod
-from secops_ingest.sources.xdr_endpoints import XdrEndpointsSource
+# Needs the 'http' extra: the Cortex connectors reach httpx through common.http.
+pytest.importorskip("httpx", reason="needs the 'http' extra")
+
+from secops_ingest.sources import _cortex  # noqa: E402
+from secops_ingest.sources import xdr_endpoints as endpoints_mod  # noqa: E402
+from secops_ingest.sources.xdr_endpoints import XdrEndpointsSource  # noqa: E402
 
 FROZEN = "2026-09-14T00:00:00+00:00"
 

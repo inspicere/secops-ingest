@@ -11,9 +11,12 @@ from typing import Any
 
 import pytest
 
-from secops_ingest.sources import _cortex
-from secops_ingest.sources import xdr_alerts as alerts_mod
-from secops_ingest.sources.xdr_alerts import (
+# Needs the 'http' extra: the Cortex connectors reach httpx through common.http.
+pytest.importorskip("httpx", reason="needs the 'http' extra")
+
+from secops_ingest.sources import _cortex  # noqa: E402
+from secops_ingest.sources import xdr_alerts as alerts_mod  # noqa: E402
+from secops_ingest.sources.xdr_alerts import (  # noqa: E402
     DEFAULT_BACKFILL_DAYS,
     XdrAlertsSource,
 )

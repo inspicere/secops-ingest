@@ -90,6 +90,67 @@ def test_file_provider_missing_raises(tmp_path: pathlib.Path) -> None:
         FileSecretProvider(tmp_path).get("absent")
 
 
+def test_file_provider_follows_a_kubernetes_secret_volume(tmp_path: pathlib.Path) -> None:
+    # Kubernetes links name -> ..data/name and ..data -> ..<timestamp>/, so the
+    # resolved file sits one level below the directory. It used to be reported
+    # as missing because its parent was not the directory itself.
+    stamp = tmp_path / "..2026_10_25_00_00_00.123"
+    stamp.mkdir()
+    (stamp / "db-pass").write_text("k8s-volume-value\n")
+    (tmp_path / "..data").symlink_to(stamp.name)
+    (tmp_path / "db-pass").symlink_to("..data/db-pass")
+    assert FileSecretProvider(tmp_path).get("db-pass") == "k8s-volume-value"
+
+
+def test_file_provider_refuses_a_symlink_out_of_the_directory(tmp_path: pathlib.Path) -> None:
+    store = tmp_path / "store"
+    store.mkdir()
+    (tmp_path / "elsewhere").write_text("not-a-secret-of-ours")
+    (store / "tok").symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(SecretNotFound):
+        FileSecretProvider(store).get("tok")
+
+
+def test_file_provider_warns_on_a_world_readable_secret(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "tok"
+    path.write_text("world-readable-value")
+    path.chmod(0o644)
+    with caplog.at_level(logging.WARNING, logger="secops_ingest.secrets.file"):
+        # A warning, not a refusal: Docker and Kubernetes ship secrets this way.
+        assert FileSecretProvider(tmp_path).get("tok") == "world-readable-value"
+    assert "tok" in caplog.text and "644" in caplog.text
+    assert str(tmp_path) not in caplog.text
+    assert "world-readable-value" not in caplog.text
+
+
+def test_file_provider_is_quiet_about_a_private_secret(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "tok"
+    path.write_text("private-value")
+    path.chmod(0o640)
+    with caplog.at_level(logging.WARNING, logger="secops_ingest.secrets.file"):
+        FileSecretProvider(tmp_path).get("tok")
+    assert caplog.text == ""
+
+
+@pytest.mark.parametrize("content", ["", "\n", "  \n"])
+def test_an_empty_secret_is_refused(tmp_path: pathlib.Path, content: str) -> None:
+    # A truncated write would otherwise be sent to the vendor as the credential.
+    (tmp_path / "tok").write_text(content)
+    with pytest.raises(SecretError, match="secret is empty: tok"):
+        FileSecretProvider(tmp_path).get("tok")
+
+
+def test_an_empty_env_secret_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SECOPS_SECRET_TOK", "")
+    with pytest.raises(SecretError, match="secret is empty: tok") as exc:
+        EnvSecretProvider().get("tok")
+    assert not isinstance(exc.value, SecretNotFound)
+
+
 def test_file_provider_uses_systemd_credentials_dir(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

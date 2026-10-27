@@ -33,6 +33,20 @@ disable first closes the window where a run in flight could race the drop.
 The `control.pack` row itself is left behind, still DISABLED, rather than
 deleted -- a deleted row reads as "never seen here", which is exactly the
 state a surviving timer's PROCEED-by-default gate treats as safe to run.
+
+WHICH DSN. `enable`, `disable` and `drop` change whether a pack runs, so they
+need the warehouse's SCHEMA-OWNER role in `SECOPS_DB_DSN`, not a worker's: the
+worker roles may only read `control.pack` (a worker that could write it could
+re-enable a pack an operator disabled), and they cannot CREATE in a raw schema
+at all. A worker DSN fails with one line saying so. Where the DDL is already
+applied by something else -- a generated schema file converged by a
+deployment tool -- `enable --state-only` records the state without applying
+any DDL, so the owner credential is used for one INSERT and nothing else.
+
+`list` also exits non-zero when discovery had to skip a pack for a reason an
+operator must fix (two distributions claiming one name, a distribution outside
+`SECOPS_ALLOWED_PACKS`), and marks a pack whose recorded version differs from
+the installed one -- the trace a silent no-op upgrade leaves.
 """
 
 from __future__ import annotations
@@ -49,8 +63,17 @@ from .. import __version__
 from ..redaction import RedactingFilter
 from ..schema import validate_identifier
 from .model import Pack
-from .registry import ENTRY_POINT_GROUP, DuplicatePack, DuplicateTarget, all_targets, discover
-from .version import InvalidVersionSpec, matches
+from .registry import (
+    ALLOWLIST_ENV,
+    ENTRY_POINT_GROUP,
+    DuplicatePack,
+    DuplicateTarget,
+    all_targets,
+    allowed_distributions,
+    discover,
+    entry_point_allowed,
+)
+from .version import InvalidVersionSpec, describe_drift, matches
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, keeps the import lazy
     import psycopg
@@ -75,14 +98,15 @@ def _configure_logging() -> None:
     )
 
 
-def _discover_packs() -> dict[str, Pack] | None:
+def _discover_packs(problems: list[str] | None = None) -> dict[str, Pack] | None:
     """discover(), reporting a name collision as one clean stderr line.
 
     Every subcommand touches the registry, so they all need this; returns
     None on failure so a caller can just check for that and return 1.
+    `problems`, if given, collects what discovery skipped and why.
     """
     try:
-        return discover()
+        return discover() if problems is None else discover(problems=problems)
     except (DuplicatePack, DuplicateTarget) as exc:
         print(str(exc), file=sys.stderr)
         return None
@@ -126,7 +150,14 @@ def _explain_unregistered(name: str, packs: Mapping[str, Pack]) -> str:
     `registry.UnknownSource` already uses, so a typo's error message actually
     helps rather than just naming what was typed.
     """
+    allowed = allowed_distributions()
     for ep in entry_points(group=ENTRY_POINT_GROUP):
+        # Never load what the allowlist refuses, not even to explain an
+        # absence; the entry point's name is metadata and safe to compare.
+        if not entry_point_allowed(ep, allowed):
+            if ep.name == name:
+                return f"pack {name!r} is installed but its distribution is not in {ALLOWLIST_ENV}"
+            continue
         try:
             candidate = ep.load()
         except Exception:
@@ -211,7 +242,8 @@ def _state_marker(state: PackState | None) -> str:
 
 
 def _cmd_list() -> int:
-    packs = _discover_packs()
+    problems: list[str] = []
+    packs = _discover_packs(problems)
     if packs is None:
         return 1
     targets = _discover_targets(packs)
@@ -229,7 +261,11 @@ def _cmd_list() -> int:
         print(f"    sources: {', '.join(sorted(pack.sources)) or '-'}")
         print(f"    targets: {', '.join(owned) or '-'}")
         if unknown_reason is None:
-            print(f"    state: {_state_marker(states.get(name))}")
+            stored = states.get(name)
+            print(f"    state: {_state_marker(stored)}")
+            drift = describe_drift(stored.version, pack.version) if stored else None
+            if drift:
+                print(f"    [!] version: {drift}")
 
     if unknown_reason is not None:
         print(f"state: unknown ({unknown_reason})")
@@ -239,10 +275,27 @@ def _cmd_list() -> int:
         for name in sorted(extra):
             row = states[name]
             print(f"    [!] {name}  {row.version}  {row.state}  -- not installed")
-    return 0
+
+    # Printed after the listing, not instead of it: the packs that did load
+    # are still running, and the operator needs to see both.
+    for problem in problems:
+        print(f"[!] {problem}", file=sys.stderr)
+    return 1 if problems else 0
 
 
-def _cmd_enable(name: str) -> int:
+def _privilege_hint(exc: Exception) -> str:
+    """A remedy for the one failure a wrong DSN produces, or nothing."""
+    import psycopg
+
+    if isinstance(exc, psycopg.errors.InsufficientPrivilege):
+        return (
+            " -- SECOPS_DB_DSN must name the schema-owner role for this command; "
+            "worker roles may only read control.pack"
+        )
+    return ""
+
+
+def _cmd_enable(name: str, state_only: bool = False) -> int:
     # Resolved from the registry before anything touches a connection: the
     # unknown-pack failure must be about the name, not about a DSN that
     # happens not to resolve. See test_enable_unknown_pack_names_it.
@@ -298,11 +351,13 @@ def _cmd_enable(name: str) -> int:
         return 1
 
     try:
-        pack_state.apply_ddl(conn, control_sql())
-        pack_state.apply_ddl(conn, target_ddl)
+        if not state_only:
+            pack_state.apply_ddl(conn, control_sql())
+            pack_state.apply_ddl(conn, target_ddl)
         pack_state.set_state(conn, name, pack.version, "ENABLED")
     except psycopg.Error as exc:
-        print(f"connected, but could not enable pack {name!r}: {exc}", file=sys.stderr)
+        print(f"connected, but could not enable pack {name!r}: {exc}{_privilege_hint(exc)}",
+              file=sys.stderr)
         return 1
     finally:
         conn.close()
@@ -352,7 +407,8 @@ def _cmd_disable(name: str) -> int:
         # disable it without guessing at a version it no longer declares.
         pack_state.set_state(conn, name, existing.version, "DISABLED")
     except psycopg.Error as exc:
-        print(f"connected, but could not disable pack {name!r}: {exc}", file=sys.stderr)
+        print(f"connected, but could not disable pack {name!r}: {exc}{_privilege_hint(exc)}",
+              file=sys.stderr)
         return 1
     finally:
         conn.close()
@@ -463,6 +519,37 @@ def _colliding_source(
     return None
 
 
+#: The transform runner's per-target advisory lock, byte for byte: namespace,
+#: key derivation and session scope must match transform/locks.py, or `drop` and
+#: a running transform would each take a lock the other never checks. Spelled
+#: out here rather than imported so this module keeps working against a runner
+#: that predates the lock; tests/packs pins the same literal the transform tests
+#: pin.
+_TRANSFORM_LOCK_NAMESPACE = "secops_ingest.transform"
+_TRY_LOCK = "SELECT pg_try_advisory_lock(hashtext(%s), hashtext(%s))"
+_UNLOCK = "SELECT pg_advisory_unlock(hashtext(%s), hashtext(%s))"
+
+
+def _try_lock_target(conn: psycopg.Connection, target: str) -> bool:
+    """Take a target's transform lock without waiting; False if a run holds it.
+
+    Non-blocking for the same reason as the runner's: a `drop` queued behind a
+    transform would destroy the tables the moment that run finished, with no
+    operator watching any more.
+    """
+    with conn.cursor() as cur:
+        cur.execute(_TRY_LOCK, (_TRANSFORM_LOCK_NAMESPACE, target))
+        row = cur.fetchone()
+    conn.commit()
+    return bool(row and row[0])
+
+
+def _unlock_target(conn: psycopg.Connection, target: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(_UNLOCK, (_TRANSFORM_LOCK_NAMESPACE, target))
+    conn.commit()
+
+
 def _cmd_drop(name: str, yes_destroy_data: bool) -> int:
     # Resolved from the registry first, exactly like `enable`: an unknown pack
     # is a naming problem, not a database problem, and must fail as one before
@@ -530,6 +617,7 @@ def _cmd_drop(name: str, yes_destroy_data: bool) -> int:
         print(f"could not connect to drop pack {name!r}: {exc}", file=sys.stderr)
         return 1
 
+    held: list[str] = []
     try:
         # `drop` requires the pack to already be DISABLED. A still-ENABLED
         # pack has a timer that may run at any moment; dropping its tables
@@ -564,6 +652,23 @@ def _cmd_drop(name: str, yes_destroy_data: bool) -> int:
                 "refusing: pass --yes-destroy-data to actually destroy this data.",
             )
             return 1
+
+        # DISABLED stops new runs; it does not stop one already in flight. A
+        # transform that started before the disable can, between the
+        # bookkeeping DELETE and the DROP below, write a watermark and a
+        # coverage row for tables about to vanish -- and coverage is what arms
+        # raw expiry. Holding every target's lock across both steps closes
+        # that window. Session-level, so it survives the commits in between;
+        # closing the connection releases whatever is still held.
+        for target in targets:
+            if not _try_lock_target(conn, target):
+                print(
+                    f"refusing: a transform run for target {target!r} is in progress; "
+                    "retry when it finishes. Nothing was destroyed.",
+                    file=sys.stderr,
+                )
+                return 1
+            held.append(target)
 
         # Bookkeeping is deleted FIRST, tables dropped second -- the inverse
         # of `_cmd_enable`'s ordering (see the "written strictly last" comment
@@ -630,9 +735,16 @@ def _cmd_drop(name: str, yes_destroy_data: bool) -> int:
         # for real against tables that no longer exist.
         print(f"destroyed the data for pack {name!r}.")
     except psycopg.Error as exc:
-        print(f"connected, but could not drop pack {name!r}: {exc}", file=sys.stderr)
+        print(f"connected, but could not drop pack {name!r}: {exc}{_privilege_hint(exc)}",
+              file=sys.stderr)
         return 1
     finally:
+        for target in held:
+            try:
+                conn.rollback()
+                _unlock_target(conn, target)
+            except psycopg.Error:
+                pass  # closing the connection below releases it anyway
         conn.close()
     return 0
 
@@ -643,6 +755,12 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("list", help="show every pack this install can see")
     enable_parser = subparsers.add_parser("enable", help="enable a pack in the warehouse")
     enable_parser.add_argument("name")
+    enable_parser.add_argument(
+        "--state-only",
+        action="store_true",
+        help="record ENABLED without applying DDL, for a warehouse whose schema "
+             "is applied by something else (a generated schema file)",
+    )
     disable_parser = subparsers.add_parser("disable", help="disable a pack in the warehouse")
     disable_parser.add_argument("name")
     drop_parser = subparsers.add_parser(
@@ -661,7 +779,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "list":
         return _cmd_list()
     if args.command == "enable":
-        return _cmd_enable(args.name)
+        return _cmd_enable(args.name, args.state_only)
     if args.command == "disable":
         return _cmd_disable(args.name)
     return _cmd_drop(args.name, args.yes_destroy_data)

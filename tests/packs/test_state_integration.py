@@ -432,6 +432,70 @@ def test_drop_removes_tables_and_leaves_the_row_disabled(
     assert got.state == "DISABLED"
 
 
+def test_drop_refuses_while_a_transform_holds_a_targets_lock(
+    conn: psycopg.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """V-30: DISABLED stops new runs, not one in flight. A transform between
+    drop's bookkeeping DELETE and its DROP would re-create coverage -- which
+    arms raw expiry -- for tables about to vanish, so drop must refuse while
+    any of the pack's targets is locked, and destroy nothing.
+
+    The key is the literal the transform runner uses (transform/locks.py and
+    tests/transform pin the same one): a different key would make this test
+    pass while the two locks never meet.
+    """
+    from secops_ingest.packs.__main__ import main
+
+    monkeypatch.setenv("SECOPS_DB_DSN", os.environ["SECOPS_TEST_DSN"])
+    assert main(["enable", "builtin"]) == 0
+    conn.execute("INSERT INTO control.transform_watermark (target) VALUES ('example_messages')")
+    conn.commit()
+    assert main(["disable", "builtin"]) == 0
+    with psycopg.connect(os.environ["SECOPS_TEST_DSN"], autocommit=True) as runner:
+        runner.execute(
+            "SELECT pg_advisory_lock(hashtext('secops_ingest.transform'),"
+            " hashtext('example_messages'))"
+        )
+        capsys.readouterr()
+        assert main(["drop", "builtin", "--yes-destroy-data"]) == 1
+        assert "transform run for target 'example_messages' is in progress" in (
+            capsys.readouterr().err
+        )
+        assert _table_exists(conn, "raw_example.messages")
+        assert conn.execute(
+            "SELECT count(*) FROM control.transform_watermark WHERE target = 'example_messages'"
+        ).fetchone() == (1,)
+    # The lock went with the runner's session; drop now proceeds.
+    assert main(["drop", "builtin", "--yes-destroy-data"]) == 0
+    assert not _table_exists(conn, "raw_example.messages")
+
+
+def test_drop_releases_the_locks_it_took(
+    conn: psycopg.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lock left held by a finished drop would make every later transform
+    run of a re-enabled pack refuse until that session ended."""
+    from secops_ingest.packs.__main__ import main
+
+    monkeypatch.setenv("SECOPS_DB_DSN", os.environ["SECOPS_TEST_DSN"])
+    assert main(["enable", "builtin"]) == 0
+    assert main(["disable", "builtin"]) == 0
+    assert main(["drop", "builtin", "--yes-destroy-data"]) == 0
+    got = conn.execute(
+        "SELECT pg_try_advisory_lock(hashtext('secops_ingest.transform'),"
+        " hashtext('example_messages'))"
+    ).fetchone()
+    assert got == (True,)
+    conn.execute(
+        "SELECT pg_advisory_unlock(hashtext('secops_ingest.transform'),"
+        " hashtext('example_messages'))"
+    )
+    conn.commit()
+
+
 def test_drop_reports_row_counts_before_destroying(
     conn: psycopg.Connection,
     monkeypatch: pytest.MonkeyPatch,
@@ -512,7 +576,7 @@ def test_drop_leaves_other_packs_tables_and_control_rows_alone(
 
     monkeypatch.setattr(
         "secops_ingest.packs.__main__.discover",
-        lambda: discover(extra=[_FakeEntryPoint()]),
+        lambda **kw: discover(extra=[_FakeEntryPoint()], **kw),
     )
     monkeypatch.setenv("SECOPS_DB_DSN", os.environ["SECOPS_TEST_DSN"])
 

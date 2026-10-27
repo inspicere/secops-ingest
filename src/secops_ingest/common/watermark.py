@@ -7,7 +7,7 @@ silent data-loss defect lived - are testable without a driver installed.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -24,7 +24,9 @@ def comparable(value: Any) -> Any:
     records that are then never re-fetched. Epoch integers rendered as strings
     misorder the same way ("9999999999" > "10000000000").
     """
-    if isinstance(value, (datetime, int, float)):
+    if isinstance(value, datetime):
+        return _aware(value)
+    if isinstance(value, (int, float)):
         return value
     text = str(value)
     if text.isdigit():
@@ -32,7 +34,7 @@ def comparable(value: Any) -> Any:
     try:
         # No Z -> +00:00 rewrite: fromisoformat parses the military suffix
         # itself from 3.11, which is this package's floor.
-        return datetime.fromisoformat(text)
+        return _aware(datetime.fromisoformat(text))
     except ValueError:
         if text[:4] not in _warned_unparsable:
             _warned_unparsable.add(text[:4])
@@ -41,6 +43,19 @@ def comparable(value: Any) -> Any:
                 "string ordering, which is unsafe across format changes", text
             )
         return text
+
+
+def _aware(value: datetime) -> datetime:
+    """Read a naive timestamp as UTC.
+
+    Python refuses to order a naive datetime against an aware one, with a
+    TypeError that aborted the whole run: one vendor record without an offset
+    among records with one took the source dark. UTC is the conventional
+    reading of an API timestamp with no offset. It is a guess, but a wrong
+    guess misplaces one mark by the offset, where the TypeError failed every
+    run until the vendor changed its data.
+    """
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 def newer(candidate: Any, current: Any) -> bool:

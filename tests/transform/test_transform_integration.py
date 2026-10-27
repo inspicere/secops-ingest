@@ -51,11 +51,14 @@ from secops_ingest.transform import runner  # noqa: E402
 from secops_ingest.transform.targets import (  # noqa: E402
     INCIDENT_LIFECYCLE,
     KSAT_ENROLLMENTS,
+    XDR_ENDPOINTS,
     XDR_INCIDENTS,
     XSOAR_INCIDENTS,
 )
 
-TARGETS = [XSOAR_INCIDENTS, XDR_INCIDENTS, INCIDENT_LIFECYCLE, KSAT_ENROLLMENTS]
+TARGETS = [
+    XSOAR_INCIDENTS, XDR_INCIDENTS, INCIDENT_LIFECYCLE, KSAT_ENROLLMENTS, XDR_ENDPOINTS,
+]
 
 # The full measured severity domain from a live XSOAR instance over 5,766
 # incidents, including the 0.5 that broke production. Counts were
@@ -490,3 +493,300 @@ def test_a_not_started_enrollment_lands_with_null_outcomes(warehouse: Any) -> No
     assert rows == [
         ("NOT_STARTED", None, None, None, None, False, "u-9001", False)
     ], rows
+
+
+# ---------------------------------------------------------------------------
+# Chunking, wind-down bookkeeping, and the target lock
+#
+# The upsert used to be one statement under the role's 900s statement_timeout.
+# A backlog longer than that was cancelled, the watermark held, and the same
+# statement was cancelled on every run after. These drive the chunked path
+# through real SQL: the slices have to cover the backlog exactly, and a failure
+# part-way has to keep what was committed before it.
+# ---------------------------------------------------------------------------
+
+T0 = datetime(2026, 10, 1, 9, 0, tzinfo=UTC)
+
+
+def _ingested(conn: Any, incident_id: str, at: datetime) -> None:
+    """Pin a raw row's _ingested_at, so chunk boundaries are deterministic."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE raw_xsoar.incidents SET _ingested_at = %s WHERE source_id = %s",
+            (at, incident_id),
+        )
+
+
+def _runs(conn: Any, target: str) -> list[tuple[Any, ...]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT status, rows_upserted, error_summary FROM control.transform_run"
+            " WHERE target = %s ORDER BY run_id",
+            (target,),
+        )
+        return list(cur.fetchall())
+
+
+def _mark(conn: Any, target: str) -> Any:
+    rows = _rows(
+        conn,
+        "SELECT cursor_value FROM control.transform_watermark"
+        f" WHERE target = '{target}'",  # noqa: S608 - fixed literal
+    )
+    return rows[0][0] if rows else None
+
+
+def test_a_backlog_lands_in_chunks_with_nothing_missed(warehouse: Any) -> None:
+    for i in range(7):
+        _land_xsoar(warehouse, f"c{i}", severity="2", brand=XDR_BRAND)
+        _ingested(warehouse, f"c{i}", T0 + timedelta(minutes=i))
+
+    result = runner.execute(XSOAR_INCIDENTS, chunk_rows=2)
+
+    assert result.status == "SUCCESS"
+    assert result.rows_upserted == 7
+    assert _rows(warehouse, "SELECT count(*) FROM mart_fact_xsoar_incidents") == [(7,)]
+    assert _mark(warehouse, "xsoar_incidents") == T0 + timedelta(minutes=6)
+    assert _runs(warehouse, "xsoar_incidents") == [("SUCCESS", 7, None)]
+
+
+def test_a_failing_chunk_keeps_every_chunk_before_it(warehouse: Any) -> None:
+    """THE LIVELOCK, INVERTED. A statement cancelled part-way through a backlog
+    used to keep nothing. Now the chunks before it are committed and the
+    watermark sits at the top of the last one, so the next run starts there."""
+    for i in range(4):
+        _land_xsoar(warehouse, f"ok{i}", severity="2", brand=XDR_BRAND)
+        _ingested(warehouse, f"ok{i}", T0 + timedelta(minutes=i))
+    # Not a number: the ::numeric cast aborts whichever chunk holds it.
+    _land_xsoar(warehouse, "bad", severity="high", brand=XDR_BRAND)
+    _ingested(warehouse, "bad", T0 + timedelta(minutes=10))
+
+    with pytest.raises(psycopg.errors.InvalidTextRepresentation):
+        runner.execute(XSOAR_INCIDENTS, chunk_rows=2)
+
+    assert _rows(warehouse, "SELECT count(*) FROM mart_fact_xsoar_incidents") == [(4,)]
+    assert _mark(warehouse, "xsoar_incidents") == T0 + timedelta(minutes=3)
+    [(status, rows, why)] = _runs(warehouse, "xsoar_incidents")
+    assert (status, rows) == ("FAILED", 4)
+    assert "after 2 committed chunk(s), 4 row(s)" in why
+
+
+def test_a_run_past_its_deadline_is_failed_not_running(warehouse: Any) -> None:
+    _land_xsoar(warehouse, "d1", severity="2", brand=XDR_BRAND)
+
+    result = runner.execute(XSOAR_INCIDENTS, deadline_sec=0)
+
+    assert result.status == "FAILED"
+    [(status, rows, why)] = _runs(warehouse, "xsoar_incidents")
+    assert (status, rows) == ("FAILED", 0)
+    assert why.startswith("stopped at the 0s deadline after 0 chunk(s)")
+
+
+def test_full_refresh_in_chunks_still_classifies_every_row(warehouse: Any) -> None:
+    """The lifecycle join's pending_xdr retry branch sits under the chunk bound
+    too; one row per chunk proves no row falls between two slices."""
+    _land_xdr(warehouse, "45220")
+    _land_xsoar(warehouse, "x1", severity="2", brand=XDR_BRAND, mirror_id="45220")
+    _land_xsoar(warehouse, "x2", severity="3", brand=XDR_BRAND, mirror_id="45221")
+    _land_xsoar(warehouse, "m1", severity="0", brand=MANUAL_BRAND)
+    for i, inc in enumerate(("x1", "x2", "m1")):
+        _ingested(warehouse, inc, T0 + timedelta(minutes=i))
+    runner.execute(XDR_INCIDENTS)
+
+    result = runner.execute(INCIDENT_LIFECYCLE, chunk_rows=1)
+
+    # 4, not 3: once chunk 2 has written x2 as pending_xdr, chunk 3's retry
+    # branch re-derives it. Idempotent, and the count of statements' rows
+    # rather than of distinct incidents -- which is why the mart is asserted.
+    assert result.rows_upserted == 4
+    assert _rows(warehouse, "SELECT count(*) FROM mart_fact_incident_lifecycle") == [(3,)]
+    assert dict(_rows(
+        warehouse,
+        "SELECT xsoar_incident_id, join_status FROM mart_fact_incident_lifecycle",
+    )) == {"x1": "matched", "x2": "pending_xdr", "m1": "non_xdr_source"}
+
+
+def test_abandoned_running_rows_are_closed_by_the_next_run(warehouse: Any) -> None:
+    """A SIGKILLed run leaves RUNNING forever; the next run of that target
+    closes it. A young RUNNING row, or another target's, is left alone."""
+    with warehouse.cursor() as cur:
+        cur.execute(
+            "INSERT INTO control.transform_run (target, status, started_at) VALUES"
+            " ('xsoar_incidents', 'RUNNING', now() - interval '2 hours'),"
+            " ('xsoar_incidents', 'RUNNING', now() - interval '1 minute'),"
+            " ('xdr_incidents',   'RUNNING', now() - interval '2 hours')"
+        )
+    _land_xsoar(warehouse, "r1", severity="2", brand=XDR_BRAND)
+
+    runner.execute(XSOAR_INCIDENTS)
+
+    got = _rows(
+        warehouse,
+        "SELECT target, status, left(error_summary, 10) FROM control.transform_run"
+        " ORDER BY run_id",
+    )
+    assert got == [
+        ("xsoar_incidents", "FAILED", "abandoned:"),
+        ("xsoar_incidents", "RUNNING", None),
+        ("xdr_incidents", "RUNNING", None),
+        ("xsoar_incidents", "SUCCESS", None),
+    ]
+
+
+def test_a_target_locked_elsewhere_writes_nothing(warehouse: Any, scratch_dsn: str) -> None:
+    """The literal lock `packs drop` must also take. Spelled out rather than
+    imported, so a change to the key breaks this test, not the coordination."""
+    _land_xsoar(warehouse, "l1", severity="2", brand=XDR_BRAND)
+    with psycopg.connect(scratch_dsn, autocommit=True) as other:
+        other.execute(
+            "SELECT pg_advisory_lock(hashtext('secops_ingest.transform'),"
+            " hashtext('xsoar_incidents'))"
+        )
+        result = runner.execute(XSOAR_INCIDENTS)
+
+    assert result.status == "BUSY"
+    assert _runs(warehouse, "xsoar_incidents") == []
+    # Released with the other session, so the next run proceeds normally.
+    assert runner.execute(XSOAR_INCIDENTS).status == "SUCCESS"
+
+
+def test_a_disabled_pack_transforms_nothing(warehouse: Any) -> None:
+    from secops_ingest.packs import state as pack_state
+
+    _land_xsoar(warehouse, "p1", severity="2", brand=XDR_BRAND)
+    pack_state.set_state(warehouse, "builtin", "0.1.0", "DISABLED")
+
+    result = runner.execute(XSOAR_INCIDENTS)
+
+    assert result.status == "DISABLED"
+    assert _runs(warehouse, "xsoar_incidents") == []
+    assert _rows(warehouse, "SELECT count(*) FROM mart_fact_xsoar_incidents") == [(0,)]
+
+
+def test_stale_raw_records_why_nothing_moved(warehouse: Any) -> None:
+    _land_xsoar(warehouse, "s1", severity="2", brand=XDR_BRAND)
+    runner.execute(XSOAR_INCIDENTS)
+
+    second = runner.execute(XSOAR_INCIDENTS)
+
+    assert second.status == "SUCCESS"
+    status, rows, why = _runs(warehouse, "xsoar_incidents")[-1]
+    assert (status, rows) == ("SUCCESS", 0)
+    assert why.startswith("nothing new: raw_xsoar.incidents last received rows at")
+
+
+# ---------------------------------------------------------------------------
+# xdr_endpoints: whole snapshots only
+#
+# Every row of one ingest run is one picture of the estate under one
+# snapshot_at. A run that failed or stopped part-way has committed half of it,
+# and copying that reads as agents vanishing. The target copies a run's rows
+# only once control.ingest_run says SUCCESS with no note, holds its watermark
+# below a run still in progress, and names every run it left out.
+# ---------------------------------------------------------------------------
+
+
+def _ingest_run(
+    conn: Any, status: str, *, note: str | None = None,
+    started: timedelta = timedelta(minutes=5),
+) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO control.ingest_run (source, status, error_summary, started_at)"
+            " VALUES ('xdr_endpoints', %s, %s, now() - %s) RETURNING run_id",
+            (status, note, started),
+        )
+        row = cur.fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+def _land_snapshot(
+    conn: Any, run_id: int, snapshot_at: datetime, ingested: datetime, n: int = 2
+) -> None:
+    with conn.cursor() as cur:
+        for i in range(n):
+            cur.execute(
+                "INSERT INTO raw_xdr.endpoint_snapshots"
+                " (source_id, payload, _event_time, _ingested_at, _source_run_id)"
+                " VALUES (%s, %s, %s, %s, %s)",
+                (f"ep{i}", json.dumps({"endpoint_name": f"host{i}",
+                                       "endpoint_status": "CONNECTED"}),
+                 snapshot_at, ingested + timedelta(seconds=i), run_id),
+            )
+
+
+def _snapshots(conn: Any) -> dict[datetime, int]:
+    return dict(_rows(
+        conn,
+        "SELECT snapshot_at, count(*)::int FROM mart_fact_xdr_endpoint_snapshots"
+        " GROUP BY 1",
+    ))
+
+
+def test_only_complete_snapshots_are_copied_and_the_rest_are_named(
+    warehouse: Any,
+) -> None:
+    day = datetime.now(UTC).replace(microsecond=0) - timedelta(days=3)
+    complete = _ingest_run(warehouse, "SUCCESS")
+    failed = _ingest_run(warehouse, "FAILED", note="HTTPStatusError: 502")
+    stopped = _ingest_run(warehouse, "SUCCESS", note="stopped at SIGTERM: read 1000 row(s)")
+    _land_snapshot(warehouse, complete, day, T0)
+    _land_snapshot(warehouse, failed, day + timedelta(days=1), T0 + timedelta(minutes=1))
+    _land_snapshot(warehouse, stopped, day + timedelta(days=2), T0 + timedelta(minutes=2))
+
+    result = runner.execute(XDR_ENDPOINTS)
+
+    assert result.status == "SUCCESS"
+    assert _snapshots(warehouse) == {day: 2}
+    [(status, _, why)] = _runs(warehouse, "xdr_endpoints")
+    assert status == "SUCCESS"
+    assert why.startswith("skipped 4 raw row(s) from incomplete ingest run(s)")
+    assert f"run {failed} FAILED: 2 row(s)" in why
+    assert f"run {stopped} SUCCESS with a note (incomplete): 2 row(s)" in why
+    # Skipped for good: the watermark is past them, which is the point -- a
+    # half estate does not become whole by waiting.
+    assert _mark(warehouse, "xdr_endpoints") == T0 + timedelta(minutes=2, seconds=1)
+
+
+def test_a_snapshot_still_landing_is_held_back_and_copied_once_complete(
+    warehouse: Any,
+) -> None:
+    """Skipping a RUNNING run's rows and moving the watermark past them would
+    lose the snapshot the moment it completed. The mark has to wait for it."""
+    day = datetime.now(UTC).replace(microsecond=0) - timedelta(days=2)
+    done = _ingest_run(warehouse, "SUCCESS")
+    live = _ingest_run(warehouse, "RUNNING", started=timedelta(minutes=1))
+    _land_snapshot(warehouse, done, day, T0)
+    _land_snapshot(warehouse, live, day + timedelta(days=1), T0 + timedelta(minutes=1))
+
+    first = runner.execute(XDR_ENDPOINTS)
+
+    assert _snapshots(warehouse) == {day: 2}
+    assert _mark(warehouse, "xdr_endpoints") == T0 + timedelta(seconds=1)
+    assert f"held back below ingest run(s) [{live}] still RUNNING" in (first.note or "")
+
+    with warehouse.cursor() as cur:
+        cur.execute("UPDATE control.ingest_run SET status = 'SUCCESS' WHERE run_id = %s",
+                    (live,))
+    second = runner.execute(XDR_ENDPOINTS)
+
+    assert second.note is None
+    assert _snapshots(warehouse) == {day: 2, day + timedelta(days=1): 2}
+
+
+def test_an_abandoned_running_snapshot_does_not_hold_the_target_forever(
+    warehouse: Any,
+) -> None:
+    """A RUNNING ingest row older than the reap age belongs to a killed
+    process. Holding for it would freeze the mart; it is skipped and named."""
+    day = datetime.now(UTC).replace(microsecond=0) - timedelta(days=2)
+    dead = _ingest_run(warehouse, "RUNNING", started=timedelta(hours=3))
+    done = _ingest_run(warehouse, "SUCCESS")
+    _land_snapshot(warehouse, dead, day, T0)
+    _land_snapshot(warehouse, done, day + timedelta(days=1), T0 + timedelta(minutes=1))
+
+    result = runner.execute(XDR_ENDPOINTS)
+
+    assert _snapshots(warehouse) == {day + timedelta(days=1): 2}
+    assert f"run {dead} RUNNING, abandoned: 2 row(s)" in (result.note or "")

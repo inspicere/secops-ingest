@@ -11,9 +11,12 @@ from typing import Any
 
 import pytest
 
-from secops_ingest.sources import _cortex
-from secops_ingest.sources import xdr as xdr_mod
-from secops_ingest.sources.xdr import PAGE_CAP, XdrSource
+# Needs the 'http' extra: the Cortex connectors reach httpx through common.http.
+pytest.importorskip("httpx", reason="needs the 'http' extra")
+
+from secops_ingest.sources import _cortex  # noqa: E402
+from secops_ingest.sources import xdr as xdr_mod  # noqa: E402
+from secops_ingest.sources.xdr import PAGE_CAP, XdrSource  # noqa: E402
 
 
 def inc(iid: str, created: int, modified: int) -> dict[str, Any]:
@@ -243,3 +246,26 @@ def test_an_explicit_cursor_is_used_verbatim_and_not_floored(
     gte = [f for f in rec.bodies[0]["request_data"]["filters"]
            if f.get("operator") == "gte"]
     assert gte[0]["value"] == 1_791_000_000_000
+
+
+def test_a_departure_mid_scan_stops_before_the_page_that_may_be_shifted(
+    source: XdrSource,
+) -> None:
+    """V-09. An incident modified mid-scan leaves the pinned window, every row
+    behind it shifts forward one place, and the next offset skips one. Its
+    total_count falls between pages: the scan stops at the last contiguous
+    page and the run is reported incomplete, so it advances only over that."""
+    from secops_ingest.common import context
+
+    replies = iter([
+        {"reply": {"total_count": 5, "incidents": [inc("1", 1, 10), inc("2", 1, 11)]}},
+        {"reply": {"total_count": 4, "incidents": [inc("4", 1, 13), inc("5", 1, 14)]}},
+    ])
+    source._post = lambda creds, body: next(replies)  # type: ignore[method-assign]
+
+    ctx = context.RunContext(source="xdr")
+    with context.running(ctx):
+        got = [r["incident_id"] for r in source.fetch({}, "5")]
+
+    assert got == ["1", "2"], "the possibly-shifted page is not yielded"
+    assert ctx.partial and "5 -> 4" in ctx.partial[0]

@@ -14,16 +14,37 @@ The parser below only understands the shape of DDL that control_sql()
 emits -- one table per CREATE, plain lowercase identifiers, table-level
 constraints starting with a keyword -- and tests/schema pins both sides of
 that contract.
+
+The same check covers each transform target's RAW, FACT and ROLLUP tables
+(`verify_target_schema`). Those are created with CREATE TABLE IF NOT EXISTS,
+so a column a newer package adds is a no-op against an existing warehouse, and
+the target then fails every run with an UndefinedColumn traceback and a
+frozen mart. Two different remedies apply, and the report says which: a
+column the target's DDL also adds with `ALTER TABLE ... ADD COLUMN IF NOT
+EXISTS` is fixed by re-applying the package's DDL; a column only its CREATE
+TABLE declares has no migration at all, which is a bug in the package (or the
+pack) that shipped it, not something re-applying can fix.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any
+from collections.abc import Iterable, Sequence
+from typing import TYPE_CHECKING, Any
 
-from ..schema import control_sql
+from ..schema import control_sql, raw_table_sql
 
-__all__ = ["ControlSchemaDrift", "expected_control_columns", "verify_control_schema"]
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ..transform.base import Target
+
+__all__ = [
+    "ControlSchemaDrift",
+    "TargetSchemaDrift",
+    "expected_control_columns",
+    "expected_target_columns",
+    "verify_control_schema",
+    "verify_target_schema",
+]
 
 #: Statement heads that introduce a table-level constraint (or a clause of
 #: one) inside a CREATE TABLE body, as opposed to a column declaration. The
@@ -140,3 +161,121 @@ def verify_control_schema(conn: Any) -> None:
             + ". "
             + REMEDY
         )
+
+
+class TargetSchemaDrift(RuntimeError):
+    """A target's raw, fact or rollup table lacks columns this package writes."""
+
+
+#: CREATE TABLE in a target's DDL: indented, optionally schema-qualified, body
+#: closed by a line starting with ")" (which may carry PARTITION BY ...).
+_TARGET_CREATE_RE = re.compile(
+    r"^\s*CREATE TABLE IF NOT EXISTS ([a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)?)\s*\(\s*\n"
+    r"(.*?)^\s*\)",
+    re.MULTILINE | re.DOTALL,
+)
+_TARGET_ALTER_RE = re.compile(
+    r"^\s*ALTER TABLE ([a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)?) ADD COLUMN IF NOT EXISTS "
+    r"([a-z_][a-z0-9_]*)",
+    re.MULTILINE,
+)
+
+
+def _parse_ddl(ddl: str) -> tuple[dict[str, list[str]], dict[str, set[str]]]:
+    """({table: columns}, {table: columns that have a migration}) from DDL text."""
+    columns: dict[str, list[str]] = {}
+    migrated: dict[str, set[str]] = {}
+    for match in _TARGET_CREATE_RE.finditer(ddl):
+        declared = columns.setdefault(match.group(1), [])
+        for column in _columns_from_create_body(match.group(2)):
+            if column not in declared:
+                declared.append(column)
+    for table, column in _TARGET_ALTER_RE.findall(ddl):
+        declared = columns.setdefault(table, [])
+        if column not in declared:
+            declared.append(column)
+        migrated.setdefault(table, set()).add(column)
+    return columns, migrated
+
+
+def expected_target_columns(
+    targets: Iterable[Target],
+) -> tuple[dict[str, list[str]], dict[str, set[str]]]:
+    """Every table the targets read or write, its columns, and which have a migration.
+
+    Raises RuntimeError -- a package bug, not drift -- when a target declares
+    DDL for its fact or rollup table that this parser cannot read, for the same
+    reason expected_control_columns() does.
+    """
+    columns: dict[str, list[str]] = {}
+    migrated: dict[str, set[str]] = {}
+    for target in targets:
+        schema, _, table = target.raw_table.partition(".")
+        ddl = [raw_table_sql(schema, table)] if table else []
+        ddl += [d for d in (target.fact_ddl, target.rollup_ddl) if d]
+        for text in ddl:
+            found, moves = _parse_ddl(text)
+            for name, cols in found.items():
+                declared = columns.setdefault(name, [])
+                declared.extend(c for c in cols if c not in declared)
+            for name, moved in moves.items():
+                migrated.setdefault(name, set()).update(moved)
+        for created, ddl_text in ((target.fact_table, target.fact_ddl),
+                                  (target.rollup_table, target.rollup_ddl)):
+            if ddl_text and created and not columns.get(created):
+                raise RuntimeError(
+                    f"target {target.name}: could not read the columns of {created} from "
+                    "its DDL; its shape has changed in a way schema_check no longer "
+                    "understands"
+                )
+    return columns, migrated
+
+
+def verify_target_schema(conn: Any, targets: Sequence[Target]) -> None:
+    """Raise TargetSchemaDrift if any table the targets touch is behind their DDL.
+
+    Columns are read from pg_attribute through to_regclass(), not from
+    information_schema: to_regclass resolves an unqualified mart table exactly
+    the way the target's own SQL will (search_path), and pg_attribute is
+    readable regardless of privileges, so a role that may only SELECT a table
+    still sees all of its columns.
+
+    As with the control check, a warehouse AHEAD of the package is fine.
+    """
+    expected, migrated = expected_target_columns(targets)
+    problems: list[str] = []
+    needs_package_fix: list[str] = []
+    with conn.cursor() as cur:
+        for table, columns in expected.items():
+            cur.execute(
+                "SELECT a.attname FROM pg_attribute a "
+                "WHERE a.attrelid = to_regclass(%s) AND a.attnum > 0 AND NOT a.attisdropped",
+                (table,),
+            )
+            present = {row[0] for row in cur.fetchall()}
+            if not present:
+                problems.append(f"{table} does not exist")
+                continue
+            missing = [c for c in columns if c not in present]
+            if not missing:
+                continue
+            problems.append(f"{table} is missing column(s): {', '.join(missing)}")
+            unmigrated = [c for c in missing if c not in migrated.get(table, set())]
+            if unmigrated:
+                needs_package_fix.append(f"{table} ({', '.join(unmigrated)})")
+    if not problems:
+        return
+    message = "warehouse tables are behind this package: " + "; ".join(problems) + ". "
+    if needs_package_fix:
+        message += (
+            "No migration ships for "
+            + ", ".join(needs_package_fix)
+            + ": the target's DDL needs an ALTER TABLE ... ADD COLUMN IF NOT EXISTS "
+            "for each (a package bug), or the column must be added by hand. "
+            "Anything else: "
+        )
+    message += (
+        "apply the package's DDL as the schema owner: "
+        'python -m secops_ingest.schema | psql "$SECOPS_DB_DSN"'
+    )
+    raise TargetSchemaDrift(message)

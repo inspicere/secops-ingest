@@ -65,7 +65,7 @@ from typing import Any
 
 from ..common.http import with_retries
 from ..common.payload import to_json
-from ._cortex import CortexCreds, env_int, headers, resolve
+from ._cortex import CortexCreds, env_int, headers, int_or_none, resolve, window_shrank
 
 log = logging.getLogger(__name__)
 
@@ -138,11 +138,17 @@ class XsoarSource:
         a row rather than repeating one. Repeating is free -- landing is an
         upsert -- and skipping is data loss, so the bound exists to make the
         error fall on the harmless side.
+
+        The bound stops arrivals, not departures: an incident modified mid-scan
+        leaves the window and shifts later rows forward just the same. `total`
+        can then only fall, so a fall between pages stops the scan at the last
+        contiguous page and reports the run incomplete, exactly as xdr.py does.
         """
         now = self._now()
         to_date = now.strftime(QUERY_TIME_FMT)
         from_date = _floor_to_second(str(cursor)) if cursor else self._horizon(now)
         page = 0
+        total: int | None = None
         while True:
             body: dict[str, Any] = {
                 "filter": {
@@ -170,6 +176,9 @@ class XsoarSource:
                      page, len(rows), time.monotonic() - started, payload.get("total", "?"))
             if not rows:
                 return
+            if window_shrank(total, payload.get("total"), page * self.page_size):
+                return
+            total = int_or_none(payload.get("total"))
             yield from rows
             if len(rows) < self.page_size:
                 return

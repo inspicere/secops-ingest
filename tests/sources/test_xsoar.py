@@ -14,9 +14,12 @@ from typing import Any
 
 import pytest
 
-from secops_ingest.sources import _cortex
-from secops_ingest.sources import xsoar as xsoar_mod
-from secops_ingest.sources.xsoar import XsoarSource
+# Needs the 'http' extra: the Cortex connectors reach httpx through common.http.
+pytest.importorskip("httpx", reason="needs the 'http' extra")
+
+from secops_ingest.sources import _cortex  # noqa: E402
+from secops_ingest.sources import xsoar as xsoar_mod  # noqa: E402
+from secops_ingest.sources.xsoar import XsoarSource  # noqa: E402
 
 
 def incident(iid: str, modified: str, created: str = "2026-01-02T03:04:05.000Z",
@@ -270,3 +273,26 @@ def test_a_subsecond_cursor_is_floored_not_rejected(source: XsoarSource) -> None
     q = rec.bodies[0]["filter"]["query"]
     assert "2026-10-01T12:34:56Z" in q, q
     assert "789" not in q
+
+
+def test_a_departure_mid_scan_stops_before_the_page_that_may_be_shifted(
+    source: XsoarSource,
+) -> None:
+    """V-09, as in test_xdr: `total` can only fall inside a pinned window, and
+    only because a row left it and shifted the rest forward."""
+    from secops_ingest.common import context
+
+    replies = iter([
+        {"total": 5, "data": [incident("1", "2026-01-01T00:00:01Z"),
+                              incident("2", "2026-01-01T00:00:02Z")]},
+        {"total": 4, "data": [incident("4", "2026-01-01T00:00:04Z"),
+                              incident("5", "2026-01-01T00:00:05Z")]},
+    ])
+    source._post = lambda creds, body: next(replies)  # type: ignore[method-assign]
+
+    ctx = context.RunContext(source="xsoar")
+    with context.running(ctx):
+        got = [r["id"] for r in source.fetch({}, "2026-01-01T00:00:00Z")]
+
+    assert got == ["1", "2"]
+    assert ctx.partial and "5 -> 4" in ctx.partial[0]

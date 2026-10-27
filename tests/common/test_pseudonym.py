@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+
 import pytest
 
 from secops_ingest.common.pseudonym import (
@@ -57,3 +60,15 @@ def test_short_salt_rejected() -> None:
 
 def test_normalise_strips_internal_whitespace() -> None:
     assert normalise(" Alice .Smith@Example.COM ") == "alice.smith@example.com"
+
+
+def test_the_key_is_an_hmac_keyed_by_the_salt() -> None:
+    # Pinned, because changing the construction orphans every stored key just
+    # as changing the salt does.
+    expected = hmac.new(
+        SALT.encode(), b"alice.smith@example.com", hashlib.sha256
+    ).hexdigest()
+    assert subject_key(" Alice.Smith@example.com ", SALT) == expected
+    assert subject_key("alice.smith@example.com", SALT) != hashlib.sha256(
+        ("alice.smith@example.com" + SALT).encode()
+    ).hexdigest()

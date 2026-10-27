@@ -64,3 +64,32 @@ def matches(version: str, spec: str) -> bool:
         if not _OPS[found.group(1)](left, right):
             return False
     return True
+
+
+def describe_drift(stored: str, installed: str) -> str | None:
+    """One line saying how the warehouse's recorded pack version differs from
+    the installed one, or None when they agree.
+
+    This is the comparison `control.pack.version` exists for. An upgrade that
+    pip resolved to nothing exits 0 and looks like success; the only trace it
+    leaves is that the version recorded at the last `enable` and the version
+    actually installed now disagree -- or, after a re-enable, that they agree on
+    the OLD version, which `pack list` shows plainly beside the installed one.
+    Versions outside the numeric grammar are still compared, as text, because a
+    difference is worth reporting even when it cannot be ordered.
+    """
+    if stored == installed:
+        return None
+    try:
+        older = parse_version(stored) < parse_version(installed)
+    except InvalidVersionSpec:
+        return f"warehouse records {stored}, installed is {installed}"
+    if older:
+        return (
+            f"warehouse records {stored}, installed is {installed}: "
+            "re-run `enable` to record the upgrade"
+        )
+    return (
+        f"warehouse records {stored}, installed is OLDER at {installed}: "
+        "this host did not get the upgrade another host recorded"
+    )

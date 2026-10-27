@@ -5,10 +5,77 @@ Install with:  pip install secops-ingest[vault]
 
 from __future__ import annotations
 
+import importlib
+import ipaddress
 import os
 from typing import Any
+from urllib.parse import urlsplit
 
 from .base import SecretError, SecretNotFound, SecretProvider
+
+
+def _require_https(url: str) -> None:
+    """Refuse a cleartext VAULT_ADDR unless it is this host.
+
+    The token and every secret read travel over this connection. Loopback is
+    allowed because a local Vault Agent listener on 127.0.0.1 is the usual way
+    to reach Vault without a token in the unit, and that traffic never leaves
+    the host. There is no override for anything else, for the same reason
+    delinea_client has none: a flag that can be set by mistake defeats it.
+    """
+    parts = urlsplit(url)
+    if parts.scheme.lower() == "https":
+        return
+    host = (parts.hostname or "").lower()
+    try:
+        loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if parts.scheme.lower() == "http" and loopback:
+        return
+    raise SecretError(
+        "VAULT_ADDR must use https:// unless it is a loopback address "
+        f"(the token is sent to it); got {url!r}"
+    )
+
+
+def _classify(name: str, exc: Exception) -> SecretError:
+    """Turn an hvac or transport failure into an error that says what failed.
+
+    Every failure used to read as "secret not found", so an expired token, a
+    sealed Vault or an unreachable server sent the operator looking for a
+    missing KV entry while every source was down. Only a missing path is
+    SecretNotFound now. The messages carry the logical name and the kind of
+    failure, never the path or the server's error text, which can describe the
+    store's layout.
+    """
+    try:
+        from hvac import exceptions as hv
+    except ImportError:  # pragma: no cover - a live client implies hvac
+        hv = None
+    if hv is not None:
+        if isinstance(exc, hv.InvalidPath):
+            # Also what raise_on_deleted_version=True raises for a deleted version.
+            return SecretNotFound(name)
+        if isinstance(exc, (hv.Forbidden, hv.Unauthorized)):
+            return SecretError(
+                f"vault denied access reading {name} (token expired, revoked, or "
+                "lacking a policy for this path?)"
+            )
+        if isinstance(exc, (hv.VaultDown, hv.VaultNotInitialized)):
+            return SecretError(f"vault is sealed or not initialised; could not read {name}")
+    try:
+        # Imported by name: requests arrives with hvac, not with this package,
+        # so a static import would fail type-checking in the default install.
+        requests: Any = importlib.import_module("requests")
+    except ImportError:  # pragma: no cover - hvac depends on requests
+        requests = None
+    if requests is not None:
+        if isinstance(exc, requests.exceptions.SSLError):
+            return SecretError(f"vault TLS verification failed reading {name}")
+        if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+            return SecretError(f"vault unreachable reading {name}")
+    return SecretError(f"vault read failed for {name} ({type(exc).__name__})")
 
 
 class VaultSecretProvider(SecretProvider):
@@ -46,6 +113,7 @@ class VaultSecretProvider(SecretProvider):
         self._prefix = path_prefix or os.environ.get("SECOPS_VAULT_PREFIX", "")
         if not self._url:
             raise SecretError("Vault provider requires VAULT_ADDR")
+        _require_https(self._url)
         self._client: Any = None
 
     def _get_client(self) -> Any:
@@ -73,7 +141,9 @@ class VaultSecretProvider(SecretProvider):
             )
             data = resp["data"]["data"]
         except Exception as exc:
-            raise SecretNotFound(name) from exc
+            raise _classify(name, exc) from exc
+        if not isinstance(data, dict):
+            raise SecretError(f"vault response for {name} has no data block; is the mount KV v2?")
         if field:
             if field not in data:
                 # The secret exists but has no such field. Reported as the

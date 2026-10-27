@@ -78,3 +78,19 @@ def test_scrub_removes_registered_secret_from_error_text() -> None:
 def test_scrub_ignores_short_values() -> None:
     register_secret("abc")
     assert scrub("abc stays") == "abc stays"
+
+
+def test_a_naive_timestamp_is_ordered_as_utc_rather_than_failing_the_run() -> None:
+    """V-45. One vendor record without an offset among records with one raised
+    TypeError out of newer() and failed the run -- every run, until the vendor's
+    data changed. Read as UTC, it orders."""
+    assert _newer("2026-10-01T12:00:01", "2026-10-01T12:00:00Z") is True
+    assert _newer("2026-10-01T11:59:59", "2026-10-01T12:00:00+00:00") is False
+    assert _newer("2026-10-01T12:00:00", "2026-10-01T13:00:00+02:00") is True
+
+
+def test_a_naive_datetime_object_is_also_read_as_utc() -> None:
+    from datetime import UTC, datetime
+
+    naive = datetime(2026, 10, 1, 12, 0, 0)
+    assert _comparable(naive) == datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)

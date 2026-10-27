@@ -36,7 +36,7 @@ from datetime import datetime, timedelta
 from functools import partial
 from typing import Any
 
-from ..common.http import with_retries
+from ..common.http import RetryableResponse, with_retries
 from ..common.payload import to_json
 from ..secrets import get_provider
 
@@ -186,7 +186,22 @@ class WazuhSource:
             timeout=60.0,
         )
         resp.raise_for_status()
-        return dict(resp.json())
+        payload = dict(resp.json())
+        # A 200 is not a complete answer. OpenSearch serves what the healthy
+        # shards hold when others fail or the search times out, and says so
+        # only in the body. Landing that page and moving search_after past it
+        # advances this ORDERED source's watermark beyond alerts that were
+        # never returned -- further than the lag overlap ever looks back. So a
+        # partial answer is retried like a 503 and, if it persists, fails the
+        # run with the watermark where it was.
+        shards = payload.get("_shards") or {}
+        failed = shards.get("failed") or 0
+        if payload.get("timed_out") or (isinstance(failed, int) and failed > 0):
+            raise RetryableResponse(
+                f"partial result: {failed} of {shards.get('total', '?')} shard(s) "
+                f"failed, timed_out={bool(payload.get('timed_out'))}"
+            )
+        return payload
 
     def _tls_verify(self) -> Any:
         bundle = os.environ.get("SECOPS_WAZUH_CA_BUNDLE")

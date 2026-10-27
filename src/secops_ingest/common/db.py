@@ -119,6 +119,38 @@ def start_run(conn: psycopg.Connection, source: str, *, posture: str | None = No
     return int(run_id)
 
 
+def reap_abandoned(conn: psycopg.Connection, source: str, older_than_sec: int) -> int:
+    """Close this source's RUNNING rows that no live process can still own.
+
+    A run killed by SIGKILL, or whose connection died before it could write
+    FAILED, leaves its row RUNNING forever. Nothing counting FAILED rows sees
+    it, and the source reads as "still running" indefinitely. A row older than
+    the unit's cap cannot belong to a live run -- systemd would have killed it
+    -- so it is marked FAILED with a note saying what happened, at the start
+    of the next run of the same source.
+
+    Scoped to one source so a run never touches another source's ledger.
+    Returns how many rows were closed.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE control.ingest_run SET status = 'FAILED', "
+            "ended_at = clock_timestamp(), error_summary = %s "
+            "WHERE source = %s AND status = 'RUNNING' "
+            "AND started_at < clock_timestamp() - make_interval(secs => %s::double precision)",
+            (
+                f"abandoned: still RUNNING more than {older_than_sec}s after it "
+                "started, past the unit's cap; the process was killed or lost "
+                "its connection before recording an outcome (closed by the next run)",
+                source,
+                older_than_sec,
+            ),
+        )
+        closed = cur.rowcount
+    conn.commit()
+    return int(closed or 0)
+
+
 def finish_run(
     conn: psycopg.Connection,
     run_id: int,
@@ -172,6 +204,13 @@ def get_watermark(conn: psycopg.Connection, source: str) -> str | None:
             (source,),
         )
         row = cur.fetchone()
+    # Ends the transaction this read opened. The caller goes on to fetch for up
+    # to half an hour before its first write, and without this the session sits
+    # "idle in transaction" for all of it: a warehouse that sets
+    # idle_in_transaction_session_timeout kills the session mid-run (so the
+    # FAILED row cannot be written either), and one that does not holds back
+    # vacuum on the raw tables for the length of every scan.
+    conn.commit()
     return row[0] if row else None
 
 
@@ -208,18 +247,31 @@ def upsert_many(
 
     cols = list(columns)
     updatable = [c for c in cols if c not in key]
+    sets: list[sql.Composable] = [
+        sql.SQL("{c} = EXCLUDED.{c}").format(c=sql.Identifier(c)) for c in updatable
+    ]
+    if "payload" in cols and "_ingested_at" not in cols:
+        # A re-landed record must look NEW to the transforms when it changed.
+        # `_ingested_at` is a column DEFAULT, so it is set on INSERT only: a
+        # finding mitigated after its first landing kept its first-landing
+        # timestamp, and every transform -- which selects `_ingested_at >
+        # watermark` -- never saw the mitigation. Moved only when the payload
+        # actually differs, so a full re-read (KSAT every run, Wazuh's overlap
+        # window) does not push unchanged rows through the transform again.
+        sets.append(sql.SQL(
+            "_ingested_at = CASE WHEN t.payload IS DISTINCT FROM EXCLUDED.payload "
+            "THEN now() ELSE t._ingested_at END"
+        ))
 
     stmt = sql.SQL(
-        "INSERT INTO {table} ({cols}) VALUES ({ph}) "
+        "INSERT INTO {table} AS t ({cols}) VALUES ({ph}) "
         "ON CONFLICT ({key}) DO UPDATE SET {sets}"
     ).format(
         table=_split_ident(table),
         cols=sql.SQL(", ").join(map(sql.Identifier, cols)),
         ph=sql.SQL(", ").join(sql.Placeholder() * len(cols)),
         key=sql.SQL(", ").join(map(sql.Identifier, key)),
-        sets=sql.SQL(", ").join(
-            sql.SQL("{c} = EXCLUDED.{c}").format(c=sql.Identifier(c)) for c in updatable
-        ),
+        sets=sql.SQL(", ").join(sets),
     )
 
     with conn.cursor() as cur:

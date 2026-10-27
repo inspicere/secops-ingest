@@ -54,6 +54,23 @@ LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# The worker needs no capabilities at all, and must not be able to create
+# namespaces, see other users' processes, or make the syscalls a connector
+# never makes. @system-service is systemd's own baseline for an ordinary daemon;
+# the deny list removes the parts of it a network client has no use for.
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelLogs=true
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @cpu-emulation @obsolete
+SystemCallErrorNumber=EPERM
+# Anything the worker writes (a cache, a state file) is private to it.
+UMask=0077
 # ProtectSystem=strict makes everything read-only except what is listed here.
 ReadWritePaths=/var/lib/secops
 

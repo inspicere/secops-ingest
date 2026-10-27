@@ -307,3 +307,64 @@ def test_every_connector_signs_each_request_freshly(
     assert seen[0]["x-xdr-nonce"] != seen[1]["x-xdr-nonce"], (
         f"{modname} reused the nonce from authenticate()")
     assert "k" * 128 not in "".join(seen[0].values())
+
+
+# -- the stored URL's scheme (V-14) -------------------------------------------
+#
+# Standard auth sends the raw API key in a header, so an `http://` URL stored
+# in Vault used to send it in cleartext on every request, silently: the scheme
+# was kept as stored.
+
+def _with_url(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+    p = StubProvider({"xdr.api_key": "k" * 64, "xdr.api_key_id": "1", "xdr.url": url})
+    monkeypatch.setattr(_cortex, "get_provider", lambda: p)
+
+
+def test_an_http_url_is_refused_without_naming_the_tenant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SECOPS_XDR_ALLOW_HTTP", raising=False)
+    _with_url(monkeypatch, "http://tenant.example.com")
+    with pytest.raises(ValueError, match="SECOPS_XDR_ALLOW_HTTP") as raised:
+        _cortex.resolve("xdr", "/p")
+    assert "tenant.example.com" not in str(raised.value)
+
+
+def test_an_http_url_is_accepted_only_when_opted_in_and_says_so_every_run(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("SECOPS_XDR_ALLOW_HTTP", "1")
+    _with_url(monkeypatch, "http://tenant.example.com")
+    with caplog.at_level("WARNING"):
+        assert _cortex.resolve("xdr", "/p").base.startswith("http://api-")
+    assert "CLEARTEXT" in caplog.text
+
+
+@pytest.mark.parametrize("url", ["ftp://tenant.example.com", "ws://tenant.example.com"])
+def test_any_other_scheme_is_refused_even_when_http_is_allowed(
+    monkeypatch: pytest.MonkeyPatch, url: str,
+) -> None:
+    monkeypatch.setenv("SECOPS_XDR_ALLOW_HTTP", "1")
+    _with_url(monkeypatch, url)
+    with pytest.raises(ValueError):
+        _cortex.resolve("xdr", "/p")
+
+
+def test_a_schemeless_url_is_https(monkeypatch: pytest.MonkeyPatch) -> None:
+    _with_url(monkeypatch, "tenant.example.com")
+    assert _cortex.resolve("xdr", "/p").base == "https://api-tenant.example.com/p"
+
+
+# -- a pinned window that shrinks mid-scan (V-09) -------------------------------
+
+def test_a_window_that_shrank_between_pages_is_reported_incomplete() -> None:
+    from secops_ingest.common import context
+
+    ctx = context.RunContext(source="xdr")
+    with context.running(ctx):
+        assert _cortex.window_shrank(None, 300, 0) is False      # first page
+        assert _cortex.window_shrank(300, 300, 100) is False     # unchanged
+        assert _cortex.window_shrank(300, 301, 100) is False     # grew: an arrival appends
+        assert _cortex.window_shrank(300, "?", 100) is False     # unknown: no claim
+        assert _cortex.window_shrank(300, 299, 200) is True
+    assert len(ctx.partial) == 1 and "300 -> 299" in ctx.partial[0]
