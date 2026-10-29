@@ -43,6 +43,13 @@ applied by something else -- a generated schema file converged by a
 deployment tool -- `enable --state-only` records the state without applying
 any DDL, so the owner credential is used for one INSERT and nothing else.
 
+`enable` and `disable` also mirror the state onto each of the pack's sources
+in `control.source_state` (audit V-18), which is what lets a freshness card say
+DISABLED instead of showing a source that merely went quiet. That write comes
+after `control.pack` has committed and is reported, not fatal, when it fails: a
+warehouse that predates the table still gets the pack disabled, which is the
+part that stops the timer.
+
 `list` also exits non-zero when discovery had to skip a pack for a reason an
 operator must fix (two distributions claiming one name, a distribution outside
 `SECOPS_ALLOWED_PACKS`), and marks a pack whose recorded version differs from
@@ -295,6 +302,34 @@ def _privilege_hint(exc: Exception) -> str:
     return ""
 
 
+def _mirror_source_states(conn: psycopg.Connection, pack: Pack, pack_state: str) -> None:
+    """Mirror the pack's new state onto its sources; dim, never fatal.
+
+    Runs after control.pack has committed, so the decision that actually stops
+    or starts the worker is already made. Failing here (a warehouse from before
+    control.source_state, say) leaves the per-source trace missing, which is
+    worth a line on stderr and not worth undoing a disable over.
+    """
+    import psycopg
+
+    from . import state as pack_state_mod
+
+    # An ACTIVE row carries no reason; who enabled it and when is the trace.
+    reason = f"pack {pack.name} disabled" if pack_state == "DISABLED" else None
+    try:
+        pack_state_mod.set_source_states(conn, sorted(pack.sources), pack_state, reason)
+    except psycopg.Error as exc:
+        conn.rollback()
+        detail = (str(exc).strip().splitlines() or ["no detail"])[0]
+        print(
+            f"[!] pack {pack.name!r} is {pack_state} in control.pack, but its sources "
+            f"were not marked in control.source_state ({type(exc).__name__}: {detail}); "
+            "a freshness card will not show this until the generated "
+            "schema is applied and this command is re-run.",
+            file=sys.stderr,
+        )
+
+
 def _cmd_enable(name: str, state_only: bool = False) -> int:
     # Resolved from the registry before anything touches a connection: the
     # unknown-pack failure must be about the name, not about a DSN that
@@ -355,6 +390,8 @@ def _cmd_enable(name: str, state_only: bool = False) -> int:
             pack_state.apply_ddl(conn, control_sql())
             pack_state.apply_ddl(conn, target_ddl)
         pack_state.set_state(conn, name, pack.version, "ENABLED")
+        # Catches its own failures: control.pack has committed by now.
+        _mirror_source_states(conn, pack, "ENABLED")
     except psycopg.Error as exc:
         print(f"connected, but could not enable pack {name!r}: {exc}{_privilege_hint(exc)}",
               file=sys.stderr)
@@ -397,6 +434,7 @@ def _cmd_disable(name: str) -> int:
 
             pack_state.apply_ddl(conn, control_sql())
             pack_state.set_state(conn, name, pack.version, "DISABLED")
+            _mirror_source_states(conn, pack, "DISABLED")
             return 0
 
         existing = pack_state.get_state(conn, name)

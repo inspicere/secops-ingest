@@ -29,10 +29,12 @@ def test_state_only_records_enabled_without_applying_ddl(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The generated schema file already applied the DDL; the owner credential
-    is then needed for one INSERT, not for CREATE in every raw schema."""
+    is then needed for the state rows (the pack's, and its sources' in
+    control.source_state), not for CREATE in every raw schema."""
     psycopg = pytest.importorskip("psycopg", reason="needs the 'postgres' extra")
     applied: list[str] = []
     recorded: list[tuple[str, str]] = []
+    mirrored: list[str] = []
     monkeypatch.setattr(psycopg, "connect", lambda dsn: _FakeConnection())
     monkeypatch.setattr(
         "secops_ingest.packs.state.apply_ddl", lambda conn, text: applied.append(text)
@@ -41,17 +43,25 @@ def test_state_only_records_enabled_without_applying_ddl(
         "secops_ingest.packs.state.set_state",
         lambda conn, name, version, state: recorded.append((name, state)),
     )
+    monkeypatch.setattr(
+        "secops_ingest.packs.state.set_source_states",
+        lambda conn, sources, state, reason: mirrored.append(state),
+    )
     monkeypatch.setenv("SECOPS_DB_DSN", "postgresql://reachable/db")
 
     assert main(["enable", "builtin", "--state-only"]) == 0
     assert applied == []
     assert recorded == [("builtin", "ENABLED")]
+    assert mirrored == ["ENABLED"]
 
 
 def test_enable_without_state_only_still_applies_ddl(monkeypatch: pytest.MonkeyPatch) -> None:
     psycopg = pytest.importorskip("psycopg", reason="needs the 'postgres' extra")
     applied: list[str] = []
     monkeypatch.setattr(psycopg, "connect", lambda dsn: _FakeConnection())
+    monkeypatch.setattr(
+        "secops_ingest.packs.state.set_source_states", lambda conn, sources, state, reason: None
+    )
     monkeypatch.setattr(
         "secops_ingest.packs.state.apply_ddl", lambda conn, text: applied.append(text)
     )

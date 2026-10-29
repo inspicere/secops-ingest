@@ -642,3 +642,38 @@ def test_disable_unregistered_with_no_row_names_the_pack(
     assert main(["disable", "nosuchpack"]) == 1
     err = capsys.readouterr().err
     assert "nosuchpack" in err
+
+
+def test_disable_still_disables_when_source_state_cannot_be_written(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """V-18: the per-source trace is dim when it fails, never fatal. The pack
+    row is what stops the worker, and it has committed by then."""
+    psycopg = pytest.importorskip("psycopg", reason="needs the 'postgres' extra")
+
+    class _FakeConnection:
+        def close(self) -> None:
+            return None
+
+        def rollback(self) -> None:
+            return None
+
+    recorded: list[str] = []
+
+    def _no_table(*args: object, **kwargs: object) -> None:
+        raise psycopg.errors.UndefinedTable('relation "control.source_state" does not exist')
+
+    monkeypatch.setattr(psycopg, "connect", lambda dsn: _FakeConnection())
+    monkeypatch.setattr("secops_ingest.packs.state.apply_ddl", lambda conn, sql: None)
+    monkeypatch.setattr(
+        "secops_ingest.packs.state.set_state",
+        lambda conn, name, version, state: recorded.append(state),
+    )
+    monkeypatch.setattr("secops_ingest.packs.state.set_source_states", _no_table)
+    monkeypatch.setenv("SECOPS_DB_DSN", "postgresql://reachable/db")
+
+    assert main(["disable", "builtin"]) == 0
+    assert recorded == ["DISABLED"]
+    err = capsys.readouterr().err
+    assert "is DISABLED in control.pack, but its sources were not marked" in err
+    assert "UndefinedTable" in err

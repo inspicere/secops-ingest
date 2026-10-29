@@ -15,6 +15,10 @@ Design notes:
   * `set_state` upserts on `name` and preserves history: moving to ENABLED
     stamps `enabled_at` and leaves `disabled_at`; moving to DISABLED is the
     mirror image. Nothing here ever clears either timestamp.
+  * `set_source_states` mirrors a pack's state onto its sources' rows in
+    `control.source_state` (origin 'pack'), so a source stopped by a disable
+    is visible per source, beside the deployment's hold-outs. It raises on a
+    missing table like any other write; the caller decides that this is dim.
 
 Nothing outside this module may import it at module scope: `packs/registry.py`,
 `packs/model.py` and the `list` path in `packs/__main__.py` must keep working
@@ -23,6 +27,7 @@ with no `psycopg` installed.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -140,6 +145,37 @@ def set_state(conn: psycopg.Connection, name: str, version: str, state: str) -> 
             ),
             (name, version, state),
         )
+    conn.commit()
+
+
+#: control.pack's vocabulary onto control.source_state's, for origin 'pack'.
+_SOURCE_STATE_FOR = {"ENABLED": "ACTIVE", "DISABLED": "DISABLED"}
+
+
+def set_source_states(
+    conn: psycopg.Connection, sources: Sequence[str], pack_state: str, reason: str | None
+) -> None:
+    """Record `pack_state` (ENABLED/DISABLED) on each source's 'pack' row.
+
+    A row whose state and reason already match is left alone, so re-running
+    `disable` keeps the time it was first disabled -- changed_at means when the
+    state changed, not when somebody last said so. changed_by is the login
+    (session_user), the same thing the deployment's hold-out functions record.
+    """
+    state = _SOURCE_STATE_FOR[validate_state(pack_state)]
+    with conn.cursor() as cur:
+        for source in sources:
+            cur.execute(
+                "INSERT INTO control.source_state AS s "
+                "(source, origin, state, reason, changed_at, changed_by) "
+                "VALUES (%s, 'pack', %s, %s, now(), session_user) "
+                "ON CONFLICT (source, origin) DO UPDATE SET "
+                "state = EXCLUDED.state, reason = EXCLUDED.reason, "
+                "changed_at = now(), changed_by = session_user "
+                "WHERE s.state <> EXCLUDED.state "
+                "OR s.reason IS DISTINCT FROM EXCLUDED.reason",
+                (source, state, reason),
+            )
     conn.commit()
 
 

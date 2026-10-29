@@ -261,7 +261,9 @@ file converged by a deployment tool -- so the owner credential is used for one `
 nothing more.
 
 `enable` and `disable` are both safe to re-run: `enable` is idempotent DDL, and `disable` just
-converges the pack's stored state to `DISABLED`, whether or not it was ever enabled.
+converges the pack's stored state to `DISABLED`, whether or not it was ever enabled. Both also
+mark each of the pack's sources in `control.source_state`, so a freshness card can say a source
+is DISABLED rather than show it going quiet (see [Warehouse schema](#warehouse-schema)).
 
 `drop` is the one irreversible verb -- "disable, never drop" is the rule everywhere else. It
 requires the pack to already be `disable`d: a still-`ENABLED` pack has a timer that could fire at
@@ -370,8 +372,8 @@ The roles:
 
 | flag | may write | may read |
 |---|---|---|
-| `--ingest-role` | every raw schema not given to a remote writer; `control.ingest_run`, `control.ingest_watermark` | all of `control` |
-| `--remote-ingest-role ROLE:SCHEMA` | that one raw schema; its own ingest runs and watermarks | all of `control` |
+| `--ingest-role` | every raw schema not given to a remote writer; `control.ingest_run`, `control.ingest_watermark`; its own hold-outs, through `control.hold_out_source()` / `release_source()` | all of `control` |
+| `--remote-ingest-role ROLE:SCHEMA` | that one raw schema; its own ingest runs, watermarks and hold-outs | all of `control` |
 | `--transform-role` | the mart; `control.transform_run`, `_watermark`, `_coverage` | every raw schema, all of `control` |
 | `--read-role` | nothing | the mart, all of `control`, `control.partition_health()` |
 | `--monitor-role` | nothing | all of `control`, `control.partition_health()` |
@@ -420,6 +422,31 @@ holds and how far ahead each parent's months reach: alert on `default_rows > 0`
 re-derivation buffer, so dropping a partition is irreversible. Nothing may drop a
 period without a positive row in `control.transform_coverage` recording that the
 period's reporting rows exist.
+
+### Freshness and hold-outs
+
+`SELECT * FROM control.source_freshness WHERE source = 'defectdojo'` is a freshness card in one
+query. Per source it gives `as_of`, the **older** of the last successful ingest and the last
+successful transform of every target reading that source's raw table, because a transform that
+keeps succeeding over raw nobody refreshes reports SUCCESS with 0 rows. "Never" is NULL, not
+hidden by `least()`: `never_succeeded` names whatever has no successful run at all. `state` says
+whether the source is `ACTIVE`, `DISABLED` (its pack is) or `HELD_OUT` (the deployment does not
+schedule it), with the reason, when, and which login recorded it. The view knows which targets
+read which source only from the connectors, so it is emitted with `--all-sources`.
+
+A deployment records the sources it holds out with the worker's own DSN:
+
+    python -m secops_ingest.holdout sync xdr_alerts --managed wazuh xdr xdr_alerts \
+        --reason "listed in ingest_disabled_sources"
+    python -m secops_ingest.holdout list
+
+`sync` holds out exactly the sources named and releases the same login's other hold-outs among
+`--managed`, the sources this host schedules or holds out. Pass `--managed` whenever two hosts
+share a login, or each converge undoes the other's. The ingest role writes `control.source_state` only through two `SECURITY DEFINER`
+functions that touch nothing but the deployment's rows, so it cannot clear a pack's `DISABLED`.
+Exit code 3 means the warehouse predates these objects: nothing was recorded, and the run should
+be reported as dim, not failed. The workers' startup drift check treats the same objects the
+same way: missing, they are a WARNING, and every run goes ahead.
 
 ## Credential handling
 
