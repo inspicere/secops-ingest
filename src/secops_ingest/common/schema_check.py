@@ -24,20 +24,37 @@ column the target's DDL also adds with `ALTER TABLE ... ADD COLUMN IF NOT
 EXISTS` is fixed by re-applying the package's DDL; a column only its CREATE
 TABLE declares has no migration at all, which is a bug in the package (or the
 pack) that shipped it, not something re-applying can fix.
+
+Not everything in control is load-bearing for a worker. control.source_state,
+the control.source_freshness view and the hold-out functions (audit V-18)
+record WHY a source is quiet and HOW CURRENT its data is; no ingest or
+transform run reads or writes them. A warehouse without them is reported as
+running dim -- a WARNING naming each missing object and the remedy, returned to
+the caller as well -- and the run goes ahead. Refusing would take every source
+dark over a monitoring object, which is the opposite of the point.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Any
 
-from ..schema import control_sql, raw_table_sql
+from ..schema import (
+    SOURCE_FRESHNESS_COLUMNS,
+    SOURCE_STATE_FUNCTIONS,
+    control_sql,
+    raw_table_sql,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..transform.base import Target
 
+log = logging.getLogger(__name__)
+
 __all__ = [
+    "ADVISORY_TABLES",
     "ControlSchemaDrift",
     "TargetSchemaDrift",
     "expected_control_columns",
@@ -68,6 +85,19 @@ _ALTER_ADD_RE = re.compile(
 REMEDY = (
     "Apply the package's own control DDL as the schema owner: "
     'python -m secops_ingest.schema | psql "$SECOPS_DB_DSN"'
+)
+
+
+#: Control tables a worker can run without: missing or behind, they are
+#: reported as dim rather than refused. See the module docstring.
+ADVISORY_TABLES = frozenset({"source_state"})
+
+#: Remedy quoted for the dim objects. --all-sources because the freshness view
+#: is only emitted with it (see schema/__main__.py).
+DIM_REMEDY = (
+    "Apply the generated warehouse schema as the schema owner, e.g. "
+    "python -m secops_ingest.schema --all-targets --all-sources (plus the "
+    "deployment's role flags) | psql"
 )
 
 
@@ -122,7 +152,7 @@ def expected_control_columns() -> dict[str, list[str]]:
     return expected
 
 
-def verify_control_schema(conn: Any) -> None:
+def verify_control_schema(conn: Any) -> list[str]:
     """Raise ControlSchemaDrift if `conn`'s control schema is behind the package.
 
     Runs once per worker invocation, before any run-ledger write: a refused
@@ -132,6 +162,10 @@ def verify_control_schema(conn: Any) -> None:
     The warehouse being AHEAD is fine and expected -- hand-added columns,
     other tools' tables in the same schema. Only what the package needs is
     checked.
+
+    Returns what is missing from the advisory objects (ADVISORY_TABLES, the
+    freshness view, the hold-out functions), one item per object, after
+    logging them as one WARNING; [] when nothing is. Those never raise.
     """
     expected = expected_control_columns()
     with conn.cursor() as cur:
@@ -142,18 +176,38 @@ def verify_control_schema(conn: Any) -> None:
         actual: dict[str, set[str]] = {}
         for table_name, column_name in cur.fetchall():
             actual.setdefault(table_name, set()).add(column_name)
+        # to_regprocedure, not information_schema.routines: the latter lists
+        # only routines the role may execute, and the transform role may not.
+        cur.execute(
+            "SELECT fn FROM unnest(%s::text[]) AS fn WHERE to_regprocedure(fn) IS NULL",
+            (list(SOURCE_STATE_FUNCTIONS),),
+        )
+        missing_functions = [str(row[0]) for row in cur.fetchall()]
 
     problems: list[str] = []
-    for table, columns in expected.items():
+    dim: list[str] = []
+    # The view's columns come from information_schema too: views are listed
+    # there for any role holding SELECT on them, as the workers do.
+    checked = {**expected, "source_freshness": list(SOURCE_FRESHNESS_COLUMNS)}
+    for table, columns in checked.items():
+        required = table in expected and table not in ADVISORY_TABLES
+        bucket = problems if required else dim
         present = actual.get(table)
         if present is None:
-            problems.append(f"control.{table} does not exist")
+            bucket.append(f"control.{table} does not exist")
             continue
         missing = [c for c in columns if c not in present]
         if missing:
-            problems.append(
+            bucket.append(
                 f"control.{table} is missing column(s): {', '.join(missing)}"
             )
+    dim.extend(f"function {fn} does not exist" for fn in missing_functions)
+    if dim and not problems:
+        log.warning(
+            "running dim: %s. Hold-outs and source freshness are not recorded "
+            "until this is fixed; runs are unaffected. %s",
+            "; ".join(dim), DIM_REMEDY,
+        )
     if problems:
         raise ControlSchemaDrift(
             "control schema is behind this package: "
@@ -161,6 +215,7 @@ def verify_control_schema(conn: Any) -> None:
             + ". "
             + REMEDY
         )
+    return dim
 
 
 class TargetSchemaDrift(RuntimeError):

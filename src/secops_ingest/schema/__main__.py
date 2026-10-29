@@ -37,6 +37,8 @@ from . import (
     partition_health_sql,
     partitions_sql,
     raw_table_sql,
+    source_freshness_sql,
+    source_state_sql,
 )
 
 
@@ -80,6 +82,31 @@ def _source_tables(packs: dict[str, Pack]) -> tuple[dict[str, str], list[str]]:
                 continue
             tables[source_name] = table
     return tables, problems
+
+
+def _freshness_sources(
+    packs: dict[str, Pack], names: list[str], targets: dict[str, Any],
+    source_tables: dict[str, str],
+) -> list[tuple[str, str | None, list[str]]]:
+    """(source, pack, targets reading its raw table) for control.source_freshness.
+
+    Only the targets being emitted count. A deployment that emits a subset does
+    not run the others, and a target that never runs would hold its source's
+    freshness at "never" for good.
+    """
+    out: list[tuple[str, str | None, list[str]]] = []
+    seen: set[str] = set()
+    for pack_name in sorted(packs):
+        for source_name in sorted(packs[pack_name].sources):
+            # Two packs may share a bare source name; the run ledger cannot
+            # tell them apart either, so the first pack in name order speaks.
+            if source_name in seen:
+                continue
+            seen.add(source_name)
+            table = source_tables.get(source_name)
+            reading = [n for n in names if targets[n].raw_table == table]
+            out.append((source_name, pack_name, reading))
+    return out
 
 
 def _parse_remote(specs: list[str], parser: argparse.ArgumentParser) -> list[tuple[str, str]]:
@@ -270,6 +297,19 @@ def main(argv: list[str] | None = None) -> int:
         out.append(_banner("control — run history, watermarks, coverage ledger"))
         out.append(control_sql())
         out.append(partition_health_sql())
+        out.append(source_state_sql())
+        # The view maps each source to the targets that read its raw table, and
+        # only the connector declares that table -- so it needs --all-sources,
+        # like the raw tables themselves. Without it the view is left out
+        # rather than emitted with every source claiming it has no target,
+        # which would report a frozen mart as current.
+        if args.all_sources:
+            out.append(source_freshness_sql(
+                _freshness_sources(packs, names, targets, source_tables)))
+        else:
+            out.append("-- control.source_freshness is emitted only with --all-sources: "
+                       "it maps each\n-- source to the targets reading its raw table, "
+                       "which only the connector declares.\n")
 
     for schema, table, why in extra_raw:
         out.append(_banner(f"{schema}.{table} ({why})"))
@@ -321,6 +361,7 @@ def main(argv: list[str] | None = None) -> int:
                     remote_ingest=remote,
                     owner_role=args.owner_role,
                     partition_health=not args.no_control,
+                    source_state=not args.no_control,
                     shared_keeps_remote=args.shared_ingest_keeps_remote,
                 )
             )

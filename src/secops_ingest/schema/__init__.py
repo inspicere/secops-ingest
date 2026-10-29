@@ -32,6 +32,8 @@ __all__ = [
     "partition_health_sql",
     "partitions_sql",
     "raw_table_sql",
+    "source_freshness_sql",
+    "source_state_sql",
     "validate_identifier",
 ]
 
@@ -146,6 +148,38 @@ CREATE TABLE IF NOT EXISTS control.pack (
                 CHECK (state IN ('ENABLED','DISABLED')),
     enabled_at  timestamptz,
     disabled_at timestamptz
+);
+
+-- Why a source is not running, when that was somebody's decision (audit V-18).
+--
+-- A pack DISABLED, or a source the deployment holds out, used to leave no
+-- trace: its timer is simply absent, nothing writes control.ingest_run, and a
+-- freshness card could not tell "held out on purpose" from "broken". One row
+-- per (source, origin), because the two origins are independent decisions --
+-- a deployment releasing its hold-out must not re-enable a pack an operator
+-- disabled, and `packs enable` must not cancel a deployment's hold-out:
+--
+--   origin 'pack'    written by `packs disable` / `packs enable`, as the
+--                    schema owner, for every source of the pack
+--   origin 'deploy'  written by `python -m secops_ingest.holdout` through
+--                    control.hold_out_source() and control.release_source(),
+--                    which are the only way a worker role can write here
+--
+-- A release sets the row back to ACTIVE instead of deleting it, so who
+-- released the source and when stays visible. control.source_freshness reads
+-- this table beside the run ledgers, so a dashboard card is one SELECT.
+CREATE TABLE IF NOT EXISTS control.source_state (
+    source     text        NOT NULL,
+    origin     text        NOT NULL CHECK (origin IN ('pack','deploy')),
+    state      text        NOT NULL
+               CHECK (state IN ('ACTIVE','DISABLED','HELD_OUT')),
+    reason     text,
+    changed_at timestamptz NOT NULL DEFAULT now(),
+    changed_by text        NOT NULL DEFAULT current_user,
+    -- One line on purpose: schema_check reads each body line's first word as
+    -- a column name unless it is a constraint keyword.
+    CHECK (state = 'ACTIVE' OR state = CASE origin WHEN 'pack' THEN 'DISABLED' ELSE 'HELD_OUT' END),
+    PRIMARY KEY (source, origin)
 );
 
 -- Migrations for tables created by an earlier version. CREATE TABLE IF NOT
@@ -279,6 +313,247 @@ BEGIN
     END IF;
 END
 $do$;
+"""
+
+
+SOURCE_STATE_SQL = """\
+-- The only way a worker role can write control.source_state: record that the
+-- deployment holds a source out, or release a hold-out it recorded itself.
+--
+-- SECURITY DEFINER rather than a grant on the table, because a grant cannot
+-- say which ROWS. An ingest role with INSERT/UPDATE on the table could also
+-- clear a pack's DISABLED row -- the forgery the per-table control grants exist
+-- to prevent. These functions only ever touch origin 'deploy', and they record
+-- session_user, the login that called them (current_user inside a definer
+-- function is the owner), so a row says truthfully who held the source out.
+-- The pinned search_path is what makes a definer function safe to expose.
+--
+-- Both return whether anything changed. A converge re-asserts the same
+-- hold-out on every run, and it should report "ok", not "changed", while
+-- changed_at keeps meaning the moment the state actually changed.
+--
+-- A hold-out another login recorded is taken over rather than refused: the
+-- source stays held out either way. Release is "own rows only": a deployment
+-- on one host must not lift a hold-out recorded by another host's login. The
+-- schema owner can still change any row directly.
+CREATE OR REPLACE FUNCTION control.hold_out_source(p_source text, p_reason text)
+RETURNS boolean
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    n integer;
+BEGIN
+    IF p_source IS NULL OR p_source !~ '^[a-z_][a-z0-9_]{0,62}$' THEN
+        RAISE EXCEPTION 'not a source name: %', p_source
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    -- A hold-out with no reason is the silence this table exists to end.
+    IF p_reason IS NULL OR btrim(p_reason) = '' OR length(p_reason) > 500 THEN
+        RAISE EXCEPTION 'holding out %: a reason of 1 to 500 characters is required', p_source
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    INSERT INTO control.source_state AS s
+        (source, origin, state, reason, changed_at, changed_by)
+    VALUES (p_source, 'deploy', 'HELD_OUT', p_reason, now(), session_user)
+    ON CONFLICT (source, origin) DO UPDATE
+        SET state = 'HELD_OUT', reason = EXCLUDED.reason,
+            changed_at = now(), changed_by = session_user
+        WHERE s.state <> 'HELD_OUT' OR s.reason IS DISTINCT FROM EXCLUDED.reason
+           OR s.changed_by <> session_user;
+    GET DIAGNOSTICS n = ROW_COUNT;
+    RETURN n > 0;
+END
+$fn$;
+REVOKE ALL ON FUNCTION control.hold_out_source(text, text) FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION control.release_source(p_source text)
+RETURNS boolean
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    holder text;
+    current_state text;
+BEGIN
+    SELECT changed_by, state INTO holder, current_state
+        FROM control.source_state
+        WHERE source = p_source AND origin = 'deploy'
+        FOR UPDATE;
+    IF NOT FOUND OR current_state <> 'HELD_OUT' THEN
+        RETURN false;
+    END IF;
+    IF holder <> session_user THEN
+        RAISE EXCEPTION 'source % is held out by %, not by %; only that login, or '
+            'the schema owner directly, can release it', p_source, holder, session_user
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    UPDATE control.source_state
+        SET state = 'ACTIVE', reason = NULL, changed_at = now(), changed_by = session_user
+        WHERE source = p_source AND origin = 'deploy';
+    RETURN true;
+END
+$fn$;
+REVOKE ALL ON FUNCTION control.release_source(text) FROM PUBLIC;
+"""
+
+#: The definer functions SOURCE_STATE_SQL creates, by signature: what grants
+#: name, and what the drift check looks for with to_regprocedure().
+SOURCE_STATE_FUNCTIONS = (
+    "control.hold_out_source(text, text)",
+    "control.release_source(text)",
+)
+
+
+def source_state_sql() -> str:
+    """DDL for the hold-out functions over `control.source_state`. Idempotent.
+
+    Kept out of control_sql() for the reason partition_health_sql() is: CREATE
+    OR REPLACE FUNCTION needs the function's owner, and `pack enable` applies
+    control_sql() under whatever role its DSN names.
+    """
+    return SOURCE_STATE_SQL
+
+
+#: The columns of control.source_freshness, in order. CREATE OR REPLACE VIEW
+#: can only append columns, so this order is an interface: dashboards select
+#: these names, and the drift check expects them.
+SOURCE_FRESHNESS_COLUMNS = (
+    "source", "pack", "state", "state_reason", "state_changed_at", "state_changed_by",
+    "targets", "last_ingest_success", "last_transform_success", "never_succeeded",
+    "as_of", "age",
+)
+
+
+def _sql_text(value: str | None) -> str:
+    """A text literal for a name already checked by validate_identifier()."""
+    return "NULL::text" if value is None else f"'{validate_identifier(value)}'::text"
+
+
+def source_freshness_sql(sources: Sequence[tuple[str, str | None, Sequence[str]]]) -> str:
+    """DDL for the `control.source_freshness` view. Idempotent.
+
+    `sources` is (source, pack, targets reading the source's raw table), as the
+    emitter derives it from the installed packs. The warehouse has no other way
+    to know which targets derive from which source -- a source names a raw
+    table only in its connector module -- so the mapping is written into the
+    view, and regenerating the schema is what updates it. A source the mapping
+    does not know (a private connector, say) still gets a row from the run
+    ledger or from control.source_state, with no pack and no targets.
+
+    FRESHNESS IS THE OLDER OF INGEST AND TRANSFORM SUCCESS. A transform that
+    keeps succeeding over raw nobody refreshes reports SUCCESS with 0 rows, and
+    an ingest that keeps succeeding into a transform that has stopped leaves the
+    mart frozen; either way the data a reader sees is only as new as the older
+    of the two. "Never" is NULL, and it is handled explicitly: PostgreSQL's
+    least() ignores NULL, so least(ingest, never) would report the ingest time
+    and hide a target that never succeeded. `never_succeeded` names what has no
+    SUCCESS row at all, so a card can say which half is missing.
+
+    `state` is DISABLED when the source's pack is (control.pack decides when the
+    pack is known, since that is what the worker obeys; control.source_state's
+    pack row otherwise), HELD_OUT when the deployment holds it out, else ACTIVE.
+    """
+    rows: list[str] = []
+    for source, pack, targets in sources:
+        reading: list[str | None] = [*sorted(targets)] or [None]
+        for target in reading:
+            rows.append(f"({_sql_text(source)}, {_sql_text(pack)}, {_sql_text(target)})")
+    if rows:
+        known = "    VALUES\n        " + ",\n        ".join(rows)
+    else:
+        known = "    SELECT NULL::text, NULL::text, NULL::text WHERE false"
+    return f"""\
+-- One row per source: how current its data is and whether it is held out on
+-- purpose. A freshness card is `SELECT * FROM control.source_freshness WHERE
+-- source = '...'`. The grants' SELECT ON ALL TABLES IN SCHEMA control covers
+-- views too, so the read and monitor roles can query it with no new grant.
+--
+-- Columns may only be appended (CREATE OR REPLACE VIEW refuses anything else).
+CREATE OR REPLACE VIEW control.source_freshness AS
+WITH known (source, pack, target) AS (
+{known}
+),
+ingest AS (
+    SELECT source, max(ended_at) FILTER (WHERE status = 'SUCCESS') AS last_success
+    FROM control.ingest_run GROUP BY source
+),
+transform AS (
+    SELECT target, max(ended_at) FILTER (WHERE status = 'SUCCESS') AS last_success
+    FROM control.transform_run GROUP BY target
+),
+sources AS (
+    SELECT source FROM known
+    UNION SELECT source FROM ingest
+    UNION SELECT source FROM control.source_state
+),
+mapped AS (
+    SELECT s.source,
+           (SELECT min(k.pack) FROM known k WHERE k.source = s.source) AS pack,
+           i.last_success AS last_ingest_success,
+           coalesce(t.targets, '{{}}') AS targets,
+           t.last_transform_success,
+           coalesce(t.never, '{{}}') AS never_targets
+    FROM sources s
+    LEFT JOIN ingest i ON i.source = s.source
+    LEFT JOIN LATERAL (
+        SELECT array_agg(k.target ORDER BY k.target) AS targets,
+               CASE WHEN bool_or(tr.last_success IS NULL) THEN NULL
+                    ELSE min(tr.last_success) END AS last_transform_success,
+               array_agg(k.target ORDER BY k.target)
+                   FILTER (WHERE tr.last_success IS NULL) AS never
+        FROM known k
+        LEFT JOIN transform tr ON tr.target = k.target
+        WHERE k.source = s.source AND k.target IS NOT NULL
+    ) t ON true
+),
+held AS (
+    SELECT m.*,
+           sp.state AS pack_row_state, sp.reason AS pack_reason,
+           sp.changed_at AS pack_changed_at, sp.changed_by AS pack_changed_by,
+           sd.changed_at AS deploy_changed_at, sd.changed_by AS deploy_changed_by,
+           sd.reason AS deploy_reason, cp.disabled_at AS pack_disabled_at,
+           coalesce(CASE WHEN cp.state IS NOT NULL THEN cp.state = 'DISABLED'
+                         ELSE sp.state = 'DISABLED' END, false) AS pack_disabled,
+           coalesce(sd.state = 'HELD_OUT', false) AS held_out,
+           (CASE WHEN m.last_ingest_success IS NULL THEN ARRAY['ingest'] ELSE '{{}}' END)
+               || m.never_targets AS never_succeeded
+    FROM mapped m
+    LEFT JOIN control.pack cp ON cp.name = m.pack
+    LEFT JOIN control.source_state sp ON sp.source = m.source AND sp.origin = 'pack'
+    LEFT JOIN control.source_state sd ON sd.source = m.source AND sd.origin = 'deploy'
+)
+SELECT source,
+       pack,
+       CASE WHEN pack_disabled THEN 'DISABLED'
+            WHEN held_out THEN 'HELD_OUT'
+            ELSE 'ACTIVE' END AS state,
+       CASE WHEN pack_disabled THEN
+                coalesce(CASE WHEN pack_row_state = 'DISABLED' THEN pack_reason END,
+                         'pack ' || pack || ' is DISABLED in control.pack')
+            WHEN held_out THEN deploy_reason END AS state_reason,
+       CASE WHEN pack_disabled THEN
+                coalesce(CASE WHEN pack_row_state = 'DISABLED' THEN pack_changed_at END,
+                         pack_disabled_at)
+            WHEN held_out THEN deploy_changed_at
+            ELSE greatest(pack_changed_at, deploy_changed_at) END AS state_changed_at,
+       CASE WHEN pack_disabled THEN
+                CASE WHEN pack_row_state = 'DISABLED' THEN pack_changed_by END
+            WHEN held_out THEN deploy_changed_by
+            WHEN deploy_changed_at IS NOT DISTINCT FROM
+                 greatest(pack_changed_at, deploy_changed_at) THEN deploy_changed_by
+            ELSE pack_changed_by END AS state_changed_by,
+       targets,
+       last_ingest_success,
+       last_transform_success,
+       never_succeeded,
+       CASE WHEN cardinality(never_succeeded) > 0 THEN NULL
+            WHEN cardinality(targets) = 0 THEN last_ingest_success
+            ELSE least(last_ingest_success, last_transform_success) END AS as_of,
+       now() - CASE WHEN cardinality(never_succeeded) > 0 THEN NULL
+                    WHEN cardinality(targets) = 0 THEN last_ingest_success
+                    ELSE least(last_ingest_success, last_transform_success) END AS age
+FROM held;
 """
 
 
@@ -564,6 +839,14 @@ def _control_grants(role: str, writes: Sequence[str]) -> list[str]:
     return out
 
 
+def _hold_out_grants(role: str) -> list[str]:
+    """EXECUTE on the hold-out functions: an ingest role's only write to
+    control.source_state. The transform, read and monitor roles never get it --
+    holding a source out is the deployment's decision, made where the ingest
+    timers are."""
+    return [f"GRANT EXECUTE ON FUNCTION {fn} TO {role};" for fn in SOURCE_STATE_FUNCTIONS]
+
+
 def _parse_remote(
     remote_ingest: Sequence[tuple[str, str]], raw_schemas: Sequence[str]
 ) -> dict[str, str]:
@@ -597,6 +880,7 @@ def grants_sql(
     remote_ingest: Sequence[tuple[str, str]] = (),
     owner_role: str | None = None,
     partition_health: bool = False,
+    source_state: bool = False,
     shared_keeps_remote: bool = False,
 ) -> str:
     """Privileges for the jobs that touch this schema.
@@ -614,6 +898,7 @@ def grants_sql(
             pipeline-health dashboard can be built on the same connection.
         monitor_role: external monitoring. Read-only control and
             partition_health(), and nothing else -- no raw, no mart.
+            Both read control.source_freshness through the same SELECT.
         remote_ingest: (role, schema) pairs. Each role writes only its one raw
             schema, and the shared ingest role is removed from that schema. A
             worker on another host then holds a credential that can damage one
@@ -622,6 +907,9 @@ def grants_sql(
             See _default_privileges.
         partition_health: also grant EXECUTE on control.partition_health() to
             the read and monitor roles; only when that function is emitted too.
+        source_state: also grant EXECUTE on the hold-out functions
+            (source_state_sql()) to the ingest role and every remote writer,
+            and to nobody else; only when those functions are emitted too.
         shared_keeps_remote: TRANSITIONAL. The shared ingest role keeps write
             access to the remote writers' schemas as well, so the remote role
             can be created and granted before the remote host switches to it --
@@ -690,6 +978,8 @@ def grants_sql(
             out.append(f"GRANT {writer} ON ALL TABLES IN SCHEMA {schema} TO {ingest_role};")
             out.extend(_default_privileges(schema, writer, ingest_role, owner_role))
         out.extend(_control_grants(ingest_role, _INGEST_WRITES))
+        if source_state:
+            out.extend(_hold_out_grants(ingest_role))
         out.append("")
 
     for schema, role in remote.items():
@@ -698,6 +988,8 @@ def grants_sql(
         out.append(f"GRANT {writer} ON ALL TABLES IN SCHEMA {schema} TO {role};")
         out.extend(_default_privileges(schema, writer, role, owner_role))
         out.extend(_control_grants(role, _INGEST_WRITES))
+        if source_state:
+            out.extend(_hold_out_grants(role))
         out.append("")
 
     if transform_role:
