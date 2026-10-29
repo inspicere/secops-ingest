@@ -18,10 +18,13 @@ Configuration (endpoints and tenancy are config, never constants):
 
     SECOPS_WAZUH_URL           indexer base URL, e.g. https://127.0.0.1:9200
     SECOPS_WAZUH_INDEX         index pattern           (default wazuh-alerts-*)
-    SECOPS_WAZUH_USER          indexer username        (default admin)
+    SECOPS_WAZUH_USER          indexer username        (default admin; logged as
+                               DEGRADED every run -- use a read-only user)
     SECOPS_WAZUH_SECRET        secret name to resolve  (default wazuh_indexer_password)
-    SECOPS_WAZUH_CA_BUNDLE     path to a CA bundle for the indexer's certificate
-    SECOPS_WAZUH_INSECURE      set to 1 to skip TLS verification (logged, loudly)
+    SECOPS_WAZUH_CA_BUNDLE     path to a CA bundle for the indexer's certificate;
+                               verification against it is never relaxed
+    SECOPS_WAZUH_INSECURE      set to 1 to skip TLS verification (logged, loudly);
+                               ignored when SECOPS_WAZUH_CA_BUNDLE is set
     SECOPS_WAZUH_LAG_SECONDS   late-arrival overlap    (default 900)
     SECOPS_WAZUH_PAGE_SIZE     hits per request        (default 500)
 """
@@ -30,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import os
+import ssl
 import time
 from collections.abc import Iterator
 from datetime import datetime, timedelta
@@ -45,6 +49,13 @@ log = logging.getLogger(__name__)
 DEFAULT_INDEX = "wazuh-alerts-*"
 DEFAULT_LAG_SECONDS = 900
 DEFAULT_PAGE_SIZE = 500
+
+#: The account the indexer is installed with. It holds every privilege the
+#: cluster has, including writes to the security index, so a leaked copy of
+#: the ingest's credential is a leaked copy of the whole SIEM. Still the
+#: default so that an existing deployment keeps running; the warning below is
+#: what keeps it from being forgotten.
+SUPERUSER = "admin"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -72,16 +83,34 @@ class WazuhSource:
     def __init__(self) -> None:
         self.url = (os.environ.get("SECOPS_WAZUH_URL") or "").rstrip("/")
         self.index = os.environ.get("SECOPS_WAZUH_INDEX", DEFAULT_INDEX)
-        self.user = os.environ.get("SECOPS_WAZUH_USER", "admin")
+        self.user = os.environ.get("SECOPS_WAZUH_USER", SUPERUSER)
         self.secret_name = os.environ.get("SECOPS_WAZUH_SECRET", "wazuh_indexer_password")
         self.lag_seconds = _env_int("SECOPS_WAZUH_LAG_SECONDS", DEFAULT_LAG_SECONDS)
         self.page_size = _env_int("SECOPS_WAZUH_PAGE_SIZE", DEFAULT_PAGE_SIZE)
+        # Resolved once per run by authenticate(); None means not yet resolved
+        # (False is a real answer: verification off).
+        self._verify: Any = None
 
     # -- credentials --------------------------------------------------------
 
     def authenticate(self) -> Any:
         if not self.url:
             raise ValueError("SECOPS_WAZUH_URL is not set")
+        # Before the password is fetched, so that a CA bundle that cannot be
+        # loaded fails the run here, with its path named, rather than on the
+        # first request -- and so that its warnings appear once per run, not
+        # once per page.
+        self._verify = self._tls_verify()
+        if self.user == SUPERUSER:
+            # Dim, not dark: the run proceeds, because refusing would stop
+            # alert ingest on every host that has not created the read-only
+            # user yet. But it must not look like a healthy run either.
+            log.warning(
+                "DEGRADED: reading the Wazuh indexer as its superuser %r, which can "
+                "also write and administer the cluster. Create a user limited to "
+                "read on %s and set SECOPS_WAZUH_USER/SECOPS_WAZUH_SECRET to it.",
+                self.user, self.index,
+            )
         password = get_provider().get(self.secret_name)
         # Registered so that a traceback or a debug-level httpx log cannot spill
         # it. The redaction filter is a backstop, not permission to log it.
@@ -182,7 +211,7 @@ class WazuhSource:
             f"{self.url}/{self.index}/_search",
             json=body,
             auth=creds,
-            verify=self._tls_verify(),
+            verify=self._verify if self._verify is not None else self._tls_verify(),
             timeout=60.0,
         )
         resp.raise_for_status()
@@ -205,19 +234,48 @@ class WazuhSource:
 
     def _tls_verify(self) -> Any:
         bundle = os.environ.get("SECOPS_WAZUH_CA_BUNDLE")
+        insecure = os.environ.get("SECOPS_WAZUH_INSECURE") == "1"
         if bundle:
-            return bundle
-        if os.environ.get("SECOPS_WAZUH_INSECURE") == "1":
+            if insecure:
+                # Verification wins. Both set is the half-finished state of a
+                # CA roll-out, and the stale opt-out must not quietly become
+                # live again if the bundle setting is later removed.
+                log.warning(
+                    "SECOPS_WAZUH_INSECURE=1 is IGNORED because SECOPS_WAZUH_CA_BUNDLE "
+                    "is set; the indexer is verified. Remove SECOPS_WAZUH_INSECURE."
+                )
+            return self._ca_context(bundle)
+        if insecure:
             # Wazuh generates its own CA at install, so an operator without the
             # bundle to hand will reach for this. Say so every run: a silent
             # opt-out becomes permanent, and this one removes the only defence
             # against an intercepted credential.
             log.warning(
-                "TLS verification DISABLED for the Wazuh indexer "
+                "DEGRADED: TLS verification DISABLED for the Wazuh indexer "
                 "(SECOPS_WAZUH_INSECURE=1). Set SECOPS_WAZUH_CA_BUNDLE instead."
             )
             return False
         return True
+
+    @staticmethod
+    def _ca_context(bundle: str) -> ssl.SSLContext:
+        """A verifying context anchored on `bundle`, and only on it.
+
+        A context rather than the path: httpx deprecates a path for `verify`,
+        and loading it here turns a missing or unparsable bundle into an error
+        that names the setting, instead of a handshake failure pages later.
+        Hostname checking and CERT_REQUIRED are the defaults and stay on. There
+        is no fallback to an unverified connection: a bundle that cannot be
+        used is a configuration error, and the run fails with the watermark
+        where it was.
+        """
+        try:
+            return ssl.create_default_context(cafile=bundle)
+        except (OSError, ssl.SSLError) as exc:
+            raise ValueError(
+                f"SECOPS_WAZUH_CA_BUNDLE={bundle!r} could not be loaded ({exc}); "
+                "refusing to connect to the indexer without verifying it"
+            ) from None
 
     # -- landing ------------------------------------------------------------
 

@@ -10,6 +10,7 @@ is synthetic).
 from __future__ import annotations
 
 import json
+import ssl
 from typing import Any
 
 import pytest
@@ -58,6 +59,12 @@ def source(monkeypatch: pytest.MonkeyPatch) -> WazuhSource:
     monkeypatch.setenv("SECOPS_WAZUH_PAGE_SIZE", "2")
     monkeypatch.setenv("SECOPS_WAZUH_LAG_SECONDS", "900")
     return WazuhSource()
+
+
+@pytest.fixture
+def ca_bundle() -> str:
+    """A real, loadable CA bundle. certifi arrives with httpx."""
+    return str(pytest.importorskip("certifi").where())
 
 
 def drive(source: WazuhSource, rec: Recorder) -> list[dict[str, Any]]:
@@ -215,11 +222,59 @@ def test_tls_verification_is_on_by_default(source: WazuhSource) -> None:
 
 
 def test_ca_bundle_is_preferred_over_disabling_verification(
-    source: WazuhSource, monkeypatch: pytest.MonkeyPatch
+    source: WazuhSource, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ca_bundle: str,
 ) -> None:
+    """Both set is a half-finished CA roll-out. Verification wins, and the
+    stale opt-out is named so it gets removed rather than lying in wait."""
     monkeypatch.setenv("SECOPS_WAZUH_INSECURE", "1")
-    monkeypatch.setenv("SECOPS_WAZUH_CA_BUNDLE", "/etc/ssl/certs/wazuh.pem")
-    assert source._tls_verify() == "/etc/ssl/certs/wazuh.pem"
+    monkeypatch.setenv("SECOPS_WAZUH_CA_BUNDLE", ca_bundle)
+    with caplog.at_level("WARNING"):
+        ctx = source._tls_verify()
+    assert isinstance(ctx, ssl.SSLContext)
+    assert "SECOPS_WAZUH_INSECURE=1 is IGNORED" in caplog.text
+    assert "DISABLED" not in caplog.text
+
+
+def test_a_ca_bundle_verifies_the_certificate_and_the_hostname(
+    source: WazuhSource, monkeypatch: pytest.MonkeyPatch, ca_bundle: str
+) -> None:
+    monkeypatch.setenv("SECOPS_WAZUH_CA_BUNDLE", ca_bundle)
+    ctx = source._tls_verify()
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+    assert ctx.check_hostname is True
+
+
+@pytest.mark.parametrize("content", [None, "not a certificate\n"], ids=["missing", "garbage"])
+def test_an_unusable_ca_bundle_fails_instead_of_falling_back(
+    source: WazuhSource, monkeypatch: pytest.MonkeyPatch, tmp_path: Any, content: str | None,
+) -> None:
+    """A bundle that cannot be loaded must never degrade to an unverified
+    connection, even with SECOPS_WAZUH_INSECURE=1 still set beside it."""
+    bundle = tmp_path / "wazuh-ca.pem"
+    if content is not None:
+        bundle.write_text(content)
+    monkeypatch.setenv("SECOPS_WAZUH_CA_BUNDLE", str(bundle))
+    monkeypatch.setenv("SECOPS_WAZUH_INSECURE", "1")
+    with pytest.raises(ValueError, match="SECOPS_WAZUH_CA_BUNDLE"):
+        source._tls_verify()
+
+
+def test_an_unusable_ca_bundle_fails_before_the_password_is_fetched(
+    source: WazuhSource, monkeypatch: pytest.MonkeyPatch, tmp_path: Any,
+) -> None:
+    monkeypatch.setenv("SECOPS_WAZUH_CA_BUNDLE", str(tmp_path / "absent.pem"))
+    asked: list[str] = []
+
+    class FakeProvider:
+        def get(self, name: str) -> str:
+            asked.append(name)
+            return "hunter2-not-real"
+
+    monkeypatch.setattr("secops_ingest.sources.wazuh.get_provider", lambda: FakeProvider())
+    with pytest.raises(ValueError, match="SECOPS_WAZUH_CA_BUNDLE"):
+        source.authenticate()
+    assert asked == []
 
 
 def test_disabling_verification_warns_every_run(
@@ -229,7 +284,64 @@ def test_disabling_verification_warns_every_run(
     monkeypatch.delenv("SECOPS_WAZUH_CA_BUNDLE", raising=False)
     with caplog.at_level("WARNING"):
         assert source._tls_verify() is False
-    assert "TLS verification DISABLED" in caplog.text
+    assert "DEGRADED: TLS verification DISABLED" in caplog.text
+
+
+def test_tls_is_resolved_once_per_run_and_used_for_every_page(
+    source: WazuhSource, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Once per run, not once per page: a warning repeated for every page of a
+    backfill buries everything else in the journal."""
+    import httpx
+
+    monkeypatch.setenv("SECOPS_WAZUH_INSECURE", "1")
+    monkeypatch.setattr("secops_ingest.sources.wazuh.get_provider", lambda: _Provider())
+    seen: list[Any] = []
+
+    def post(url: str, **kw: Any) -> httpx.Response:
+        seen.append(kw["verify"])
+        return httpx.Response(200, json={"hits": {"hits": []}},
+                              request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", post)
+    with caplog.at_level("WARNING"):
+        creds = source.authenticate()
+        source._search(creds, {"size": 2})
+        source._search(creds, {"size": 2})
+    assert seen == [False, False]
+    assert caplog.text.count("TLS verification DISABLED") == 1
+
+
+# -- the indexer account (V-16) --------------------------------------------------
+
+class _Provider:
+    def get(self, name: str) -> str:
+        return "hunter2-not-real"
+
+
+def test_running_as_the_indexer_superuser_is_degraded(
+    source: WazuhSource, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Still the default, so it must still run -- but never look healthy."""
+    monkeypatch.delenv("SECOPS_WAZUH_USER", raising=False)
+    monkeypatch.setattr("secops_ingest.sources.wazuh.get_provider", lambda: _Provider())
+    with caplog.at_level("WARNING"):
+        user, _ = WazuhSource().authenticate()
+    assert user == "admin"
+    assert "DEGRADED: reading the Wazuh indexer as its superuser 'admin'" in caplog.text
+    assert "hunter2-not-real" not in caplog.text
+
+
+def test_a_read_only_user_is_not_degraded(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("SECOPS_WAZUH_URL", "https://127.0.0.1:9200")
+    monkeypatch.setenv("SECOPS_WAZUH_USER", "secops_ingest_reader")
+    monkeypatch.setattr("secops_ingest.sources.wazuh.get_provider", lambda: _Provider())
+    with caplog.at_level("WARNING"):
+        user, _ = WazuhSource().authenticate()
+    assert user == "secops_ingest_reader"
+    assert "DEGRADED" not in caplog.text
 
 
 # -- partial answers (V-34) ------------------------------------------------------
