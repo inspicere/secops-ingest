@@ -100,13 +100,18 @@ jobs:
           # example.com / example.org / .example are reserved by RFC 2606 for
           # exactly this. Anything else in a test fixture is somebody's real host.
           #
+          # The RFC 5737 documentation ranges (192.0.2.0/24, 198.51.100.0/24,
+          # 203.0.113.0/24) are reserved for the same purpose as example.com,
+          # and a test that needs an IP literal that is not loopback has no
+          # other honest choice.
+          #
           # Loopback is allowed: 127.0.0.1 and localhost are provably nobody's
           # infrastructure, and they are the correct thing to write in a local
           # integration test. Flagging them made this job fail on a change that
           # leaked nothing -- and a check that cries wolf is one people learn to
           # ignore, which costs more than it ever catches.
           if grep -rnoE 'https?://[A-Za-z0-9.-]+' src tests --include='*.py' \
-             | grep -vE '(example\.(com|org|net)|//api\.example|apache\.org|python\.org|//127\.0\.0\.1|//localhost)'; then
+             | grep -vE '(example\.(com|org|net)|//api\.example|apache\.org|python\.org|//127\.0\.0\.1|//localhost|//(192\.0\.2|198\.51\.100|203\.0\.113)\.[0-9]{1,3}$)'; then
             echo "::error::Non-reserved hostname. Use example.com (RFC 2606)."
             exit 1
           fi

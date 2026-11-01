@@ -93,7 +93,7 @@ def test_https_or_loopback_is_accepted(url: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "url", ["http://vault.example.com:8200", "http://10.0.0.5:8200", "ftp://127.0.0.1"]
+    "url", ["http://vault.example.com:8200", "http://198.51.100.5:8200", "ftp://127.0.0.1"]
 )
 def test_cleartext_to_a_remote_vault_is_refused(url: str) -> None:
     with pytest.raises(SecretError, match="must use https"):

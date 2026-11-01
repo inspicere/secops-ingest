@@ -336,7 +336,7 @@ def test_an_http_url_is_accepted_only_when_opted_in_and_says_so_every_run(
     monkeypatch.setenv("SECOPS_XDR_ALLOW_HTTP", "1")
     _with_url(monkeypatch, "http://tenant.example.com")
     with caplog.at_level("WARNING"):
-        assert _cortex.resolve("xdr", "/p").base.startswith("http://api-")
+        assert _cortex.resolve("xdr", "/p").base == "http://api-tenant.example.com/p"
     assert "CLEARTEXT" in caplog.text
 
 
