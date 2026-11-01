@@ -5,9 +5,12 @@
 ```bash
 git clone git@github.com:inspicere/secops-ingest.git
 cd secops-ingest
-pip install -e ".[dev]"
+pip install -e ".[dev,http,postgres]"
 pytest
 ```
+
+`http` and `postgres` are what CI installs. Without them, the connector, run-lifecycle and
+transform tests skip rather than fail, and a green local run means much less.
 
 The package uses a `src/` layout with `pythonpath = ["src"]` in the pytest config, so the tests
 import without a build step.
@@ -31,8 +34,10 @@ CI runs exactly these, plus four more jobs:
   that does. It exists because a clean `mypy src` turned out to be clean only because no
   driver was installed; installing one produced three errors.
 - **Two integration jobs** the local commands skip: the Vault provider against a live
-  OpenBao, and pack state against a real PostgreSQL. Both skip locally unless their env var
-  is set.
+  OpenBao, and every test file that reads `SECOPS_TEST_DSN` against a real PostgreSQL, each
+  file in its own database. Both skip locally unless their env var is set. A new file that
+  reads `SECOPS_TEST_DSN` must be added to `LIVE_DB_TESTS` in `.github/workflows/ci.yml`;
+  the job fails until it is.
 
 `ruff` selects `E,F,W,I`, which is what makes `line-length = 100` enforced. Until those rules
 were selected nothing ran `E501` and the setting was decorative.
