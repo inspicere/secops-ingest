@@ -61,6 +61,7 @@ from datetime import UTC, datetime
 from functools import partial
 from typing import Any
 
+from ..common import context
 from ..common.http import with_retries
 from ..common.payload import to_json
 from ._cortex import CortexCreds, env_int, headers, resolve
@@ -85,16 +86,21 @@ class XdrAlertsSource:
     name = "xdr_alerts"
     table = "raw_xdr.alerts"
 
-    #: NOT ordered, deliberately. It sorts and filters on `creation_time` but
-    #: watermarks `detection_timestamp` -- different fields. The lag window
-    #: above exists because they diverge, so the highest detection timestamp
-    #: seen does not mean every earlier one has been read. Advancing early
-    #: could step over a late-indexed alert.
+    #: ORDERED. It sorts and filters on `creation_time` and watermarks
+    #: `detection_timestamp`, and `creation_time` orders on detection time
+    #: (measured; see the module docstring). So when a run stops early, the
+    #: highest detection timestamp it saw is a mark it has read up to. Alerts
+    #: XDR indexes later, below that mark, fall inside the lag window the next
+    #: run rewinds by: the same guarantee a complete run gives.
     #:
-    #: Moving the cursor onto the creation-time axis would make this orderable
-    #: and is the fix for its livelock, but that is a change to what the cursor
-    #: MEANS and belongs in its own change.
-    fetch_order_is_watermark_order = False
+    #: Declared unordered, a run stopped by its deadline kept its cursor and
+    #: the next one re-read the same oldest window. At ~16 rows/s a run covers
+    #: ~24k alerts, so a first run (~1.6M over the 90-day horizon) or any gap
+    #: longer than about a day never caught up, and every run reported
+    #: SUCCESS. fetch() checks the ordering as it reads and caps the
+    #: watermark if an alert arrives further out of order than the lag window
+    #: covers, so the declaration is verified, not assumed.
+    fetch_order_is_watermark_order = True
 
     def __init__(self) -> None:
         self.secret = os.environ.get("SECOPS_XDR_ALERTS_SECRET", "xdr")
@@ -125,8 +131,20 @@ class XdrAlertsSource:
         return int(cursor) - self.lag_seconds * 1000
 
     def fetch(self, creds: Any, cursor: str | None) -> Iterator[dict[str, Any]]:
-        """Yield alerts created at or after the cursor, minus the lag window."""
+        """Yield alerts created at or after the cursor, minus the lag window.
+
+        Also checks the ordering the run relies on (see
+        fetch_order_is_watermark_order). An alert detected more than the lag
+        window below the highest mark already yielded means the sort is not
+        detection order here, so alerts after a stop could sit below the mark
+        by more than the next run rewinds. The watermark is then capped at the
+        lowest such alert: the next run re-reads from there rather than
+        stepping past anything.
+        """
         since = self._since(cursor)
+        lag_ms = self.lag_seconds * 1000
+        highest: int | None = None
+        ceiling: int | None = None
         frm = 0
         while True:
             body = {"request_data": {
@@ -147,7 +165,22 @@ class XdrAlertsSource:
                      time.monotonic() - started, reply.get("total_count", "?"))
             if not rows:
                 return
-            yield from rows
+            for row in rows:
+                mark = _detection_ms(row)
+                if mark is not None:
+                    if highest is not None and mark < highest - lag_ms:
+                        if ceiling is None or mark < ceiling:
+                            ceiling = mark
+                            log.warning(
+                                "alert %s detected at %d, more than the %ds lag "
+                                "window below the highest mark read (%d): the "
+                                "sort is not detection order here, so the "
+                                "watermark is capped at %d",
+                                row.get("alert_id"), mark, self.lag_seconds,
+                                highest, mark)
+                            context.cap_watermark(mark)
+                    highest = mark if highest is None else max(highest, mark)
+                yield row
             if len(rows) < self.page_size:
                 return
             frm += self.page_size
@@ -174,6 +207,18 @@ class XdrAlertsSource:
 
     def watermark_of(self, record: dict[str, Any]) -> Any:
         return int(record["detection_timestamp"])
+
+
+def _detection_ms(record: dict[str, Any]) -> int | None:
+    """The record's detection timestamp, or None if it has none usable.
+
+    A record without one is the run's to reject (watermark_of raises); the
+    ordering check just leaves it out.
+    """
+    try:
+        return int(record["detection_timestamp"])
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 SOURCE = XdrAlertsSource()

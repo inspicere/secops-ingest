@@ -33,11 +33,19 @@ jobs:
           print('core OK:', available_backends())
           "
 
-      # The http extra is required, not optional, for the suite to be meaningful:
-      # connector tests guard on `importorskip("httpx")`, so without it they
-      # skip silently and CI reports green on tests that never ran.
+      # The http and postgres extras are required, not optional, for the suite
+      # to be meaningful: connector tests guard on `importorskip("httpx")` and
+      # the run-lifecycle, lease, pack-CLI, hold-out and transform wind-down
+      # tests on `importorskip("psycopg")`. Without an extra those files skip
+      # silently and CI reports green on tests that never ran. Without postgres
+      # here, seventeen files ran nowhere. Most use fakes and need only the import.
       - name: Install dev dependencies
-        run: pip install -e ".[dev,http]"
+        run: pip install -e ".[dev,http,postgres]"
+
+      # Fails here, loudly, if the line above ever drops an extra, rather
+      # than letting every file that guards on it skip.
+      - name: The extras the suite needs are importable
+        run: python -c "import httpx, tenacity, psycopg"
 
       - name: Lint
         run: ruff check src tests
@@ -92,13 +100,18 @@ jobs:
           # example.com / example.org / .example are reserved by RFC 2606 for
           # exactly this. Anything else in a test fixture is somebody's real host.
           #
+          # The RFC 5737 documentation ranges (192.0.2.0/24, 198.51.100.0/24,
+          # 203.0.113.0/24) are reserved for the same purpose as example.com,
+          # and a test that needs an IP literal that is not loopback has no
+          # other honest choice.
+          #
           # Loopback is allowed: 127.0.0.1 and localhost are provably nobody's
           # infrastructure, and they are the correct thing to write in a local
           # integration test. Flagging them made this job fail on a change that
           # leaked nothing -- and a check that cries wolf is one people learn to
           # ignore, which costs more than it ever catches.
           if grep -rnoE 'https?://[A-Za-z0-9.-]+' src tests --include='*.py' \
-             | grep -vE '(example\.(com|org|net)|//api\.example|apache\.org|python\.org|//127\.0\.0\.1|//localhost)'; then
+             | grep -vE '(example\.(com|org|net)|//api\.example|apache\.org|python\.org|//127\.0\.0\.1|//localhost|//(192\.0\.2|198\.51\.100|203\.0\.113)\.[0-9]{1,3}$)'; then
             echo "::error::Non-reserved hostname. Use example.com (RFC 2606)."
             exit 1
           fi
@@ -166,6 +179,17 @@ jobs:
 
   postgres:
     runs-on: ubuntu-latest
+    # Every file that reads SECOPS_TEST_DSN. The last step checks this list
+    # against the tree, so a new live-database file cannot be left out of it.
+    env:
+      LIVE_DB_TESTS: >-
+        tests/packs/test_state_integration.py
+        tests/transform/test_transform_integration.py
+        tests/common/test_run_watermark_progression.py
+        tests/common/test_run_timing_integration.py
+        tests/schema/test_schema_drift_integration.py
+        tests/schema/test_grants_integration.py
+        tests/schema/test_source_state_integration.py
     services:
       postgres:
         image: postgres:16
@@ -183,57 +207,46 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install with the postgres extra
-        run: pip install -e ".[postgres,dev]"
-      # Fail here rather than letting the tests skip: SECOPS_TEST_DSN is set
-      # below regardless, so a database that never came up would otherwise
-      # surface as a pass.
-      - name: Pack state against a real PostgreSQL
-        env:
-          SECOPS_TEST_DSN: postgresql://postgres:pw@127.0.0.1:5432/secops
-        run: pytest tests/packs/test_state_integration.py -v
+        run: pip install -e ".[postgres,http,dev]"
 
-      # The offline suite asserts transform SQL as TEXT, which agreed with two
-      # production bugs rather than catching them: an ::int cast on a
-      # fractional severity, and join_status classified on dbotMirrorId
-      # instead of sourceBrand. Both are invisible in a string and obvious the
-      # moment real values go through real SQL, so this runs the targets and
-      # asserts on the rows.
+      # Every file in LIVE_DB_TESTS, named explicitly rather than globbed: SECOPS_TEST_DSN is set for each run, so a file that stopped
+      # being collected would otherwise skip silently and the job stay green.
+      # A missing path fails here instead, and the next step fails when a new
+      # live-database file is added without being listed.
       #
-      # Named explicitly rather than globbed, for the same reason the step
-      # above is: SECOPS_TEST_DSN is set for the whole job, so a file that
-      # stopped being collected would skip silently and the job would still be
-      # green. A missing path fails here instead.
-      - name: Transform targets against a real PostgreSQL
-        env:
-          SECOPS_TEST_DSN: postgresql://postgres:pw@127.0.0.1:5432/secops
-        run: pytest tests/transform/test_transform_integration.py -v
-
-      # These two needed psycopg and so never ran in the test matrix, which
-      # installs only [dev,http] and skips them at importorskip. They were not
-      # named here either, so they ran NOWHERE -- and that is how #16 shipped a
-      # regression through seven green jobs: verify_control_schema() began
-      # reaching for a real cursor, and nine tests in the first file hand it a
-      # stub connection. The second file is #16's OWN integration test, added
-      # and never wired in.
-      # ITS OWN DATABASE, not the shared `secops` one. Every step above runs
-      # against `secops` in sequence, and the drift tests' live-database guard
-      # refuses any database whose control tables already hold rows -- which is
-      # precisely what the transform step leaves behind
-      # (control.transform_coverage, one row per target per day it derived).
+      # Before this list, three of these files ran NOWHERE: the grants test (the
+      # only real-database proof that the read role never sees raw_*), the
+      # source-state test and the run-timing test. That is the gap #16 shipped a
+      # regression through.
       #
-      # So this step is not order-dependent on what ran before it. Reordering
-      # the steps would only move the refusal: whichever of these files runs
-      # second inherits the first one's control rows.
-      - name: Run ledger and schema drift against a real PostgreSQL
-        env:
-          SECOPS_TEST_DSN: postgresql://postgres:pw@127.0.0.1:5432/secops_drift
+      # EACH FILE GETS ITS OWN DATABASE. The drift tests' live-database guard
+      # refuses any database whose control tables already hold rows, which is
+      # exactly what the transform tests leave behind
+      # (control.transform_coverage), so a shared database makes the outcome
+      # depend on order.
+      - name: Every live-database test, each against its own PostgreSQL database
         run: |
-          python - <<'PY'
-          import psycopg
+          i=0
+          for f in $LIVE_DB_TESTS; do
+            i=$((i + 1))
+            db="secops_live_$i"
+            python - "$db" <<'PY'
+          import sys, psycopg
           dsn = "postgresql://postgres:pw@127.0.0.1:5432/postgres"
           with psycopg.connect(dsn, autocommit=True) as c:
-              c.execute('DROP DATABASE IF EXISTS secops_drift')
-              c.execute('CREATE DATABASE secops_drift')
+              c.execute(f'DROP DATABASE IF EXISTS {sys.argv[1]}')
+              c.execute(f'CREATE DATABASE {sys.argv[1]}')
           PY
-          pytest tests/common/test_run_watermark_progression.py \
-                 tests/schema/test_schema_drift_integration.py -v
+            SECOPS_TEST_DSN="postgresql://postgres:pw@127.0.0.1:5432/$db" pytest "$f" -v
+          done
+
+      - name: No live-database test file is left out of LIVE_DB_TESTS
+        run: |
+          missing=0
+          for f in $(grep -rl SECOPS_TEST_DSN tests --include='*.py' | sort); do
+            case " $LIVE_DB_TESTS " in
+              *" $f "*) ;;
+              *) echo "::error file=$f::reads SECOPS_TEST_DSN but is not in LIVE_DB_TESTS, so it runs nowhere"; missing=1 ;;
+            esac
+          done
+          exit $missing

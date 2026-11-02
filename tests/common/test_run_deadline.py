@@ -230,3 +230,88 @@ def test_sigterm_winds_down_instead_of_killing_the_run(
     assert result.status == "SUCCESS"
     status, _r, _w, note = harness["finished"][-1]
     assert status == "SUCCESS" and note, "and said why it stopped"
+
+
+# -- xdr_alerts, the source the livelock was measured on ----------------------
+
+T0 = 1_789_400_000_000
+LAG_MS = 1_800_000
+
+
+def _xdr_alerts(monkeypatch: pytest.MonkeyPatch, pages: list[list[int]],
+                on_call: Any = None) -> Any:
+    """The real XdrAlertsSource, with each page given as detection timestamps."""
+    pytest.importorskip("httpx", reason="needs the 'http' extra")
+    from secops_ingest.sources import _cortex, xdr_alerts
+
+    monkeypatch.setenv("SECOPS_XDR_ALERTS_PAGE_SIZE", "2")
+    monkeypatch.setenv("SECOPS_XDR_ALERTS_LAG_SECONDS", str(LAG_MS // 1000))
+    monkeypatch.setattr(
+        xdr_alerts, "resolve",
+        lambda secret, path: _cortex.CortexCreds(
+            key="k", key_id="1", base=f"https://api-tenant.example.com{path}"))
+    src = xdr_alerts.XdrAlertsSource()
+    calls = {"n": 0}
+
+    def post(creds: object, body: dict[str, Any]) -> dict[str, Any]:
+        calls["n"] += 1
+        if on_call is not None:
+            on_call(calls["n"])
+        marks = pages.pop(0) if pages else []
+        rows = [{"alert_id": f"a{m}", "detection_timestamp": m} for m in marks]
+        return {"reply": {"total_count": 99, "alerts": rows}}
+
+    src._post = post
+    return src
+
+
+def test_xdr_alerts_keeps_the_ground_it_covered_when_stopped(
+    harness: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The livelock itself. Declared unordered, a stopped xdr_alerts run kept
+    its cursor and the next one re-read the same oldest window forever; at
+    ~24k alerts a run, a 90-day first run never finished."""
+    import signal as signal_mod
+
+    installed: dict[Any, Any] = {}
+    monkeypatch.setattr(run_mod.signal, "signal",
+                        lambda sig, handler: installed.__setitem__(sig, handler))
+
+    def stop_on_second_page(n: int) -> None:
+        if n == 2:
+            installed[signal_mod.SIGTERM](signal_mod.SIGTERM, None)
+
+    harness["cursor_in"] = str(T0)
+    src = _xdr_alerts(monkeypatch, [[T0, T0 + 1000], [T0 + 2000, T0 + 3000],
+                                    [T0 + 4000, T0 + 5000]],
+                      on_call=stop_on_second_page)
+    run_mod.execute(src, batch_size=2, deadline_sec=3600)
+
+    status, _r, _w, note = harness["finished"][-1]
+    assert status == "SUCCESS" and note, "the stop is recorded"
+    assert harness["watermarks"], "a stopped run advances"
+    assert int(harness["watermarks"][-1]) >= T0 + 1000
+
+
+def test_xdr_alerts_caps_its_mark_when_the_sort_is_not_detection_order(
+    harness: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ordering is checked, not assumed. An alert more than the lag window
+    below the highest mark already read means unread alerts after a stop could
+    be too, so the mark is held at that alert and the next run re-reads."""
+    late = T0 + 10 * LAG_MS - LAG_MS - 1
+    src = _xdr_alerts(monkeypatch, [[T0, T0 + 10 * LAG_MS], [late]])
+    run_mod.execute(src, batch_size=2, deadline_sec=3600)
+
+    assert harness["watermarks"] == [late]
+
+
+def test_xdr_alerts_disorder_inside_the_lag_window_does_not_cap(
+    harness: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Disorder the lag window already covers is harmless: no re-read."""
+    high = T0 + 10 * LAG_MS
+    src = _xdr_alerts(monkeypatch, [[T0, high], [high - LAG_MS + 1]])
+    run_mod.execute(src, batch_size=2, deadline_sec=3600)
+
+    assert harness["watermarks"] == [high]

@@ -25,6 +25,8 @@ Configuration (endpoints and tenancy are config, never constants):
                                verification against it is never relaxed
     SECOPS_WAZUH_INSECURE      set to 1 to skip TLS verification (logged, loudly);
                                ignored when SECOPS_WAZUH_CA_BUNDLE is set
+    SECOPS_WAZUH_ALLOW_HTTP    set to 1 to accept an http:// URL, which sends the
+                               password in cleartext (logged every run)
     SECOPS_WAZUH_LAG_SECONDS   late-arrival overlap    (default 900)
     SECOPS_WAZUH_PAGE_SIZE     hits per request        (default 500)
 """
@@ -39,6 +41,7 @@ from collections.abc import Iterator
 from datetime import datetime, timedelta
 from functools import partial
 from typing import Any
+from urllib.parse import urlsplit
 
 from ..common.http import RetryableResponse, with_retries
 from ..common.payload import to_json
@@ -96,6 +99,8 @@ class WazuhSource:
     def authenticate(self) -> Any:
         if not self.url:
             raise ValueError("SECOPS_WAZUH_URL is not set")
+        # Before anything else, and above all before the password is fetched.
+        self._require_https()
         # Before the password is fetched, so that a CA bundle that cannot be
         # loaded fails the run here, with its path named, rather than on the
         # first request -- and so that its warnings appear once per run, not
@@ -118,6 +123,33 @@ class WazuhSource:
 
         register_secret(password)
         return (self.user, password)
+
+    def _require_https(self) -> None:
+        """Refuse to send the password anywhere but https://, unless told to.
+
+        It goes as Basic auth on every request, and by default it is the
+        indexer superuser's, so http:// is the whole SIEM's credential in
+        cleartext for as long as nobody notices. DefectDojo, KSAT and the
+        Cortex connectors already refuse it; this one used the URL as given,
+        and a CA bundle or verification setting means nothing over http. The
+        opt-out is explicit and says so on every run, because a silent one
+        becomes permanent.
+        """
+        scheme = urlsplit(self.url).scheme.lower()
+        if scheme == "https":
+            return
+        if scheme == "http" and os.environ.get("SECOPS_WAZUH_ALLOW_HTTP") == "1":
+            log.warning(
+                "Wazuh indexer password for %r is being sent in CLEARTEXT over "
+                "http:// (SECOPS_WAZUH_ALLOW_HTTP=1). Serve the indexer over TLS "
+                "and remove this setting.", self.user,
+            )
+            return
+        raise ValueError(
+            f"SECOPS_WAZUH_URL must be https:// (got scheme {scheme or 'none'!r}); "
+            "the indexer password would be sent in cleartext. Set "
+            "SECOPS_WAZUH_ALLOW_HTTP=1 to accept http:// anyway."
+        )
 
     # -- fetching -----------------------------------------------------------
 

@@ -190,6 +190,53 @@ def test_authenticate_requires_a_configured_url(monkeypatch: pytest.MonkeyPatch)
         WazuhSource().authenticate()
 
 
+class _CountingProvider:
+    def __init__(self) -> None:
+        self.asked = 0
+
+    def get(self, name: str) -> str:
+        self.asked += 1
+        return "pw-not-real"
+
+
+def test_an_http_url_is_refused_before_the_password_is_fetched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Basic auth over http:// is the indexer password -- by default the
+    superuser's -- in cleartext on every run. The other connectors refuse it;
+    this one used to send it."""
+    monkeypatch.setenv("SECOPS_WAZUH_URL", "http://idx.example.com:9200")
+    monkeypatch.delenv("SECOPS_WAZUH_ALLOW_HTTP", raising=False)
+    provider = _CountingProvider()
+    monkeypatch.setattr("secops_ingest.sources.wazuh.get_provider", lambda: provider)
+
+    with pytest.raises(ValueError, match="SECOPS_WAZUH_ALLOW_HTTP"):
+        WazuhSource().authenticate()
+    assert provider.asked == 0, "a refused URL never has a password to send"
+
+
+def test_an_http_url_is_accepted_when_opted_in_and_says_so_every_run(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("SECOPS_WAZUH_URL", "http://idx.example.com:9200")
+    monkeypatch.setenv("SECOPS_WAZUH_ALLOW_HTTP", "1")
+    monkeypatch.setattr("secops_ingest.sources.wazuh.get_provider",
+                        lambda: _CountingProvider())
+    with caplog.at_level("WARNING"):
+        WazuhSource().authenticate()
+        WazuhSource().authenticate()
+    assert caplog.text.count("CLEARTEXT") == 2
+
+
+def test_a_url_without_a_scheme_is_refused_even_when_http_is_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SECOPS_WAZUH_URL", "idx.example.com:9200")
+    monkeypatch.setenv("SECOPS_WAZUH_ALLOW_HTTP", "1")
+    with pytest.raises(ValueError, match="https"):
+        WazuhSource().authenticate()
+
+
 def test_authenticate_registers_the_password_for_redaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
