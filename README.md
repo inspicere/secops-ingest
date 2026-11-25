@@ -176,7 +176,7 @@ Selected by `SECOPS_SECRETS_BACKEND`, defaulting to `env`.
 | `env` | development, CI, containers | yes |
 | `file` | systemd `LoadCredential=`, Docker and Kubernetes secrets | yes |
 | `vault` | HashiCorp Vault, or OpenBao | `[vault]` |
-| `delinea` | Delinea Secret Server | `[delinea]` |
+| `delinea` | Delinea Secret Server, on-premises or behind the Delinea Platform | `[delinea]` |
 
 ```python
 from secops_ingest.secrets import get_provider
@@ -203,6 +203,68 @@ VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root pytest tests/secrets -v
 
 Without `VAULT_ADDR` those tests skip, so the default `pytest` run still needs
 no network and no server.
+
+### Delinea Secret Server, with no Vault in front of it
+
+Secret Server has no host-attested login: something on the host has to hold a
+credential. The strongest shape available is one credential, sealed to the
+host's TPM, and nothing else secret on disk. That is posture `sealed`:
+
+1. **Onboard the host once** as an SDK client. A Secret Server administrator
+   creates an onboarding rule; its key goes in on stdin and the new client's
+   secret comes out on stdout, straight into `systemd-creds`:
+
+   ```bash
+   python -m secops_ingest.secrets.onboard --url https://pam.example.com/SecretServer \
+       --rule secops-ingest --client-id-file /etc/secops-ingest/ss-client-id < onboarding-key \
+     | systemd-creds encrypt --with-key=tpm2 --name=ss_client_secret - \
+         /etc/credstore.encrypted/ss_client_secret
+   ```
+
+2. **Write the map** naming each secret by Secret Server id and field slug.
+   The file provider holds only the client's own secret:
+
+   ```json
+   {"posture": "sealed",
+    "providers": {
+      "creds": {"kind": "file"},
+      "ss": {"kind": "delinea", "credential": "ss_client_secret",
+             "config": {"base_url": "https://pam.example.com/SecretServer",
+                        "client_id": "sdk-client-..."}}},
+    "entries": {
+      "ss_client_secret": {"provider": "creds"},
+      "xdr_ro": {"provider": "ss", "secret": "101", "field": "api-key"},
+      "warehouse_ingest_password": {"provider": "ss", "secret": "103", "field": "password"}}}
+   ```
+
+3. **Load both into the unit** and point the worker at them:
+
+   ```ini
+   LoadCredentialEncrypted=secret-map:/etc/credstore.encrypted/secret-map
+   LoadCredentialEncrypted=ss_client_secret:/etc/credstore.encrypted/ss_client_secret
+   Environment=SECOPS_SECRETS_BACKEND=mapped SECOPS_SECRETS_MAP_SOURCE=file
+   Environment=SECOPS_DB_BASE_DSN="host=... dbname=... user=wh_ingest sslmode=verify-full"
+   Environment=SECOPS_DB_PASSWORD_SECRET=warehouse_ingest_password
+   ```
+
+`sealed` is refused unless every name a source uses is served by a PAM
+provider, the only file provider holds a PAM's own credential, and the map
+was read from systemd's `CREDENTIALS_DIRECTORY`. That the files there were
+*encrypted* (`LoadCredentialEncrypted=`, not `LoadCredential=`) is not visible
+from inside the process; verify it in the deployment. Every run records its
+posture in `control.ingest_run.posture` and `control.transform_run`.
+
+`SECOPS_DB_PASSWORD_SECRET` reads the warehouse password through the provider
+on every connection, ingest and transform alike, so a password Secret Server
+rotates reaches the next run without a redeploy.
+
+**The Delinea Platform.** Secret Server behind the Platform takes its token
+from the Platform's identity service instead. Moving is configuration: add
+`"auth": "platform"` and `"platform_url": "https://<tenant>.delinea.app"` to the
+provider's config, set `base_url` to the Secret Server the Platform fronts, and
+use a Platform service user's id and secret as the credential. The map's
+entries do not change shape. The vault broker is deliberately not consulted:
+the bearer token goes only to the configured `base_url`.
 
 The interface is one method:
 
