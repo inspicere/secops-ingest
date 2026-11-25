@@ -446,10 +446,17 @@ def execute(
     *,
     deadline_sec: int | None = None,
     chunk_rows: int | None = None,
+    provider: object | None = None,
 ) -> TransformResult:
+    """Run TARGET once.
+
+    PROVIDER is the secret provider the connection's credential is read
+    through (SECOPS_DB_PASSWORD_SECRET, or a lease), and its posture is
+    recorded on the run row. None is the static-DSN case.
+    """
     budget = _Budget(DEFAULT_DEADLINE_SEC if deadline_sec is None else deadline_sec)
     chunk_rows = DEFAULT_CHUNK_ROWS if chunk_rows is None else chunk_rows
-    with db.connect() as conn:
+    with db.connect(provider) as conn:
         # Before the run-ledger INSERT below: a schema behind the package
         # turns it into a driver traceback, and a refused run must not leave
         # a RUNNING row behind.
@@ -487,7 +494,7 @@ def execute(
             stopper = _Stopper(conn)
             stopper.install()
             try:
-                return _run(conn, target, budget, stopper, chunk_rows)
+                return _run(conn, target, budget, stopper, chunk_rows, provider)
             finally:
                 stopper.restore()
         finally:
@@ -503,11 +510,10 @@ def execute(
 
 
 def _run(
-    conn: Any, target: Target, budget: _Budget, stopper: _Stopper, chunk_rows: int
+    conn: Any, target: Target, budget: _Budget, stopper: _Stopper, chunk_rows: int,
+    provider: object | None = None,
 ) -> TransformResult:
-    # No secret provider reaches the transform runner yet, so this records
-    # None until a provider is threaded through.
-    run_id = _start(conn, target.name, current_posture(None))
+    run_id = _start(conn, target.name, current_posture(provider))
     rows = 0
     days: set[date] = set()
     chunks_done = 0
