@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 
 from ..packs.registry import DuplicatePack, DuplicateTarget, all_targets
@@ -64,7 +65,15 @@ def main(argv: list[str] | None = None) -> int:
     drift = (schema_check.ControlSchemaDrift, schema_check.TargetSchemaDrift)
 
     try:
-        result = runner.execute(targets[args.target])
+        # As the ingest CLI does: no backend named is the static-DSN case, and
+        # a backend named but unbuildable fails the run rather than falling
+        # back to whatever SECOPS_DB_DSN holds.
+        provider = None
+        if os.environ.get("SECOPS_SECRETS_BACKEND"):
+            from ..secrets import get_provider
+
+            provider = get_provider()
+        result = runner.execute(targets[args.target], provider=provider)
     except drift as exc:
         # The warehouse is older than the package: a configuration state, not
         # a crash, so one line on stderr and a non-zero exit -- never the

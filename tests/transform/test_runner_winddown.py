@@ -100,7 +100,7 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     def unlock(conn: object, target: str) -> None:
         calls["unlocked"] += 1
 
-    monkeypatch.setattr(runner.db, "connect", lambda: conn)
+    monkeypatch.setattr(runner.db, "connect", lambda provider=None: conn)
     monkeypatch.setattr(runner, "verify_control_schema", lambda conn: None)
     # raising=False: the target check lands on fix/audit-schema; stubbed like
     # the control check either way, since a fake connection has no catalog.

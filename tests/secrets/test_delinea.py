@@ -252,3 +252,114 @@ def test_an_empty_field_is_refused_rather_than_sent_as_none(body):
     response = httpx.Response(200, content=body, headers={"content-type": "application/json"})
     with pytest.raises(SecretError, match="field password is empty"):
         _client(_token_then(response)).field("4821", "password")
+
+
+# -- the Delinea Platform -----------------------------------------------------
+#
+# The same /api/v1 field read, with the token from the Platform's identity
+# endpoint. A deployment moves between the two by configuration alone.
+
+PLATFORM_TOKEN_PATH = "/identity/api/oauth2/token/xpmplatform"
+
+
+def _platform_client(handler, **kwargs):
+    return SecretServerClient(
+        base_url="https://tenant.secretservercloud.example.com",
+        client_id="service-user-1",
+        client_secret=Secret("bootstrap-secret-value"),
+        transport=httpx.MockTransport(handler),
+        clock=Clock(),
+        auth="platform",
+        platform_url="https://tenant.delinea.example.com",
+        **kwargs,
+    )
+
+
+def test_platform_takes_its_token_from_the_platform_and_reads_from_the_vault():
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.host, request.url.path))
+        if request.url.path == PLATFORM_TOKEN_PATH:
+            form = parse_qs(request.content.decode())
+            assert form["grant_type"] == ["client_credentials"]
+            assert form["scope"] == ["xpmheadless"]
+            assert form["client_id"] == ["service-user-1"]
+            return httpx.Response(200, json={"access_token": "ptok", "expires_in": 3600})
+        assert request.headers["Authorization"] == "Bearer ptok"
+        return httpx.Response(200, json="the-value")
+
+    assert _platform_client(handler).field("17", "password") == "the-value"
+    assert seen == [
+        ("tenant.delinea.example.com", PLATFORM_TOKEN_PATH),
+        ("tenant.secretservercloud.example.com", "/api/v1/secrets/17/fields/password"),
+    ]
+
+
+def test_platform_never_asks_the_vault_broker_where_to_send_the_token():
+    paths = []
+
+    def handler(request):
+        paths.append(request.url.path)
+        if request.url.path == PLATFORM_TOKEN_PATH:
+            return httpx.Response(200, json={"access_token": "ptok", "expires_in": 3600})
+        return httpx.Response(200, json="v")
+
+    _platform_client(handler).field("17", "password")
+    assert not any("vaultbroker" in p for p in paths)
+
+
+def test_sdk_client_sends_no_scope():
+    def handler(request):
+        if request.url.path == TOKEN_PATH:
+            assert "scope" not in parse_qs(request.content.decode())
+            return httpx.Response(200, json={"access_token": "t", "expires_in": 3600})
+        return httpx.Response(200, json="v")
+
+    assert _client(handler).field("17", "password") == "v"
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"auth": "platform"}, "requires platform_url"),
+        ({"auth": "platform", "platform_url": "http://tenant.delinea.example.com"}, "https://"),
+        ({"platform_url": "https://tenant.delinea.example.com"}, "only used with"),
+        ({"auth": "password"}, "unknown delinea auth mode"),
+    ],
+)
+def test_auth_configuration_is_checked_before_any_request(kwargs, message):
+    def handler(request):  # pragma: no cover - must not be reached
+        raise AssertionError("no request may be made")
+
+    with pytest.raises(Exception, match=message):
+        SecretServerClient(
+            base_url="https://pam.example.com",
+            client_id="c",
+            client_secret=Secret("s"),
+            transport=httpx.MockTransport(handler),
+            **kwargs,
+        )
+
+
+def test_provider_reads_the_auth_mode_from_the_environment(monkeypatch):
+    from secops_ingest.secrets.delinea import DelineaSecretProvider
+
+    monkeypatch.setenv("SECOPS_DELINEA_AUTH", "platform")
+    monkeypatch.setenv("SECOPS_DELINEA_PLATFORM_URL", "https://tenant.delinea.example.com")
+    hosts = []
+
+    def handler(request):
+        hosts.append(request.url.host)
+        if request.url.path == PLATFORM_TOKEN_PATH:
+            return httpx.Response(200, json={"access_token": "t", "expires_in": 3600})
+        return httpx.Response(200, json="v")
+
+    provider = DelineaSecretProvider(
+        base_url="https://vault.example.com",
+        client_id="c",
+        credential=Secret("s"),
+        transport=httpx.MockTransport(handler),
+    )
+    assert provider.fetch_locator({"secret": "5", "field": "password"}) == "v"
+    assert hosts == ["tenant.delinea.example.com", "vault.example.com"]

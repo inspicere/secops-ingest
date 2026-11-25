@@ -21,6 +21,23 @@ THREE DELIBERATE CHOICES IN ONE URL:
   * autoComment carries the run id into Secret Server's own access audit
     record, which is where attributable audit comes from.
 
+TWO WAYS TO GET A TOKEN, ONE WAY TO READ. The /api/v1 resources are the same
+on-premises and behind the Delinea Platform; only the token differs:
+
+    auth="sdk_client"  on-premises Secret Server (and SS Cloud): an SDK client's
+                       id and secret, client_credentials at {base_url}/oauth2/token
+    auth="platform"    the Delinea Platform: a service user's id and secret,
+                       client_credentials with scope=xpmheadless at
+                       {platform_url}/identity/api/oauth2/token/xpmplatform
+
+So moving a deployment from one to the other is configuration: the auth mode,
+the token URL and a new client, with no change to any map entry's shape.
+
+The Platform's vault broker (/vaultbroker/api/vaults) can say which Secret
+Server holds the secrets. It is NOT consulted: base_url is configured, always.
+Following the broker would send the bearer token wherever its answer pointed,
+and the address of the store is a fact a deployment should state, not learn.
+
 Addressing is by numeric id. `secretPath` on the single-field endpoint is
 undocumented upstream and no vendor code attempts it, so it is treated as
 unsupported until measured.
@@ -40,6 +57,13 @@ from .secret import Secret
 #: upstream. 300s is comfortably more than any single request takes.
 DRIFT_SECONDS = 300.0
 _TIMEOUT = 30.0
+
+#: auth mode -> (token path, extra form fields). The path is relative to
+#: base_url for sdk_client and to platform_url for platform.
+AUTH_MODES: dict[str, tuple[str, dict[str, str]]] = {
+    "sdk_client": ("/oauth2/token", {}),
+    "platform": ("/identity/api/oauth2/token/xpmplatform", {"scope": "xpmheadless"}),
+}
 
 
 def _json_body(response: Any, what: str) -> Any:
@@ -80,6 +104,8 @@ class SecretServerClient:
         run_id: str = "",
         transport: Any | None = None,
         clock: Callable[[], float] = time.monotonic,
+        auth: str = "sdk_client",
+        platform_url: str | None = None,
     ) -> None:
         try:
             import httpx
@@ -90,9 +116,29 @@ class SecretServerClient:
             ) from exc
         if not isinstance(client_secret, Secret):
             raise SecretError("client_secret must be a Secret, not a bare string")
+        if auth not in AUTH_MODES:
+            raise SecretError(
+                f"unknown delinea auth mode {auth!r}; expected one of: {', '.join(AUTH_MODES)}"
+            )
+        if auth == "platform":
+            if not platform_url:
+                raise SecretError("delinea auth 'platform' requires platform_url")
+            _require_https(platform_url)
+        elif platform_url:
+            # Ignored silently, a platform_url left in place after a move back
+            # would look like it was in use.
+            raise SecretError("platform_url is only used with delinea auth 'platform'")
         _require_https(base_url)
         self._client = httpx.Client(
             transport=transport, base_url=base_url.rstrip("/"), timeout=_TIMEOUT
+        )
+        self._auth = auth
+        token_path, self._token_extra = AUTH_MODES[auth]
+        # Absolute for platform: the token comes from the Platform, the fields
+        # from the Secret Server it fronts.
+        self._token_url = (
+            platform_url.rstrip("/") + token_path if auth == "platform" and platform_url
+            else token_path
         )
         self._client_id = client_id
         self._client_secret = client_secret
@@ -109,11 +155,12 @@ class SecretServerClient:
 
         try:
             response = self._client.post(
-                "/oauth2/token",
+                self._token_url,
                 data={
                     "grant_type": "client_credentials",
                     "client_id": self._client_id,
                     "client_secret": self._client_secret.reveal(),
+                    **self._token_extra,
                 },
             )
         except httpx.HTTPError as exc:

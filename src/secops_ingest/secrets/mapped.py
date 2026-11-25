@@ -21,6 +21,7 @@ PAM credential failed sources that never used that PAM.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -87,8 +88,29 @@ class MappedSecretProvider(SecretProvider):
                     "the map would be only as trusted as the host's files. Serve it "
                     "from vault_agent, or declare posture 'dev' outside production."
                 )
+            if loaded.posture is Posture.SEALED and self._root_kind is not None:
+                self._check_sealed_root()
             self._map = loaded
         return self._map
+
+    def _check_sealed_root(self) -> None:
+        """'sealed' is served only by a file root reading systemd's credentials.
+
+        Checked against the environment the run actually has: under systemd,
+        CREDENTIALS_DIRECTORY is set only when the unit loads credentials, and
+        the file root reads it before SECOPS_SECRETS_DIR.
+        """
+        if self._root_kind != "file":
+            raise InvalidMap(
+                f"posture 'sealed' is served by a 'file' root reading systemd's "
+                f"credentials, not by a {self._root_kind!r} root; a vault_agent "
+                "root serves 'assured'"
+            )
+        if not os.environ.get("CREDENTIALS_DIRECTORY"):
+            raise InvalidMap(
+                "posture 'sealed' needs CREDENTIALS_DIRECTORY: load the map and the "
+                "bootstrap with LoadCredentialEncrypted= in the unit"
+            )
 
     @property
     def posture(self) -> Posture:

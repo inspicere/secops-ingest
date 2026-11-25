@@ -111,7 +111,7 @@ def test_exit_code_agrees_with_the_ledger(
     monkeypatch.setattr(
         "secops_ingest.transform.__main__.all_targets", lambda **_: {"t": object()}
     )
-    monkeypatch.setattr(runner, "execute", lambda target: runner.TransformResult(status))
+    monkeypatch.setattr(runner, "execute", lambda target, **_: runner.TransformResult(status))
 
     assert main(["t"]) == code
 
@@ -152,7 +152,7 @@ def test_target_schema_drift_is_a_one_line_refusal(
         "secops_ingest.transform.__main__.all_targets", lambda **_: {"t": object()}
     )
 
-    def drifted(target: object) -> object:
+    def drifted(target: object, **_: object) -> object:
         raise TargetSchemaDrift("mart_fact_t is missing column(s): x; re-apply the DDL")
 
     monkeypatch.setattr(runner, "execute", drifted)
@@ -160,3 +160,49 @@ def test_target_schema_drift_is_a_one_line_refusal(
     assert main(["t"]) == 1
     err = capsys.readouterr().err
     assert err.strip() == "mart_fact_t is missing column(s): x; re-apply the DDL"
+
+
+def test_the_secret_provider_reaches_the_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The transform reads its database password through the same provider as
+    ingest: without one, SECOPS_DB_PASSWORD_SECRET has nothing to resolve it."""
+    pytest.importorskip("psycopg", reason="the runner needs the 'postgres' extra")
+    from secops_ingest.transform import runner
+
+    sentinel = object()
+    seen: list[object] = []
+    monkeypatch.setattr(
+        "secops_ingest.transform.__main__.all_targets", lambda **_: {"t": object()}
+    )
+    monkeypatch.setattr("secops_ingest.secrets.get_provider", lambda: sentinel)
+
+    def execute(target: object, provider: object = None) -> object:
+        seen.append(provider)
+        return runner.TransformResult("SUCCESS")
+
+    monkeypatch.setattr(runner, "execute", execute)
+    monkeypatch.delenv("SECOPS_SECRETS_BACKEND", raising=False)
+    assert main(["t"]) == 0
+    monkeypatch.setenv("SECOPS_SECRETS_BACKEND", "mapped")
+    assert main(["t"]) == 0
+    assert seen == [None, sentinel]
+
+
+def test_a_provider_that_cannot_be_built_fails_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Never a fallback to whatever SECOPS_DB_DSN holds."""
+    pytest.importorskip("psycopg", reason="the runner needs the 'postgres' extra")
+    from secops_ingest.transform import runner
+
+    def broken() -> object:
+        raise RuntimeError("no map")
+
+    ran: list[bool] = []
+    monkeypatch.setattr(
+        "secops_ingest.transform.__main__.all_targets", lambda **_: {"t": object()}
+    )
+    monkeypatch.setattr("secops_ingest.secrets.get_provider", broken)
+    monkeypatch.setattr(runner, "execute", lambda *a, **k: ran.append(True))
+    monkeypatch.setenv("SECOPS_SECRETS_BACKEND", "mapped")
+    assert main(["t"]) == 1
+    assert ran == []

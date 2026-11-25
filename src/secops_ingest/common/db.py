@@ -39,11 +39,27 @@ def resolve_conninfo(provider: object | None = None) -> tuple[str, dict[str, str
     This is what replaces the PGPASSFILE.
 
     Environment:
-        SECOPS_DB_LEASE     Vault path, e.g. database/creds/ingest
+        SECOPS_DB_LEASE            Vault path, e.g. database/creds/ingest
+        SECOPS_DB_PASSWORD_SECRET  a logical secret name: the password of the
+                                   user in SECOPS_DB_BASE_DSN, resolved per run
         SECOPS_DB_BASE_DSN  everything but the credential: host, dbname, sslmode
+                            (and user, for SECOPS_DB_PASSWORD_SECRET)
         SECOPS_DB_DSN       a complete static DSN, for dev and for Metabase
+
+    SECOPS_DB_PASSWORD_SECRET is the rotated-static form, for a store that
+    rotates a stored password but cannot mint a role per run (Delinea Secret
+    Server). Fetched on every connection, so a rotation needs no converge:
+    the next run reads the new value and no copy on the host goes stale.
     """
     lease_path = os.environ.get("SECOPS_DB_LEASE")
+    password_name = os.environ.get("SECOPS_DB_PASSWORD_SECRET")
+    if lease_path and password_name:
+        raise RuntimeError(
+            "SECOPS_DB_LEASE and SECOPS_DB_PASSWORD_SECRET are both set; a run "
+            "takes its database credential from exactly one"
+        )
+    if password_name:
+        return _stored_password(provider, password_name)
     if not lease_path:
         dsn = os.environ.get("SECOPS_DB_DSN")
         if not dsn:
@@ -74,6 +90,30 @@ def resolve_conninfo(provider: object | None = None) -> tuple[str, dict[str, str
     return base, {"user": str(username), "password": str(password)}
 
 
+def _stored_password(provider: object | None, name: str) -> tuple[str, dict[str, str]]:
+    """The base DSN and a password read through the secret provider by NAME."""
+    base = os.environ.get("SECOPS_DB_BASE_DSN")
+    if not base:
+        raise RuntimeError(
+            "SECOPS_DB_PASSWORD_SECRET is set but SECOPS_DB_BASE_DSN is not; it "
+            "must carry host, dbname, user and sslmode"
+        )
+    getter = getattr(provider, "get", None)
+    if not callable(getter):
+        raise RuntimeError(
+            "SECOPS_DB_PASSWORD_SECRET is set but no secret provider is "
+            "configured; set SECOPS_SECRETS_BACKEND"
+        )
+    password = str(getter(name))
+    if not password:
+        raise RuntimeError(f"secret {name!r} resolved to an empty database password")
+
+    from ..redaction import register_secret
+
+    register_secret(password)
+    return base, {"password": password}
+
+
 @contextmanager
 def connect(provider: object | None = None) -> Iterator[psycopg.Connection]:
     """Yield a connection with autocommit off, committing on clean exit."""
@@ -82,10 +122,15 @@ def connect(provider: object | None = None) -> Iterator[psycopg.Connection]:
     # with typed keyword parameters, so a dict[str, str] splat does not
     # typecheck once psycopg's stubs are installed. Visible only in the
     # mypy-with-drivers job, which exists for exactly this class of error.
-    if credentials:
+    # A lease brings its own user; a stored password is for the user the base
+    # DSN already names.
+    if "user" in credentials:
         with psycopg.connect(
             conninfo, user=credentials["user"], password=credentials["password"]
         ) as conn:
+            yield conn
+    elif credentials:
+        with psycopg.connect(conninfo, password=credentials["password"]) as conn:
             yield conn
     else:
         with psycopg.connect(conninfo) as conn:
