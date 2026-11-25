@@ -33,11 +33,15 @@ class DelineaSecretProvider(SecretProvider):
         credential: Secret | None = None,
         run_id: str | None = None,
         transport: Any | None = None,
+        auth: str | None = None,
+        platform_url: str | None = None,
         **kwargs: object,
     ) -> None:
         super().__init__(**kwargs)  # type: ignore[arg-type]
         base_url = base_url or os.environ.get("SECOPS_DELINEA_URL")
         client_id = client_id or os.environ.get("SECOPS_DELINEA_CLIENT_ID")
+        auth = auth or os.environ.get("SECOPS_DELINEA_AUTH") or "sdk_client"
+        platform_url = platform_url or os.environ.get("SECOPS_DELINEA_PLATFORM_URL") or None
         if not base_url:
             raise SecretError("Delinea provider requires base_url (or SECOPS_DELINEA_URL)")
         if not client_id:
@@ -55,6 +59,8 @@ class DelineaSecretProvider(SecretProvider):
             client_secret=credential,
             run_id=run_id or os.environ.get("SECOPS_RUN_ID", ""),
             transport=transport,
+            auth=auth,
+            platform_url=platform_url,
         )
 
     def fetch_locator(self, locator: dict[str, str]) -> str:
