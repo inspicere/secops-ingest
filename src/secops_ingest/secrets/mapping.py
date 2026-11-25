@@ -42,9 +42,23 @@ class InvalidMap(SecretError):
 
 
 class Posture(enum.StrEnum):
-    """How much the deployment is allowed to trust its own filesystem."""
+    """How much the deployment is allowed to trust its own filesystem.
+
+    ASSURED  every provider is a PAM and the map comes from a credential-free
+             root (a Vault Agent socket). Nothing secret is on the host.
+    SEALED   for a PAM that cannot be reached without a credential of its own
+             (Delinea Secret Server, with no Vault in front of it). Every
+             secret a source uses comes from the PAM at run time; the one
+             credential that unlocks it, and the map, arrive through systemd's
+             credentials directory, sealed to the host's TPM. So a ciphertext
+             bootstrap exists on disk, and nothing else secret does. The code
+             checks the shape (below and in mapped.py); that the credential is
+             encrypted rather than plain is the deployment's to verify.
+    DEV      anything else: files or environment, outside production.
+    """
 
     ASSURED = "assured"
+    SEALED = "sealed"
     DEV = "dev"
 
 
@@ -132,7 +146,9 @@ def load_map(doc: object, *, check_kinds: bool = True) -> SecretMap:
     registered = frozenset(available_backends()) if check_kinds else frozenset()
 
     if "posture" not in body:
-        raise InvalidMap("posture is required; use 'assured' in production or 'dev' locally")
+        raise InvalidMap(
+            "posture is required; use 'assured' or 'sealed' in production, 'dev' locally"
+        )
     raw_posture = body["posture"]
     try:
         posture = Posture(str(raw_posture))
@@ -205,7 +221,47 @@ def load_map(doc: object, *, check_kinds: bool = True) -> SecretMap:
         )
 
     _reject_cycles(providers, entries)
+    if posture is Posture.SEALED:
+        _check_sealed(providers, entries)
     return SecretMap(posture=posture, providers=providers, entries=entries)
+
+
+def _check_sealed(providers: dict[str, ProviderSpec], entries: dict[str, Entry]) -> None:
+    """Refuse a 'sealed' map unless a file holds nothing but PAM bootstraps.
+
+    The file kind is allowed for exactly one job: holding the credential a
+    PAM provider authenticates with, read from systemd's credentials
+    directory. Any other name served from a file is a secret on the host, and
+    that is what the posture says there is not.
+    """
+    pam = {name for name, spec in providers.items() if spec.kind.lower() in _PAM_KINDS}
+    if not pam:
+        raise InvalidMap("posture 'sealed' needs at least one PAM provider")
+    bootstraps = {spec.credential for spec in providers.values()
+                  if spec.credential is not None and spec.kind.lower() in _PAM_KINDS}
+    for name, spec in providers.items():
+        kind = spec.kind.lower()
+        if kind in _PAM_KINDS:
+            continue
+        if kind != "file":
+            raise InvalidMap(
+                f"posture 'sealed' forbids provider kind {spec.kind!r}: only "
+                f"{', '.join(sorted(_PAM_KINDS))}, and 'file' for a PAM's own credential"
+            )
+        if spec.credential is not None:
+            raise InvalidMap(f"posture 'sealed': file provider {name!r} must be a root")
+        if "directory" in spec.config:
+            raise InvalidMap(
+                f"posture 'sealed': file provider {name!r} may not name a directory; "
+                "it reads systemd's CREDENTIALS_DIRECTORY"
+            )
+    for name, entry in entries.items():
+        if entry.provider not in pam and name not in bootstraps:
+            raise InvalidMap(
+                f"posture 'sealed': entry {name!r} is served by file provider "
+                f"{entry.provider!r} but is no PAM provider's credential; only a "
+                "bootstrap credential may come from a file"
+            )
 
 
 def _reject_cycles(providers: dict[str, ProviderSpec], entries: dict[str, Entry]) -> None:
